@@ -25,10 +25,20 @@ pub enum ContractError {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Critical = 0,
+    High = 1,
+    Medium = 2,
+    Low = 3,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
+    pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
@@ -46,6 +56,7 @@ pub struct ScoreEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecord {
     pub task_type: Symbol,
+    pub priority: Priority,
     pub notes: String,
 }
 
@@ -82,6 +93,7 @@ const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
 const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
+const EVENT_CRIT_OVRD: Symbol = symbol_short!("CRIT_OVRD");
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -775,6 +787,7 @@ impl Lifecycle {
         env: Env,
         asset_id: u64,
         task_type: Symbol,
+        priority: Priority,
         notes: String,
         engineer: Address,
     ) {
@@ -818,6 +831,7 @@ impl Lifecycle {
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
+            priority,
             notes,
             engineer: engineer.clone(),
             timestamp,
@@ -868,7 +882,7 @@ impl Lifecycle {
 
         // Emit maintenance submission event
         env.events()
-            .publish((EVENT_MAINT, asset_id), (task_type, engineer, timestamp));
+            .publish((EVENT_MAINT, asset_id), (task_type, priority, engineer, timestamp));
     }
 
     /// Record an ownership transfer in the asset's maintenance history.
@@ -906,6 +920,7 @@ impl Lifecycle {
         let sentinel = MaintenanceRecord {
             asset_id,
             task_type: symbol_short!("XFER"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Ownership transferred"),
             engineer: new_owner.clone(),
             timestamp,
@@ -1005,6 +1020,7 @@ impl Lifecycle {
             history.push_back(MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
+                priority: record.priority,
                 notes: record.notes.clone(),
                 engineer: engineer.clone(),
                 timestamp,
@@ -1017,7 +1033,7 @@ impl Lifecycle {
             );
             env.events().publish(
                 (EVENT_MAINT, asset_id),
-                (record.task_type.clone(), engineer.clone(), timestamp),
+                (record.task_type.clone(), record.priority, engineer.clone(), timestamp),
             );
         }
 
@@ -1082,6 +1098,91 @@ impl Lifecycle {
             .persistent()
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get overdue maintenance tasks for an asset.
+    ///
+    /// Returns all maintenance records older than `days_overdue` days from the
+    /// current ledger timestamp. If any of the overdue tasks have `Priority::Critical`,
+    /// a `CRIT_OVRD` event is emitted to alert operations teams.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `days_overdue` - Number of days past which a task is considered overdue
+    ///
+    /// # Returns
+    /// Vec of overdue MaintenanceRecords
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_overdue_tasks(env: Env, asset_id: u64, days_overdue: u64) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let cutoff = now.saturating_sub(days_overdue.saturating_mul(86400));
+
+        let mut overdue = Vec::new(&env);
+        let mut has_critical = false;
+        for record in history.iter() {
+            if record.timestamp < cutoff {
+                if record.priority == Priority::Critical {
+                    has_critical = true;
+                }
+                overdue.push_back(record);
+            }
+        }
+
+        if has_critical {
+            env.events()
+                .publish((EVENT_CRIT_OVRD, asset_id), (days_overdue, overdue.len()));
+        }
+
+        overdue
+    }
+
+    /// Get maintenance tasks filtered by priority level.
+    ///
+    /// Returns all maintenance records for the asset that match the given priority.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `priority` - The priority level to filter by
+    ///
+    /// # Returns
+    /// Vec of MaintenanceRecords matching the specified priority
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_tasks_by_priority(
+        env: Env,
+        asset_id: u64,
+        priority: Priority,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        for record in history.iter() {
+            if record.priority == priority {
+                result.push_back(record);
+            }
+        }
+        result
     }
 
     /// Get a paginated slice of the maintenance history for an asset.
@@ -1782,6 +1883,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Routine oil change"),
                 &engineer,
             );
@@ -1817,6 +1919,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &999u64,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &engineer,
         );
@@ -1842,6 +1945,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
             );
@@ -1850,6 +1954,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "over cap"),
             &engineer,
         );
@@ -1876,6 +1981,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
             );
@@ -1887,6 +1993,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "over cap"),
             &unregistered,
         );
@@ -1934,6 +2041,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
+            &Priority::Low,
             &String::from_str(&env, "Unknown task type"),
             &engineer,
         );
@@ -1984,6 +2092,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &unregistered,
         );
@@ -2008,12 +2117,14 @@ mod tests {
         client.submit_maintenance(
             &asset_id1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "one"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id2,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "two"),
             &engineer,
         );
@@ -2043,6 +2154,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "service"),
                 &engineer,
             );
@@ -2078,12 +2190,14 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -2126,6 +2240,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -2135,6 +2250,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -2157,6 +2273,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Configured increment"),
             &engineer,
         );
@@ -2178,6 +2295,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First"),
             &engineer,
         );
@@ -2188,6 +2306,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second"),
             &engineer,
         );
@@ -2200,6 +2319,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Bulk"),
                 &engineer,
             );
@@ -2318,6 +2438,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -2335,6 +2456,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -2367,6 +2489,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -2411,6 +2534,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -2480,6 +2604,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -2573,6 +2698,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Major work"),
                 &engineer,
             );
@@ -2608,6 +2734,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score"),
                 &engineer,
             );
@@ -2645,6 +2772,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score"),
                 &engineer,
             );
@@ -2693,6 +2821,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score to 50"),
                 &engineer,
             );
@@ -2719,6 +2848,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Single major service"),
             &engineer,
         );
@@ -2779,6 +2909,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -2813,6 +2944,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -2859,6 +2991,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Routine"),
             &engineer,
         );
@@ -2974,6 +3107,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "notes"),
             &engineer,
         );
@@ -2993,6 +3127,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "notes"),
             &engineer,
         );
@@ -3018,6 +3153,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "notes"),
                 &engineer,
             );
@@ -3048,6 +3184,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement 1"),
             &engineer,
         );
@@ -3058,6 +3195,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement 2"),
             &engineer,
         );
@@ -3112,6 +3250,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer,
             );
@@ -3122,6 +3261,7 @@ mod tests {
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -3182,12 +3322,14 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer,
             );
             client.submit_maintenance(
                 &asset_b,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer,
             );
@@ -3401,18 +3543,21 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Second"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Third"),
             &engineer,
         );
@@ -3435,18 +3580,21 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "a"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "b"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "c"),
             &engineer,
         );
@@ -3470,6 +3618,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "at t0"),
             &engineer,
         );
@@ -3480,6 +3629,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("LUBE"),
+            &Priority::Low,
             &String::from_str(&env, "at t1"),
             &engineer,
         );
@@ -3503,6 +3653,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("REBUILD"),
+                &Priority::Low,
                 &String::from_str(&env, "major"),
                 &engineer,
             );
@@ -3533,6 +3684,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer,
             );
@@ -3565,6 +3717,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "entry"),
                 &engineer,
             );
@@ -3591,6 +3744,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "only one"),
             &engineer,
         );
@@ -3612,6 +3766,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "entry"),
             &engineer,
         );
@@ -3644,14 +3799,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("ENGINE"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Engine repair"),
         });
 
@@ -3674,10 +3832,12 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -3707,6 +3867,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("UNKNOWN"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Unknown task type"),
         });
 
@@ -3733,14 +3894,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change 1"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change 2"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -3766,6 +3930,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer,
             );
@@ -3776,10 +3941,12 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, ""),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, ""),
         });
 
@@ -3807,14 +3974,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "First"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Second"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Third - over cap"),
         });
 
@@ -3839,6 +4009,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Should fail"),
         });
 
@@ -3863,14 +4034,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("UNKNOWN"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Invalid task type"),
         });
 
@@ -3897,6 +4071,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, &"x".repeat(300)),
         });
 
@@ -3922,6 +4097,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &unregistered,
         );
@@ -3947,6 +4123,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "Filter replacement"),
                 &engineer,
             );
@@ -3969,6 +4146,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
         );
@@ -4007,6 +4185,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
         );
@@ -4026,6 +4205,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-reregistration submission"),
             &engineer,
         );
@@ -4066,6 +4246,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-expiry attempt"),
             &engineer,
         );
@@ -4088,6 +4269,7 @@ mod tests {
         let owner = Address::generate(&env);
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
+            &Priority::Low,
             &String::from_str(&env, "Test Generator"),
             &owner,
         );
@@ -4111,6 +4293,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-expiry attempt"),
             &engineer,
         );
@@ -4133,6 +4316,7 @@ mod tests {
         let owner = Address::generate(&env);
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
+            &Priority::Low,
             &String::from_str(&env, "Test Generator"),
             &owner,
         );
@@ -4156,6 +4340,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Post-expiry batch attempt"),
         });
 
@@ -4206,6 +4391,7 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Full engine service"),
                 &engineer,
             );
@@ -4237,6 +4423,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -4281,6 +4468,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4303,6 +4491,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4330,6 +4519,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4339,6 +4529,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Post-reset work"),
             &engineer,
         );
@@ -4370,6 +4561,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -4381,6 +4573,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -4392,6 +4585,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -4402,6 +4596,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -4426,6 +4621,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4460,6 +4656,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4500,6 +4697,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first service"),
             &engineer,
         );
@@ -4510,6 +4708,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "second service"),
             &engineer,
         );
@@ -4574,6 +4773,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
             );
@@ -4597,6 +4797,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
             );
@@ -4891,14 +5092,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "First"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Second"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("ENGINE"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Third"),
         });
 
@@ -4924,6 +5128,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "ttl test"),
         });
         client.batch_submit_maintenance(&asset_id, &records, &engineer);
@@ -4960,6 +5165,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -5007,6 +5213,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -5050,6 +5257,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -5081,6 +5289,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -5128,6 +5337,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -5162,10 +5372,12 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -5203,6 +5415,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -5229,6 +5442,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -5237,6 +5451,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -5260,6 +5475,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -5303,6 +5519,7 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, ""),
                 &engineer
             ),
@@ -5315,6 +5532,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, ""),
         });
         assert_eq!(
@@ -5413,6 +5631,7 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "should be blocked"),
                 &engineer,
             ),
@@ -5435,6 +5654,7 @@ mod tests {
         client.submit_maintenance(
             &asset1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Session 1"),
             &engineer,
         );
@@ -5443,6 +5663,7 @@ mod tests {
         client.submit_maintenance(
             &asset2,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Session 2"),
             &engineer,
         );
@@ -5467,6 +5688,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "Filter replacement"),
                 &engineer,
             );
@@ -5478,6 +5700,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement"),
             &engineer,
         );
@@ -5523,6 +5746,7 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OVERHAUL"),
+                &Priority::Low,
                 &String::from_str(&env, "Full overhaul"),
                 &engineer,
             );
@@ -5597,12 +5821,14 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-transfer inspection"),
             &engineer,
         );
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Oil change"),
             &engineer,
         );
@@ -5658,6 +5884,7 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-deregister check"),
             &engineer,
         );
@@ -5793,6 +6020,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
         );
@@ -5835,6 +6063,7 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Routine check"),
             &engineer,
         );
