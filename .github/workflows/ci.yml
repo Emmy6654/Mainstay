@@ -104,3 +104,100 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  testnet-smoke:
+    name: Testnet Smoke Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build WASM contracts
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install Stellar CLI
+        run: |
+          cargo install stellar-cli --features opt
+
+      - name: Deploy to testnet
+        run: |
+          chmod +x scripts/deploy_testnet.sh
+          ./scripts/deploy_testnet.sh
+        env:
+          STELLAR_NETWORK: testnet
+
+      - name: Test register_asset round-trip
+        run: |
+          echo "Verifying asset registration on testnet..."
+          # Generate a test identity for smoke testing
+          stellar keys generate smoke-tester --network testnet
+
+          # Fund the test account on testnet (using friendbot)
+          curl "https://friendbot.stellar.org?addr=$(stellar keys address smoke-tester)"
+
+          # Get the deployed contract IDs (extracted from deploy output or stored)
+          # For now, we deploy fresh and capture IDs
+          DEPLOY_OUTPUT=$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/asset_registry.wasm \
+            --source smoke-tester \
+            --network testnet)
+          ASSET_REGISTRY_ID=$(echo "$DEPLOY_OUTPUT" | tail -1)
+          echo "Asset Registry deployed at: $ASSET_REGISTRY_ID"
+
+          # Initialize admin
+          stellar contract invoke \
+            --id "$ASSET_REGISTRY_ID" \
+            --source smoke-tester \
+            --network testnet \
+            -- initialize_admin --admin "$(stellar keys address smoke-tester)"
+
+          # Add asset type
+          stellar contract invoke \
+            --id "$ASSET_REGISTRY_ID" \
+            --source smoke-tester \
+            --network testnet \
+            -- add_asset_type --asset_type "GENSET" --admin "$(stellar keys address smoke-tester)"
+
+          # Register an asset
+          RESULT=$(stellar contract invoke \
+            --id "$ASSET_REGISTRY_ID" \
+            --source smoke-tester \
+            --network testnet \
+            -- register_asset \
+            --asset_type "GENSET" \
+            --metadata "Smoke Test Asset" \
+            --owner "$(stellar keys address smoke-tester)")
+
+          echo "Register asset result: $RESULT"
+
+          # Extract the returned asset ID and validate it
+          ASSET_ID=$(echo "$RESULT" | grep -oP '\d+' | head -1)
+          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" -le 0 ]; then
+            echo "::error::Invalid asset ID returned: $ASSET_ID"
+            exit 1
+          fi
+          echo "Successfully registered asset with ID: $ASSET_ID"
+
+          # Store deployed contract IDs as artifacts
+          echo "ASSET_REGISTRY_ID=$ASSET_REGISTRY_ID" >> contract-ids.env
+          echo "ASSET_ID=$ASSET_ID" >> contract-ids.env
+
+      - name: Upload contract IDs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-ids
+          path: contract-ids.env
