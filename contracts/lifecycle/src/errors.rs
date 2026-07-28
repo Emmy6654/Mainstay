@@ -36,6 +36,9 @@ pub enum ContractError {
     InsufficientSigners = 22,
     /// Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard).
     BatchTooLarge = 23,
+    /// Insufficient maintenance history to compute a reliable prediction.
+    /// At least 2 records of the same task type are required.
+    InsufficientPredictionData = 24,
 }
 
 impl From<SharedContractError> for ContractError {

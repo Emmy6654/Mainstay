@@ -54,3 +54,11 @@ path = "test_collateral_score_cap.rs"
 [[test]]
 name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
+
+[[test]]
+name = "test_ttl_extension"
+path = "test_ttl_extension.rs"
+
+[[test]]
+name = "test_predictive_alerts"
+path = "test_predictive_alerts.rs"

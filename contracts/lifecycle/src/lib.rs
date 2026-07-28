@@ -498,6 +498,69 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
     }
 }
 
+/// Internal helper: compute predicted next service timestamp without panicking.
+///
+/// Uses a moving average of historical intervals between consecutive records
+/// of the same task type. Returns [`ContractError::InsufficientPredictionData`]
+/// if fewer than 2 matching records exist.
+fn try_predict_next_service(
+    env: &Env,
+    asset_id: u64,
+    task_type: &Symbol,
+) -> Result<u64, ContractError> {
+    let history: Vec<MaintenanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&history_key(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+
+    if history.is_empty() {
+        return Err(ContractError::NoMaintenanceHistory);
+    }
+
+    // Collect timestamps for matching task_type, excluding XFER sentinels.
+    let mut timestamps: Vec<u64> = Vec::new(env);
+    for record in history.iter() {
+        if record.task_type == *task_type
+            && record.task_type != symbol_short!("XFER")
+        {
+            timestamps.push_back(record.timestamp);
+        }
+    }
+
+    if timestamps.len() < 2 {
+        return Err(ContractError::InsufficientPredictionData);
+    }
+
+    // Moving average of intervals between consecutive records.
+    let mut total_interval: u64 = 0;
+    let mut interval_count: u64 = 0;
+    for i in 1..timestamps.len() {
+        let interval = timestamps
+            .get(i as u32)
+            .unwrap()
+            .saturating_sub(timestamps.get((i - 1) as u32).unwrap());
+        if interval > 0 {
+            total_interval = total_interval.saturating_add(interval);
+            interval_count = interval_count.saturating_add(1);
+        }
+    }
+
+    if interval_count == 0 {
+        return Err(ContractError::InsufficientPredictionData);
+    }
+
+    let avg_interval = total_interval / interval_count;
+
+    // Clamp: minimum 24 hours, maximum 5 years.
+    let min_interval: u64 = 24 * 60 * 60;
+    let max_interval: u64 = 5 * 365 * 24 * 60 * 60;
+    let clamped = avg_interval.clamp(min_interval, max_interval);
+
+    let last_timestamp = timestamps.get(timestamps.len() - 1).unwrap();
+    Ok(last_timestamp.saturating_add(clamped))
+}
+
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
     use soroban_sdk::{contractclient, contracttype, Address, Env, Symbol, Vec};
@@ -3275,6 +3338,103 @@ impl Lifecycle {
             .persistent()
             .get(&health_snapshot_key(asset_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Predict the next service date for a given task type on an asset.
+    ///
+    /// Uses a simple moving average of historical intervals between consecutive
+    /// maintenance records of the same `task_type`. The prediction is clamped
+    /// to a minimum of 24 hours from now to prevent infinite loops from
+    /// back-to-back submissions, and a maximum of 5 years to prevent
+    /// unreasonable far-future predictions from sparse data.
+    ///
+    /// # Arguments
+    /// * `env` - The environment.
+    /// * `asset_id` - The unique identifier of the asset.
+    /// * `task_type` - The task type symbol to predict (e.g., `symbol_short!("OIL_CHG")`).
+    ///
+    /// # Returns
+    /// Predicted Unix timestamp (seconds) for the next service of this type.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::InsufficientPredictionData`] if fewer than 2 matching
+    ///   records exist (need at least 2 to compute an interval).
+    pub fn calculate_predicted_next_service(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+    ) -> u64 {
+        try_predict_next_service(&env, asset_id, &task_type)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Return active maintenance alerts for an asset.
+    ///
+    /// An alert is generated when the predicted next service date for a task
+    /// type has already passed, meaning the asset is overdue for maintenance.
+    ///
+    /// # Arguments
+    /// * `env` - The environment.
+    /// * `asset_id` - The unique identifier of the asset.
+    ///
+    /// # Returns
+    /// A `Vec<(Symbol, u64)>` where each entry is a `(task_type, overdue_since_timestamp)`.
+    /// The second value is the predicted service timestamp that was missed.
+    /// Returns an empty vec if no alerts are active or if there is insufficient
+    /// data to make predictions.
+    pub fn get_maintenance_alerts(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<(Symbol, u64)> {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return Vec::new(&env);
+        }
+
+        // Collect unique task types from the history, excluding XFER sentinels.
+        let mut task_types: Vec<Symbol> = Vec::new(&env);
+        for record in history.iter() {
+            if record.task_type == symbol_short!("XFER") {
+                continue;
+            }
+            let mut found = false;
+            for t in task_types.iter() {
+                if t == record.task_type {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                task_types.push_back(record.task_type.clone());
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let mut alerts: Vec<(Symbol, u64)> = Vec::new(&env);
+
+        for task_type in task_types.iter() {
+            // Use the fallible helper; skip task types with insufficient data.
+            if let Ok(predicted) = try_predict_next_service(&env, asset_id, &task_type) {
+                if now > predicted {
+                    alerts.push_back((task_type.clone(), predicted));
+                }
+            }
+        }
+
+        if !alerts.is_empty() {
+            env.events().publish(
+                (symbol_short!("MAINT_ALRT"), asset_id),
+                alerts.clone(),
+            );
+        }
+
+        alerts
     }
 }
 
