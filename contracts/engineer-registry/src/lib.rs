@@ -32,8 +32,8 @@ pub enum ContractError {
     CredentialSuspended = 17,
     EngineerAlreadySuspended = 18,
     InvalidSuspensionPeriod = 19,
-    BatchRevokeTooLarge = 17,
-    CredentialExpired = 18,
+    BatchRevokeTooLarge = 20,
+    CredentialExpired = 21,
 }
 
 impl From<SharedContractError> for ContractError {
