@@ -52,7 +52,7 @@ fn test_collateral_score_does_not_exceed_100_under_high_volume_maintenance() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "overhaul"),
-            &engineer,
+            &engineer, &None,
         );
         // Advance timestamp by 1 second so each record gets a unique ledger
         // timestamp and score-history deduplication does not collapse entries.

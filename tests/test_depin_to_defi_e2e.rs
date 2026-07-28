@@ -137,7 +137,7 @@ fn test_depin_to_defi_flow() {
             &asset_id,
             &symbol_short!(task_type),
             &String::from_str(&env, description),
-            &engineer,
+            &engineer, &None,
         );
 
         // Verify maintenance history grows
@@ -384,7 +384,7 @@ fn test_multiple_assets_independent_scores() {
             &asset_id_1,
             &symbol_short!("MAINT"),
             &String::from_str(&env, &format!("Maintenance {}", i)),
-            &engineer1,
+            &engineer1, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }
@@ -395,7 +395,7 @@ fn test_multiple_assets_independent_scores() {
             &asset_id_2,
             &symbol_short!("MAINT"),
             &String::from_str(&env, &format!("Maintenance {}", i)),
-            &engineer2,
+            &engineer2, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }

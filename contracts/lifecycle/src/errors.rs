@@ -36,6 +36,22 @@ pub enum ContractError {
     InsufficientSigners = 22,
     /// Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard).
     BatchTooLarge = 23,
+    /// Recurring task with the given task_id already exists for this asset.
+    DuplicateRecurringTask = 24,
+    /// Recurring task not found for the given task_id.
+    RecurringTaskNotFound = 25,
+    /// The maintenance record marked as duplicate was not found.
+    DuplicateRecordNotFound = 26,
+    /// Maintenance standards for this asset type are not registered.
+    StandardNotRegistered = 27,
+    /// The submitted compliance proof does not match the registered standard.
+    ComplianceValidationFailed = 28,
+    /// The maintenance standard for this asset type is already registered.
+    StandardAlreadyRegistered = 29,
+    /// The recurring task schedule has an invalid configuration.
+    InvalidRecurringSchedule = 30,
+    /// Cannot auto-create a recurring task that is not active.
+    RecurringTaskInactive = 31,
 }
 
 impl From<SharedContractError> for ContractError {

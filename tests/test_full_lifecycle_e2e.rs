@@ -65,7 +65,7 @@ fn test_full_lifecycle_e2e() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "Engine overhaul"),
-            &engineer,
+            &engineer, &None,
         );
 
         let history = lifecycle.get_maintenance_history(&asset_id);
@@ -133,7 +133,7 @@ fn test_asset_transfer_preserves_history() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "Maintenance task"),
-            &engineer,
+            &engineer, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }

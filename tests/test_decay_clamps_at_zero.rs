@@ -51,7 +51,7 @@ fn test_decay_score_clamps_at_zero_after_long_elapsed_time() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "overhaul"),
-            &engineer,
+            &engineer, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }
