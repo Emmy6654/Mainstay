@@ -8041,4 +8041,129 @@ mod tests {
             "get_lending_contract must return None before set_lending_contract is called"
         );
     }
+
+    #[test]
+    fn test_duplicate_serial_across_owners_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-001-DEDUP");
+
+        // Owner A registers asset with serial X
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model A"),
+            &serial,
+            &owner_a,
+        );
+
+        // Owner B attempts to register same serial X — must panic with DuplicateAsset
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model B"),
+            &serial,
+            &owner_b,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            ))),
+            "serial number deduplication must prevent a different owner from registering the same serial"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_sets_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Initially Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+
+        // Mark under maintenance as owner
+        client.mark_under_maintenance(&owner, &asset_id);
+
+        // Status should now be UnderMaintenance
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    fn test_mark_maintenance_complete_returns_to_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Mark under maintenance
+        client.mark_under_maintenance(&owner, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+        // Complete maintenance
+        client.mark_maintenance_complete(&owner, &asset_id);
+
+        // Status should return to Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let stranger = Address::generate(&env);
+        let result = client.try_mark_under_maintenance(&stranger, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            ))),
+            "non-owner/non-admin must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_decommissioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        // Decommission first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_mark_under_maintenance(&admin, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_admin_can_mark_under_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        client.mark_under_maintenance(&admin, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+        client.mark_maintenance_complete(&admin, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
 }
