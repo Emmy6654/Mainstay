@@ -37,6 +37,15 @@ pub struct Engineer {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainingRecord {
+    pub training_type: Symbol,
+    pub completion_date: u64,
+    pub certificate_hash: BytesN<32>,
+    pub issuer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineerStatus {
     Active = 0,
     Revoked = 1,
@@ -78,6 +87,10 @@ fn trusted_key(issuer: &Address) -> (Symbol, Address) {
 
 fn issuer_engineers_key(issuer: &Address) -> (Symbol, Address) {
     (symbol_short!("ISS_ENGS"), issuer.clone())
+}
+
+fn training_key(engineer: &Address) -> (Symbol, Address) {
+    (symbol_short!("TRAIN"), engineer.clone())
 }
 
 /// Returns the key for the authoritative trusted-issuer list in instance storage.
@@ -609,6 +622,79 @@ impl EngineerRegistry {
     /// Get the number of engineers credentialed by a specific issuer.
     pub fn get_engineer_count_by_issuer(env: Env, issuer: Address) -> u32 {
         Self::get_engineers_by_issuer(env, issuer).len()
+    }
+
+    /// Record a training completion for an engineer.
+    /// Only the engineer's original credential issuer can record training.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer who completed the training
+    /// * `training_type` - Symbol identifying the type of training completed
+    /// * `completion_date` - Unix timestamp when training was completed
+    /// * `certificate_hash` - Hash of the training certificate/documentation
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
+    /// - [`ContractError::UntrustedIssuer`] if the caller is not the engineer's issuer or not trusted
+    pub fn record_training(
+        env: Env,
+        engineer: Address,
+        training_type: Symbol,
+        completion_date: u64,
+        certificate_hash: BytesN<32>,
+    ) {
+        ensure_not_paused(&env);
+
+        let engineer_record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        engineer_record.issuer.require_auth();
+
+        // Verify the caller is still a trusted issuer
+        if !env.storage().instance().has(&trusted_key(&engineer_record.issuer)) {
+            panic_with_error!(&env, ContractError::UntrustedIssuer);
+        }
+
+        let record = TrainingRecord {
+            training_type: training_type.clone(),
+            completion_date,
+            certificate_hash: certificate_hash.clone(),
+            issuer: engineer_record.issuer.clone(),
+        };
+
+        let key = training_key(&engineer);
+        let mut history: Vec<TrainingRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(record);
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 518400, 518400);
+
+        env.events().publish(
+            (symbol_short!("REC_TRAIN"), engineer.clone()),
+            (training_type, completion_date, certificate_hash),
+        );
+    }
+
+    /// Get the complete training history for an engineer.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer
+    ///
+    /// # Returns
+    /// Vec of TrainingRecord containing all training records in chronological order
+    pub fn get_training_history(env: Env, engineer: Address) -> Vec<TrainingRecord> {
+        env.storage()
+            .persistent()
+            .get(&training_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Admin-only function to upgrade the contract WASM to a new hash.
@@ -2355,5 +2441,113 @@ mod tests {
                 ContractError::Paused as u32
             )))
         );
+    }
+
+    // --- Training record tests ---
+
+    #[test]
+    fn test_record_training_and_get_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &cred_hash, &issuer, &31_536_000);
+
+        let cert_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let ts = env.ledger().timestamp();
+        client.record_training(&engineer, &symbol_short!("SAFETY"), &ts, &cert_hash);
+
+        let history = client.get_training_history(&engineer);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().training_type, symbol_short!("SAFETY"));
+        assert_eq!(history.get(0).unwrap().completion_date, ts);
+        assert_eq!(history.get(0).unwrap().certificate_hash, cert_hash);
+        assert_eq!(history.get(0).unwrap().issuer, issuer);
+    }
+
+    #[test]
+    fn test_record_training_multiple_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &cred_hash, &issuer, &31_536_000);
+
+        client.record_training(&engineer, &symbol_short!("SAFETY"), &env.ledger().timestamp(), &BytesN::from_array(&env, &[1u8; 32]));
+        client.record_training(&engineer, &symbol_short!("TECHNICAL"), &env.ledger().timestamp(), &BytesN::from_array(&env, &[2u8; 32]));
+        client.record_training(&engineer, &symbol_short!("COMPLIANCE"), &env.ledger().timestamp(), &BytesN::from_array(&env, &[3u8; 32]));
+
+        let history = client.get_training_history(&engineer);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn test_get_training_history_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let history = client.get_training_history(&engineer);
+        assert_eq!(history.len(), 0);
+    }
+
+    #[test]
+    fn test_record_training_unknown_engineer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let unknown = Address::generate(&env);
+        let cert_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let result = client.try_record_training(&unknown, &symbol_short!("SAFETY"), &env.ledger().timestamp(), &cert_hash);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_record_training_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &cred_hash, &issuer, &31_536_000);
+
+        let cert_hash = BytesN::from_array(&env, &[5u8; 32]);
+        let ts = env.ledger().timestamp();
+        client.record_training(&engineer, &symbol_short!("SAFETY"), &ts, &cert_hash);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        use soroban_sdk::TryIntoVal;
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("REC_TRAIN"));
+        assert_eq!(t1, engineer);
+
+        let (emitted_type, emitted_date, emitted_hash): (Symbol, u64, BytesN<32>) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_type, symbol_short!("SAFETY"));
+        assert_eq!(emitted_date, ts);
+        assert_eq!(emitted_hash, cert_hash);
     }
 }
