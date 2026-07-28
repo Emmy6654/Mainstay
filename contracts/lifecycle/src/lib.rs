@@ -3003,12 +3003,18 @@ impl Lifecycle {
             if history.len() > config.max_history {
                 // Keep only the last max_history entries
                 let start_idx = history.len() - config.max_history;
+                let pruned_count = start_idx as u32;
+                let oldest_pruned_timestamp = history.get(0).unwrap().timestamp;
                 let mut pruned = Vec::new(&env);
                 for i in start_idx..history.len() {
                     pruned.push_back(history.get(i).unwrap());
                 }
                 env.storage().persistent().set(&history_key, &pruned);
                 extend_persistent_ttl(&env, &history_key);
+                env.events().publish(
+                    (EVENT_PRUNED,),
+                    (asset_id, pruned_count, oldest_pruned_timestamp),
+                );
 
                 // Remove asset from engineer index for engineers whose records were
                 // entirely dropped (i.e. they appear only in the pruned prefix).
