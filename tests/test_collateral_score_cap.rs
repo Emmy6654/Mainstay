@@ -41,7 +41,7 @@ fn test_collateral_score_does_not_exceed_100_under_high_volume_maintenance() {
     );
 
     let credential_hash = BytesN::from_array(&env, &[1u8; 32]);
-    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000);
+    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000, &None);
 
     lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
 

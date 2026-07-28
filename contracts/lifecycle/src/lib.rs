@@ -10413,7 +10413,7 @@ mod tests {
         let hash = BytesN::from_array(env, &[2u8; 32]);
         eng_registry.initialize_admin(&admin, &admin);
         eng_registry.add_trusted_issuer(&admin, &issuer);
-        eng_registry.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        eng_registry.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
         // Neutral reputation (1.0× multiplier) so tests don't depend on reputation weighting.
         eng_registry.update_reputation(&engineer, &500);
         engineer
@@ -10732,7 +10732,7 @@ mod tests {
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // validity_period = 86_400 s (1 day — the minimum allowed)
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
         // Confirm credential is Valid before we advance time.
         assert_eq!(
