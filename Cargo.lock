@@ -154,7 +154,9 @@ dependencies = [
 name = "asset-registry"
 version = "0.1.0"
 dependencies = [
+ "engineer-registry",
  "lifecycle",
+ "shared",
  "soroban-sdk",
 ]
 
@@ -278,6 +280,13 @@ dependencies = [
 [[package]]
 name = "cross-platform-tests"
 version = "0.1.0"
+dependencies = [
+ "asset-registry",
+ "engineer-registry",
+ "lending",
+ "lifecycle",
+ "soroban-sdk",
+]
 
 [[package]]
 name = "crypto-bigint"
@@ -545,6 +554,7 @@ dependencies = [
 name = "engineer-registry"
 version = "0.1.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
 ]
 
@@ -780,6 +790,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lending"
+version = "0.1.0"
+dependencies = [
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -797,6 +815,7 @@ version = "0.1.0"
 dependencies = [
  "asset-registry",
  "engineer-registry",
+ "shared",
  "soroban-sdk",
 ]
 
@@ -1154,6 +1173,13 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

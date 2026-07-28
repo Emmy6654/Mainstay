@@ -4,6 +4,53 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[dependencies]
+asset-registry = { path = "../contracts/asset-registry" }
+engineer-registry = { path = "../contracts/engineer-registry" }
+lifecycle = { path = "../contracts/lifecycle" }
+lending = { path = "../contracts/lending" }
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+
 [[test]]
 name = "cross_platform_tests"
 path = "cross_platform_tests.rs"
+
+[[test]]
+name = "test_full_lifecycle_e2e"
+path = "test_full_lifecycle_e2e.rs"
+
+[[test]]
+name = "test_lending_features"
+path = "test_lending_features.rs"
+
+[[test]]
+name = "test_loan_deadline"
+path = "test_loan_deadline.rs"
+
+[[test]]
+name = "test_emergency_pause"
+path = "test_emergency_pause.rs"
+
+[[test]]
+name = "test_admin_transfer"
+path = "test_admin_transfer.rs"
+
+[[test]]
+name = "test_admin_timelock"
+path = "test_admin_timelock.rs"
+
+[[test]]
+name = "test_multi_asset_collateral"
+path = "test_multi_asset_collateral.rs"
+
+[[test]]
+name = "test_paused_contract"
+path = "test_paused_contract.rs"
+
+[[test]]
+name = "test_collateral_score_cap"
+path = "test_collateral_score_cap.rs"
+
+[[test]]
+name = "test_decay_clamps_at_zero"
+path = "test_decay_clamps_at_zero.rs"

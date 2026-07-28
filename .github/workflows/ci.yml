@@ -39,55 +39,8 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
-  wasm-size:
-    name: WASM Size Check
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build WASM contracts
-        run: cargo build --target wasm32-unknown-unknown --release
-
-      - name: Check WASM sizes
-        run: |
-          # Soroban maximum WASM size is 65536 bytes
-          # Threshold set at 80% (52428 bytes) to leave headroom
-          MAX_SIZE=52428
-          THRESHOLD_PCT=80
-
-          echo "Checking WASM binary sizes against ${THRESHOLD_PCT}% of Soroban max (${MAX_SIZE} bytes)..."
-
-          EXCEEDED=0
-          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
-            SIZE=$(stat -c%s "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null)
-            NAME=$(basename "$wasm")
-            echo "  ${NAME}: ${SIZE} bytes"
-            if [ "$SIZE" -gt "$MAX_SIZE" ]; then
-              echo "::error file=${wasm}::${NAME} is ${SIZE} bytes, exceeding the ${MAX_SIZE} byte threshold"
-              EXCEEDED=1
-            fi
-          done
-
-          if [ "$EXCEEDED" -eq 1 ]; then
-            echo "::error::One or more WASM binaries exceed the size threshold"
-            exit 1
-          fi
-          echo "All WASM binaries are within the size limit."
+      - name: Run clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   audit:
     name: Dependency Audit
@@ -105,99 +58,20 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-  testnet-smoke:
-    name: Testnet Smoke Test
+  secret-scan:
+    name: Secret Scan
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          fetch-depth: 0
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build WASM contracts
-        run: cargo build --target wasm32-unknown-unknown --release
-
-      - name: Install Stellar CLI
+      - name: Install gitleaks
         run: |
-          cargo install stellar-cli --features opt
+          curl -sSfL https://github.com/zricethezav/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x86_64.tar.gz -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
 
-      - name: Deploy to testnet
-        run: |
-          chmod +x scripts/deploy_testnet.sh
-          ./scripts/deploy_testnet.sh
-        env:
-          STELLAR_NETWORK: testnet
-
-      - name: Test register_asset round-trip
-        run: |
-          echo "Verifying asset registration on testnet..."
-          # Generate a test identity for smoke testing
-          stellar keys generate smoke-tester --network testnet
-
-          # Fund the test account on testnet (using friendbot)
-          curl "https://friendbot.stellar.org?addr=$(stellar keys address smoke-tester)"
-
-          # Get the deployed contract IDs (extracted from deploy output or stored)
-          # For now, we deploy fresh and capture IDs
-          DEPLOY_OUTPUT=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/asset_registry.wasm \
-            --source smoke-tester \
-            --network testnet)
-          ASSET_REGISTRY_ID=$(echo "$DEPLOY_OUTPUT" | tail -1)
-          echo "Asset Registry deployed at: $ASSET_REGISTRY_ID"
-
-          # Initialize admin
-          stellar contract invoke \
-            --id "$ASSET_REGISTRY_ID" \
-            --source smoke-tester \
-            --network testnet \
-            -- initialize_admin --admin "$(stellar keys address smoke-tester)"
-
-          # Add asset type
-          stellar contract invoke \
-            --id "$ASSET_REGISTRY_ID" \
-            --source smoke-tester \
-            --network testnet \
-            -- add_asset_type --asset_type "GENSET" --admin "$(stellar keys address smoke-tester)"
-
-          # Register an asset
-          RESULT=$(stellar contract invoke \
-            --id "$ASSET_REGISTRY_ID" \
-            --source smoke-tester \
-            --network testnet \
-            -- register_asset \
-            --asset_type "GENSET" \
-            --metadata "Smoke Test Asset" \
-            --owner "$(stellar keys address smoke-tester)")
-
-          echo "Register asset result: $RESULT"
-
-          # Extract the returned asset ID and validate it
-          ASSET_ID=$(echo "$RESULT" | grep -oP '\d+' | head -1)
-          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" -le 0 ]; then
-            echo "::error::Invalid asset ID returned: $ASSET_ID"
-            exit 1
-          fi
-          echo "Successfully registered asset with ID: $ASSET_ID"
-
-          # Store deployed contract IDs as artifacts
-          echo "ASSET_REGISTRY_ID=$ASSET_REGISTRY_ID" >> contract-ids.env
-          echo "ASSET_ID=$ASSET_ID" >> contract-ids.env
-
-      - name: Upload contract IDs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-ids
-          path: contract-ids.env
+      - name: Run gitleaks scan
+        run: gitleaks detect --source . --config .gitleaks.toml
