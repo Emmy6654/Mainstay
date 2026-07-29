@@ -252,7 +252,6 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
     // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
     // returns the ledger number (currently ~30M on mainnet) and must NOT be used here:
     // the comparison would be either instant (delay << sequence) or centuries long.
-    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
