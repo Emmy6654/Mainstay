@@ -371,8 +371,8 @@ fn test_multiple_assets_independent_scores() {
     // Register engineers
     let cred_hash_1 = BytesN::from_array(&env, &[1u8; 32]);
     let cred_hash_2 = BytesN::from_array(&env, &[2u8; 32]);
-    engineer_registry.register_engineer(&engineer1, &cred_hash_1, &issuer, &31_536_000);
-    engineer_registry.register_engineer(&engineer2, &cred_hash_2, &issuer, &31_536_000);
+    engineer_registry.register_engineer(&engineer1, &cred_hash_1, &issuer, &31_536_000, &None);
+    engineer_registry.register_engineer(&engineer2, &cred_hash_2, &issuer, &31_536_000, &None);
 
     lifecycle.authorize_engineer(&owner1, &asset_id_1, &engineer1);
     lifecycle.authorize_engineer(&owner2, &asset_id_2, &engineer2);

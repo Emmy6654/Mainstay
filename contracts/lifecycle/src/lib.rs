@@ -957,13 +957,106 @@ impl Lifecycle {
         extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
-            (admin, env.ledger().timestamp()),
-        );
-    }
+env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
+             (admin, env.ledger().timestamp()),
+         );
+     }
 
-    /// Check if the contract is currently paused.
+     /// Propose pausing the contract using the admin timelock.
+     ///
+     /// # Arguments
+     /// * `admin` - The administrator requesting the pause
+     pub fn propose_pause(env: Env, admin: Address) {
+         ensure_not_paused(&env);
+         admin.require_auth();
+         let config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         require_quorum(&env, &config, &admin);
+         store_timelock(&env, symbol_short!("PAUSE"));
+         env.events().publish(
+             (symbol_short!("PROP_PAUSE"),), (admin.clone(),));
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("PROP_PAUSE")),
+             (admin, env.ledger().timestamp()),
+         );
+     }
+
+     /// Execute a pending pause after the timelock expires.
+     ///
+     /// # Arguments
+     /// * `admin` - The administrator performing the pause
+     pub fn execute_pause(env: Env, admin: Address) {
+         require_timelock_ready(&env, symbol_short!("PAUSE"));
+         admin.require_auth();
+         let config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         require_quorum(&env, &config, &admin);
+         env.storage().persistent().set(&PAUSED_KEY, &true);
+         extend_persistent_ttl(&env, &PAUSED_KEY);
+         env.events()
+             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
+             (admin, env.ledger().timestamp()),
+         );
+     }
+
+     /// Propose unpausing the contract using the admin timelock.
+     ///
+     /// # Arguments
+     /// * `admin` - The administrator requesting the unpause
+     pub fn propose_unpause(env: Env, admin: Address) {
+         admin.require_auth();
+         let config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         if config.admin != admin {
+             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+         }
+         store_timelock(&env, symbol_short!("UNPAUSE"));
+         env.events().publish(
+             (symbol_short!("PROP_UNPAUSE"),), (admin.clone(),));
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("PROP_UNPAUSE")),
+             (admin, env.ledger().timestamp()),
+         );
+     }
+
+     /// Execute a pending unpause after the timelock expires.
+     ///
+     /// # Arguments
+     /// * `admin` - The administrator performing the unpause
+     pub fn execute_unpause(env: Env, admin: Address) {
+         require_timelock_ready(&env, symbol_short!("UNPAUSE"));
+         admin.require_auth();
+         let config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         if config.admin != admin {
+             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+         }
+         env.storage().persistent().set(&PAUSED_KEY, &false);
+         extend_persistent_ttl(&env, &PAUSED_KEY);
+         env.events()
+             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
+             (admin, env.ledger().timestamp()),
+         );
+     }
+
+     /// Check if the contract is currently paused.
     ///
     /// # Returns
     /// `true` if paused; `false` otherwise
@@ -982,27 +1075,28 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
-    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
-        admin.require_auth();
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-        if env.storage().instance().has(&PENDING_ADMIN_KEY) {
-            panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
-        }
-        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
-        env.events()
-            .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("PROP_ADM")),
-            (admin, env.ledger().timestamp(), new_admin),
-        );
-    }
+pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+         admin.require_auth();
+         let config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         if config.admin != admin {
+             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+         }
+         if env.storage().instance().has(&PENDING_ADMIN_KEY) {
+             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
+         }
+         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+         store_timelock(&env, symbol_short!("ADM_XFER"));
+         env.events()
+             .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("PROP_ADM")),
+             (admin, env.ledger().timestamp(), new_admin),
+         );
+     }
 
     /// Accept the admin transfer (step 2 of 2-step transfer).
     /// Only the pending admin can accept and become the new admin.
@@ -1010,29 +1104,30 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if no pending admin exists
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the pending admin
-    pub fn accept_admin(env: Env) {
-        let pending_admin: Address = env
-            .storage()
-            .instance()
-            .get(&PENDING_ADMIN_KEY)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        pending_admin.require_auth();
+pub fn accept_admin(env: Env) {
+         require_timelock_ready(&env, symbol_short!("ADM_XFER"));
+         let pending_admin: Address = env
+             .storage()
+             .instance()
+             .get(&PENDING_ADMIN_KEY)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         pending_admin.require_auth();
 
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        config.admin = pending_admin.clone();
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-        env.storage().instance().remove(&PENDING_ADMIN_KEY);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
-            (pending_admin.clone(), env.ledger().timestamp()),
-        );
-        env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
-    }
+         let mut config: Config = env
+             .storage()
+             .persistent()
+             .get(&CONFIG)
+             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+         config.admin = pending_admin.clone();
+         env.storage().persistent().set(&CONFIG, &config);
+         extend_persistent_ttl(&env, &CONFIG);
+         env.storage().instance().remove(&PENDING_ADMIN_KEY);
+         env.events().publish(
+             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
+             (pending_admin.clone(), env.ledger().timestamp()),
+         );
+         env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
+     }
 
     /// Admin-only function to configure the M-of-N multisig set for critical operations.
     ///
@@ -6584,6 +6679,11 @@ mod tests {
         let new_admin = Address::generate(&env);
 
         client.propose_admin(&admin, &new_admin);
+
+        // Timelock must expire before accept_admin succeeds.
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
         client.accept_admin();
 
         assert_eq!(client.get_config().admin, new_admin);
@@ -6598,6 +6698,11 @@ mod tests {
         let new_admin = Address::generate(&env);
 
         client.propose_admin(&admin, &new_admin);
+
+        // Timelock must expire before accept_admin succeeds.
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
         client.accept_admin();
 
         let contract_id = client.address.clone();
@@ -6649,6 +6754,163 @@ mod tests {
         let result = client.try_accept_admin();
         assert!(result.is_err());
         assert_eq!(client.get_config().admin, admin);
+    }
+
+    #[test]
+    fn test_accept_admin_rejected_before_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin);
+
+        // Attempt to accept before timelock expires must fail.
+        let result = client.try_accept_admin();
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "accept_admin must fail with TimelockNotExpired before the timelock expires",
+        );
+
+        // Admin must remain unchanged.
+        assert_eq!(client.get_config().admin, admin);
+    }
+
+    #[test]
+    fn test_propose_pause_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_pause(&admin);
+
+        let events = env.events().all();
+        assert!(events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|v| soroban_sdk::TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                .map(|s: Symbol| s == symbol_short!("PROP_PAUSE"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn test_execute_pause_after_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_pause(&admin);
+
+        // Advance past timelock.
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_pause(&admin);
+
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_execute_pause_rejected_before_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_pause(&admin);
+
+        let result = client.try_execute_pause(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute_pause must fail with TimelockNotExpired before the timelock expires",
+        );
+    }
+
+    #[test]
+    fn test_propose_unpause_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        // First pause the contract so unpause can be proposed.
+        client.propose_pause(&admin);
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+        client.execute_pause(&admin);
+        assert!(client.is_paused());
+
+        client.propose_unpause(&admin);
+
+        let events = env.events().all();
+        assert!(events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|v| soroban_sdk::TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                .map(|s: Symbol| s == symbol_short!("PROP_UNPAUSE"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn test_execute_unpause_after_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        // First pause the contract so unpause can be proposed.
+        client.propose_pause(&admin);
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+        client.execute_pause(&admin);
+        assert!(client.is_paused());
+
+        client.propose_unpause(&admin);
+
+        // Advance past timelock.
+        let base2 = env.ledger().timestamp();
+        env.ledger().set_timestamp(base2 + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_unpause(&admin);
+
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_execute_unpause_rejected_before_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        // First pause the contract so unpause can be proposed.
+        client.propose_pause(&admin);
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+        client.execute_pause(&admin);
+        assert!(client.is_paused());
+
+        client.propose_unpause(&admin);
+
+        let result = client.try_execute_unpause(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute_unpause must fail with TimelockNotExpired before the timelock expires",
+        );
     }
 
     // --- Score history tests (original) ---
@@ -9878,6 +10140,11 @@ mod tests {
         let new_admin = Address::generate(&env);
 
         client.propose_admin(&admin, &new_admin);
+
+        // Timelock must expire before accept_admin succeeds.
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
         client.accept_admin();
 
         let events = env.events().all();
@@ -11219,7 +11486,7 @@ mod tests {
         let hash = BytesN::from_array(env, &[2u8; 32]);
         eng_registry.initialize_admin(&admin, &admin);
         eng_registry.add_trusted_issuer(&admin, &issuer);
-        eng_registry.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        eng_registry.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
         // Neutral reputation (1.0× multiplier) so tests don't depend on reputation weighting.
         eng_registry.update_reputation(&engineer, &500);
         engineer
@@ -11538,7 +11805,7 @@ mod tests {
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // validity_period = 86_400 s (1 day — the minimum allowed)
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
         // Confirm credential is Valid before we advance time.
         assert_eq!(
