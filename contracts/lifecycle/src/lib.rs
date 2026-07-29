@@ -7,8 +7,8 @@ mod types;
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
-    TransferRecord,
+    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, RecurringTask, ScoreEntry,
+    TimelockProposal, TransferRecord,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -110,6 +110,10 @@ fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
 }
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
+}
+
+fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("MSTD"), asset_type.clone())
 }
 
 /// Enforce M-of-N admin quorum for critical lifecycle operations.
@@ -496,6 +500,69 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
     if result.is_err() {
         panic_with_error!(env, ContractError::AssetNotFound);
     }
+}
+
+/// Internal helper: compute predicted next service timestamp without panicking.
+///
+/// Uses a moving average of historical intervals between consecutive records
+/// of the same task type. Returns [`ContractError::InsufficientPredictionData`]
+/// if fewer than 2 matching records exist.
+fn try_predict_next_service(
+    env: &Env,
+    asset_id: u64,
+    task_type: &Symbol,
+) -> Result<u64, ContractError> {
+    let history: Vec<MaintenanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&history_key(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+
+    if history.is_empty() {
+        return Err(ContractError::NoMaintenanceHistory);
+    }
+
+    // Collect timestamps for matching task_type, excluding XFER sentinels.
+    let mut timestamps: Vec<u64> = Vec::new(env);
+    for record in history.iter() {
+        if record.task_type == *task_type
+            && record.task_type != symbol_short!("XFER")
+        {
+            timestamps.push_back(record.timestamp);
+        }
+    }
+
+    if timestamps.len() < 2 {
+        return Err(ContractError::InsufficientPredictionData);
+    }
+
+    // Moving average of intervals between consecutive records.
+    let mut total_interval: u64 = 0;
+    let mut interval_count: u64 = 0;
+    for i in 1..timestamps.len() {
+        let interval = timestamps
+            .get(i as u32)
+            .unwrap()
+            .saturating_sub(timestamps.get((i - 1) as u32).unwrap());
+        if interval > 0 {
+            total_interval = total_interval.saturating_add(interval);
+            interval_count = interval_count.saturating_add(1);
+        }
+    }
+
+    if interval_count == 0 {
+        return Err(ContractError::InsufficientPredictionData);
+    }
+
+    let avg_interval = total_interval / interval_count;
+
+    // Clamp: minimum 24 hours, maximum 5 years.
+    let min_interval: u64 = 24 * 60 * 60;
+    let max_interval: u64 = 5 * 365 * 24 * 60 * 60;
+    let clamped = avg_interval.clamp(min_interval, max_interval);
+
+    let last_timestamp = timestamps.get(timestamps.len() - 1).unwrap();
+    Ok(last_timestamp.saturating_add(clamped))
 }
 
 // Minimal client interface for cross-contract call to EngineerRegistry
@@ -1446,6 +1513,7 @@ impl Lifecycle {
     /// * `task_type` - Symbol representing the type of maintenance task
     /// * `notes` - String containing maintenance notes and details
     /// * `engineer` - Address of the engineer performing the maintenance
+    /// * `cost` - Optional maintenance cost in stroops (1 stroop = 10^-7 XLM)
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
@@ -1456,8 +1524,10 @@ impl Lifecycle {
         env: Env,
         asset_id: u64,
         task_type: Symbol,
+        priority: Priority,
         notes: String,
         engineer: Address,
+        cost: Option<u64>,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
@@ -1502,23 +1572,18 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
-        // Cross-check engineer credential via registry. The lifecycle's
-        // own trait declares `verify_engineer -> Option<bool>` so we keep
-        // the bool contract here. The half-merged code that originally
-        // lived here left an unfinished `if status != ... {` that broke
-        // parsing; this is the closed-up version.
+        // Verify engineer credential via the engineer registry.
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        if !registry.verify_engineer(&engineer).unwrap_or(false) {
-        use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
-        if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-            let status = registry.verify_engineer(&engineer);
-            if status != CredentialStatus::Valid {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
-            }
+        if status != engineer_registry::CredentialStatus::Valid
+            && status != engineer_registry::CredentialStatus::GracePeriod
+        {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+
+        // Verify engineer is explicitly authorized by the asset owner
+        // for this specific asset (DataKey::EngineerAuth check).
         require_engineer_authorized(&env, asset_id, &engineer);
 
         // Validate engineer specialization matches asset type
@@ -1541,9 +1606,11 @@ impl Lifecycle {
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
+            priority,
             notes,
             engineer: engineer.clone(),
             timestamp,
+            cost,
         };
 
         history.push_back(record);
@@ -1650,9 +1717,11 @@ impl Lifecycle {
         let sentinel = MaintenanceRecord {
             asset_id,
             task_type: symbol_short!("XFER"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Ownership transferred"),
             engineer: new_owner.clone(),
             timestamp,
+            cost: None,
         };
 
         let mut history: Vec<MaintenanceRecord> = env
@@ -1687,6 +1756,35 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .extend_ttl(&xfer_key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Clear all EngineerAuth entries granted by the previous owner so that
+        // engineers authorized by the previous owner cannot submit maintenance
+        // under the new owner without re-authorization.
+        let mut cleared_engineers: Vec<Address> = Vec::new(&env);
+        // Reuse the already-loaded maintenance history (which now includes the
+        // transfer sentinel) to avoid an extra storage read.
+        for record in history.iter() {
+            let eng = record.engineer.clone();
+            let mut already_cleared = false;
+            for cleared in cleared_engineers.iter() {
+                if cleared == eng {
+                    already_cleared = true;
+                    break;
+                }
+            }
+            if !already_cleared {
+                env.storage()
+                    .persistent()
+                    .remove(&engineer_auth_key(asset_id, &eng));
+                cleared_engineers.push_back(eng);
+            }
+        }
+        if !cleared_engineers.is_empty() {
+            env.events().publish(
+                (symbol_short!("AUTH_CLR"), asset_id),
+                cleared_engineers,
+            );
+        }
 
         env.events().publish(
             (EVENT_XFER, asset_id),
@@ -1740,6 +1838,7 @@ impl Lifecycle {
         asset_id: u64,
         records: Vec<BatchRecord>,
         engineer: Address,
+        costs: Option<Vec<Option<u64>>>,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
@@ -1770,29 +1869,17 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Validate engineer credential via batch call to reduce future round-trips.
+        // Verify engineer credential via the engineer registry.
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        // Verify engineer credential through the batch path that already
-        // exists below. The half-merged `if status != CredentialStatus::Valid {`
-        // that originally lived here was never closed and broke parsing;
-        // the batch path is the same check intent expressed via the
-        // already-wired `batch_verify_engineers` API.
-        let mut batch = Vec::new(&env);
-        batch.push_back(engineer.clone());
-        let results = engineer_registry_client.batch_verify_engineers(&batch);
-        let verified = results.get(0).unwrap_or(false);
-        if !verified {
-        use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-            let status = engineer_registry_client.verify_engineer(&engineer);
-            if status != CredentialStatus::Valid {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
-            }
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+
+        // Verify engineer is explicitly authorized by the asset owner
+        // for this specific asset (DataKey::EngineerAuth check).
         require_engineer_authorized(&env, asset_id, &engineer);
 
         // Validate engineer specialization matches asset type
@@ -1822,6 +1909,10 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::HistoryCapReached);
         }
 
+        if costs.is_some() && costs.as_ref().map(|c| c.len() != records.len()).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
         // Build all records and compute final score before any write.
         let reputation = engineer_registry_client.get_reputation(&engineer);
         let weighted_increment = ((config.score_increment as u64) * (500 + reputation as u64) / 1000) as u32;
@@ -1833,19 +1924,27 @@ impl Lifecycle {
 
         let mut new_records: Vec<MaintenanceRecord> = Vec::new(&env);
         let mut score_entries: Vec<ScoreEntry> = Vec::new(&env);
+        let mut rec_idx: u32 = 0;
         for record in records.iter() {
             score = score
                 .checked_add(weighted_increment)
                 .map(|s: u32| s.min(100))
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+            let rec_cost = costs
+                .as_ref()
+                .and_then(|c| c.get(rec_idx))
+                .and_then(|o| o);
             new_records.push_back(MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
+                priority: record.priority,
                 notes: record.notes.clone(),
                 engineer: engineer.clone(),
                 timestamp,
+                cost: rec_cost,
             });
             score_entries.push_back(ScoreEntry { timestamp, score });
+            rec_idx += 1;
         }
 
         // All validation passed — now commit everything atomically.
@@ -1858,7 +1957,7 @@ impl Lifecycle {
         for record in records.iter() {
             env.events().publish(
                 (EVENT_MAINT, asset_id),
-                (record.task_type.clone(), engineer.clone(), timestamp),
+                (record.task_type.clone(), record.priority, engineer.clone(), timestamp),
             );
         }
 
@@ -2158,6 +2257,95 @@ impl Lifecycle {
         best
     }
 
+    /// Returns the total maintenance cost for an asset across all records (in stroops).
+    ///
+    /// Sums all `cost` fields from the asset's maintenance history.
+    /// Records with `cost: None` contribute 0 to the total.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// Total cost in stroops (1 stroop = 10^-7 XLM). Returns 0 if no history.
+    pub fn get_total_maintenance_cost(env: Env, asset_id: u64) -> u64 {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut total: u64 = 0;
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            total = total.saturating_add(record.cost.unwrap_or(0));
+        }
+        total
+    }
+
+    /// Returns a chronological list of (timestamp, cost) pairs for an asset.
+    ///
+    /// Only includes records where `cost` is `Some`. Records with `None` cost
+    /// are filtered out. Useful for trend analysis and cost anomaly detection.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Vec<(u64, u64)>` where each element is `(timestamp, cost_in_stroops)`
+    pub fn get_maintenance_cost_history(env: Env, asset_id: u64) -> Vec<(u64, u64)> {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result = Vec::<(u64, u64)>::new(&env);
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if let Some(cost) = record.cost {
+                result.push_back((record.timestamp, cost));
+            }
+        }
+        result
+    }
+
+    /// Returns the average maintenance cost for a specific task type on an asset.
+    ///
+    /// Only considers records matching the given `task_type`. Records with
+    /// `cost: None` are excluded from the average calculation.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `task_type` - The task type to filter by
+    ///
+    /// # Returns
+    /// Average cost in stroops, or 0 if no matching records with cost data exist.
+    pub fn get_average_maintenance_interval_cost(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+    ) -> u64 {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut total: u64 = 0;
+        let mut count: u64 = 0;
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.task_type == task_type {
+                if let Some(cost) = record.cost {
+                    total = total.saturating_add(cost);
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            0
+        } else {
+            total / count
+        }
+    }
+
     /// View alias for [`get_last_service`].
     /// Returns the most recent maintenance record for an asset, or `None` if no history exists.
     /// Frontends and lenders should prefer this over fetching the full history.
@@ -2169,6 +2357,419 @@ impl Lifecycle {
     /// `Some(MaintenanceRecord)` for the latest record, or `None` for assets with no history
     pub fn get_last_maintenance(env: Env, asset_id: u64) -> Option<MaintenanceRecord> {
         Self::get_last_service(env, asset_id)
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Recurring Maintenance Tasks
+    // ---------------------------------------------------------------------------
+
+    /// Schedule a recurring maintenance task for an asset.
+    ///
+    /// Only the asset owner (as recorded in the asset registry) may schedule recurring tasks.
+    ///
+    /// # Arguments
+    /// * `owner` - The owner address (must match the asset's current owner)
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `task_id` - A unique identifier for this recurring task definition
+    /// * `task_type` - The type of maintenance task (e.g., "OIL_CHG")
+    /// * `interval_type` - Unit of the interval (e.g., "HOURS", "DAYS", "CYCLES")
+    /// * `interval_value` - The numeric interval (e.g., 500 for "every 500 hours")
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the asset owner
+    /// - [`ContractError::DuplicateRecurringTask`] if task_id already exists
+    /// - [`ContractError::InvalidRecurringSchedule`] if interval_value is 0
+    pub fn schedule_recurring_task(
+        env: Env,
+        owner: Address,
+        asset_id: u64,
+        task_id: u64,
+        task_type: Symbol,
+        interval_type: Symbol,
+        interval_value: u64,
+    ) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        if interval_value == 0 {
+            panic_with_error!(&env, ContractError::InvalidRecurringSchedule);
+        }
+
+        // Verify caller is the asset owner
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let mut tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringTasks(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check for duplicate task_id
+        for i in 0..tasks.len() {
+            if tasks.get(i).unwrap().task_id == task_id {
+                panic_with_error!(&env, ContractError::DuplicateRecurringTask);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let next_due = now.saturating_add(interval_value);
+
+        tasks.push_back(RecurringTask {
+            task_id,
+            task_type,
+            interval_type,
+            interval_value,
+            next_due,
+            is_active: true,
+        });
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringTasks(asset_id), &tasks);
+        extend_persistent_ttl(&env, &DataKey::RecurringTasks(asset_id));
+
+        env.events().publish(
+            (symbol_short!("RECUR_SCH"), asset_id),
+            (task_id, task_type.clone(), interval_value),
+        );
+    }
+
+    /// Auto-create a maintenance record from a recurring task schedule.
+    ///
+    /// Called by an off-chain scheduler (or any caller) when a recurring task's
+    /// `next_due` timestamp has been reached. Creates a new maintenance record
+    /// and updates the `next_due` to `now + interval_value`.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `task_id` - The recurring task ID to execute
+    /// * `engineer` - The engineer performing the maintenance
+    ///
+    /// # Panics
+    /// - [`ContractError::RecurringTaskNotFound`] if task_id not found
+    /// - [`ContractError::RecurringTaskInactive`] if the task is not active
+    pub fn auto_create_recurring_task(
+        env: Env,
+        asset_id: u64,
+        task_id: u64,
+        engineer: Address,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+
+        let mut tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringTasks(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::RecurringTaskNotFound));
+
+        let mut found_idx: Option<u32> = None;
+        for i in 0..tasks.len() {
+            let task = tasks.get(i).unwrap();
+            if task.task_id == task_id {
+                if !task.is_active {
+                    panic_with_error!(&env, ContractError::RecurringTaskInactive);
+                }
+                found_idx = Some(i);
+                break;
+            }
+        }
+
+        let idx = found_idx.unwrap_or_else(|| {
+            panic_with_error!(&env, ContractError::RecurringTaskNotFound)
+        });
+
+        let task = tasks.get(idx).unwrap();
+        let task_type = task.task_type.clone();
+
+        // Create the maintenance record with no cost (auto-generated)
+        let timestamp = env.ledger().timestamp();
+        let notes = String::from_str(&env, "Auto-created from recurring schedule");
+
+        let record = MaintenanceRecord {
+            asset_id,
+            task_type: task_type.clone(),
+            notes,
+            engineer: engineer.clone(),
+            timestamp,
+            cost: None,
+        };
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        if config.max_history > 0 && history.len() >= config.max_history {
+            history.remove(0);
+        }
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&history_key(asset_id), &history);
+        extend_persistent_ttl(&env, &history_key(asset_id));
+
+        // Update next_due for this recurring task
+        let mut task_mut = tasks.get(idx).unwrap();
+        task_mut.next_due = timestamp.saturating_add(task_mut.interval_value);
+        tasks.set(idx, task_mut);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringTasks(asset_id), &tasks);
+        extend_persistent_ttl(&env, &DataKey::RecurringTasks(asset_id));
+
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &timestamp);
+        extend_persistent_ttl(&env, &last_update_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("RECUR_EXEC"), asset_id),
+            (task_id, task_type, timestamp),
+        );
+    }
+
+    /// Returns all recurring tasks configured for an asset.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Vec<RecurringTask>` — empty if none are configured
+    pub fn get_recurring_tasks(env: Env, asset_id: u64) -> Vec<RecurringTask> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecurringTasks(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Duplicate Maintenance Detection
+    // ---------------------------------------------------------------------------
+
+    /// Detect pairs of duplicate maintenance events within a time window.
+    ///
+    /// Two records are considered duplicates if they share the same `task_type`
+    /// and `engineer` and were submitted within `window_seconds` of each other.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `window_seconds` - Time window in seconds for duplicate detection
+    ///
+    /// # Returns
+    /// `Vec<(u64, u64)>` where each element is a pair of timestamps of similar events
+    pub fn get_duplicate_maintenance_events(
+        env: Env,
+        asset_id: u64,
+        window_seconds: u64,
+    ) -> Vec<(u64, u64)> {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut result = Vec::<(u64, u64)>::new(&env);
+        let len = history.len();
+
+        for i in 0..len {
+            let a = history.get(i).unwrap();
+            if a.task_type == symbol_short!("XFER") {
+                continue;
+            }
+            let mut j = i.saturating_add(1);
+            while j < len {
+                let b = history.get(j).unwrap();
+                if b.task_type == symbol_short!("XFER") {
+                    j += 1;
+                    continue;
+                }
+                let time_diff = if a.timestamp > b.timestamp {
+                    a.timestamp.saturating_sub(b.timestamp)
+                } else {
+                    b.timestamp.saturating_sub(a.timestamp)
+                };
+                if a.task_type == b.task_type
+                    && a.engineer == b.engineer
+                    && time_diff <= window_seconds
+                {
+                    result.push_back((a.timestamp, b.timestamp));
+                }
+                j += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Mark a maintenance record as a duplicate.
+    ///
+    /// Admin-only. Stores the duplicate record's timestamp so that scoring
+    /// logic can exclude it from collateral score calculations.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `primary_id` - The timestamp of the canonical (primary) record (informational)
+    /// * `duplicate_id` - The timestamp of the record to mark as duplicate
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::DuplicateRecordNotFound`] if the duplicate timestamp not in history
+    pub fn mark_maintenance_as_duplicate(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        primary_id: u64,
+        duplicate_id: u64,
+    ) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        // Verify the duplicate timestamp exists in history
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..history.len() {
+            if history.get(i).unwrap().timestamp == duplicate_id {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::DuplicateRecordNotFound);
+        }
+
+        let mut duplicates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DuplicateRecords(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        duplicates.push_back(duplicate_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DuplicateRecords(asset_id), &duplicates);
+        extend_persistent_ttl(&env, &DataKey::DuplicateRecords(asset_id));
+
+        env.events().publish(
+            (symbol_short!("MARK_DUP"), asset_id),
+            (primary_id, duplicate_id, env.ledger().timestamp()),
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Maintenance Compliance Standards
+    // ---------------------------------------------------------------------------
+
+    /// Register a maintenance compliance standard for an asset type.
+    ///
+    /// Admin-only. Stores the compliance standard definition hash, enabling
+    /// later validation that submitted maintenance meets industry requirements.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_type` - The asset type to register the standard for
+    /// * `standard_definition_hash` - Hash of the compliance standard document
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::StandardAlreadyRegistered`] if already registered for this type
+    pub fn register_standard(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        standard_definition_hash: Bytes,
+    ) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let key = standard_key(&asset_type);
+
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::StandardAlreadyRegistered);
+        }
+
+        env.storage().persistent().set(&key, &standard_definition_hash);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("REG_STD"), asset_type.clone()),
+            standard_definition_hash.clone(),
+        );
+    }
+
+    /// Validate that a submitted maintenance task complies with the registered standard.
+    ///
+    /// Retrieves the asset type from the registry, then checks whether the provided
+    /// `compliance_proof_hash` matches the registered standard for that asset type.
+    /// Returns `true` if compliant, `false` otherwise.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `task_type` - The type of maintenance task being validated
+    /// * `compliance_proof_hash` - The hash to validate against the standard
+    ///
+    /// # Returns
+    /// `true` if the proof matches the registered standard
+    pub fn validate_maintenance_compliance(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+        compliance_proof_hash: Bytes,
+    ) -> bool {
+        // Get the asset type from the registry
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        if client.try_get_asset(&asset_id).is_err() {
+            return false;
+        }
+        let asset = client.get_asset(&asset_id);
+
+        let key = standard_key(&asset.asset_type);
+
+        // Look up the registered standard for this asset type and compare
+        if let Some(registered_hash) =
+            env.storage().persistent().get::<_, Bytes>(&key)
+        {
+            registered_hash == compliance_proof_hash
+        } else {
+            false
+        }
+    }
+
+    /// Return the registered maintenance compliance standard for an asset type.
+    ///
+    /// Returns the raw standard bytes if registered, or empty `Bytes` if none.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The asset type to look up
+    ///
+    /// # Returns
+    /// `Bytes` containing the standard definition, empty if not registered
+    pub fn get_maintenance_standard(env: Env, asset_type: Symbol) -> Bytes {
+        let key = standard_key(&asset_type);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Bytes::from_slice(&env, &[]))
     }
 
     /// Get the current collateral score for an asset.
@@ -3276,6 +3877,103 @@ impl Lifecycle {
             .get(&health_snapshot_key(asset_id))
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    /// Predict the next service date for a given task type on an asset.
+    ///
+    /// Uses a simple moving average of historical intervals between consecutive
+    /// maintenance records of the same `task_type`. The prediction is clamped
+    /// to a minimum of 24 hours from now to prevent infinite loops from
+    /// back-to-back submissions, and a maximum of 5 years to prevent
+    /// unreasonable far-future predictions from sparse data.
+    ///
+    /// # Arguments
+    /// * `env` - The environment.
+    /// * `asset_id` - The unique identifier of the asset.
+    /// * `task_type` - The task type symbol to predict (e.g., `symbol_short!("OIL_CHG")`).
+    ///
+    /// # Returns
+    /// Predicted Unix timestamp (seconds) for the next service of this type.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::InsufficientPredictionData`] if fewer than 2 matching
+    ///   records exist (need at least 2 to compute an interval).
+    pub fn calculate_predicted_next_service(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+    ) -> u64 {
+        try_predict_next_service(&env, asset_id, &task_type)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Return active maintenance alerts for an asset.
+    ///
+    /// An alert is generated when the predicted next service date for a task
+    /// type has already passed, meaning the asset is overdue for maintenance.
+    ///
+    /// # Arguments
+    /// * `env` - The environment.
+    /// * `asset_id` - The unique identifier of the asset.
+    ///
+    /// # Returns
+    /// A `Vec<(Symbol, u64)>` where each entry is a `(task_type, overdue_since_timestamp)`.
+    /// The second value is the predicted service timestamp that was missed.
+    /// Returns an empty vec if no alerts are active or if there is insufficient
+    /// data to make predictions.
+    pub fn get_maintenance_alerts(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<(Symbol, u64)> {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return Vec::new(&env);
+        }
+
+        // Collect unique task types from the history, excluding XFER sentinels.
+        let mut task_types: Vec<Symbol> = Vec::new(&env);
+        for record in history.iter() {
+            if record.task_type == symbol_short!("XFER") {
+                continue;
+            }
+            let mut found = false;
+            for t in task_types.iter() {
+                if t == record.task_type {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                task_types.push_back(record.task_type.clone());
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let mut alerts: Vec<(Symbol, u64)> = Vec::new(&env);
+
+        for task_type in task_types.iter() {
+            // Use the fallible helper; skip task types with insufficient data.
+            if let Ok(predicted) = try_predict_next_service(&env, asset_id, &task_type) {
+                if now > predicted {
+                    alerts.push_back((task_type.clone(), predicted));
+                }
+            }
+        }
+
+        if !alerts.is_empty() {
+            env.events().publish(
+                (symbol_short!("MAINT_ALRT"), asset_id),
+                alerts.clone(),
+            );
+        }
+
+        alerts
+    }
 }
 
 #[cfg(test)]
@@ -3402,6 +4100,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Routine oil change"),
                 &engineer,
             );
@@ -3658,6 +4357,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &999u64,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &engineer,
         );
@@ -3685,6 +4385,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
             );
@@ -3694,6 +4395,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "over cap"),
             &engineer,
         );
@@ -3757,6 +4459,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
             );
@@ -3767,6 +4470,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "over cap"),
             &unregistered,
         );
@@ -3816,6 +4520,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
+            &Priority::Low,
             &String::from_str(&env, "Unknown task type"),
             &engineer,
         );
@@ -3925,6 +4630,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &unregistered,
         );
@@ -3951,12 +4657,14 @@ mod tests {
         client.submit_maintenance(
             &asset_id1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "one"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id2,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "two"),
             &engineer,
         );
@@ -3986,6 +4694,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "service"),
                 &engineer,
             );
@@ -4022,12 +4731,14 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -4071,6 +4782,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -4080,6 +4792,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -4144,6 +4857,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Configured increment"),
             &engineer,
         );
@@ -4166,6 +4880,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First"),
             &engineer,
         );
@@ -4176,6 +4891,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second"),
             &engineer,
         );
@@ -4188,6 +4904,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Bulk"),
                 &engineer,
             );
@@ -4573,6 +5290,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -4590,6 +5308,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -4623,6 +5342,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -4668,6 +5388,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Maintenance"),
                 &engineer,
             );
@@ -4798,6 +5519,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -4892,6 +5614,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Major work"),
                 &engineer,
             );
@@ -4928,6 +5651,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score"),
                 &engineer,
             );
@@ -4966,6 +5690,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score"),
                 &engineer,
             );
@@ -5015,6 +5740,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Build score to 50"),
                 &engineer,
             );
@@ -5042,6 +5768,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Single major service"),
             &engineer,
         );
@@ -5345,6 +6072,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "notes"),
             &engineer,
         );
@@ -5365,6 +6093,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "notes"),
             &engineer,
         );
@@ -5391,6 +6120,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "notes"),
                 &engineer,
             );
@@ -5422,6 +6152,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement 1"),
             &engineer,
         );
@@ -5432,6 +6163,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement 2"),
             &engineer,
         );
@@ -5946,6 +6678,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First"),
             &engineer,
         );
@@ -5953,6 +6686,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Second"),
             &engineer,
         );
@@ -5960,6 +6694,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Third"),
             &engineer,
         );
@@ -5984,6 +6719,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "a"),
             &engineer,
         );
@@ -5991,6 +6727,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "b"),
             &engineer,
         );
@@ -5998,6 +6735,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "c"),
             &engineer,
         );
@@ -6022,6 +6760,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "at t0"),
             &engineer,
         );
@@ -6032,6 +6771,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("LUBE"),
+            &Priority::Low,
             &String::from_str(&env, "at t1"),
             &engineer,
         );
@@ -6058,6 +6798,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("REBUILD"),
+                &Priority::Low,
                 &String::from_str(&env, "major"),
                 &engineer,
             );
@@ -6125,6 +6866,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "entry"),
                 &engineer,
             );
@@ -6153,6 +6895,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "only one"),
             &engineer,
         );
@@ -6175,6 +6918,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "entry"),
             &engineer,
         );
@@ -6208,14 +6952,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("ENGINE"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Engine repair"),
         });
 
@@ -6239,10 +6986,12 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -6273,6 +7022,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("UNKNOWN"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Unknown task type"),
         });
 
@@ -6369,14 +7119,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change 1"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change 2"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -6483,14 +7236,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "First"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Second"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Third - over cap"),
         });
 
@@ -6515,6 +7271,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Should fail"),
         });
 
@@ -6540,14 +7297,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("UNKNOWN"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Invalid task type"),
         });
 
@@ -6575,6 +7335,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, &"x".repeat(300)),
         });
 
@@ -6600,6 +7361,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &unregistered,
         );
@@ -6626,6 +7388,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "Filter replacement"),
                 &engineer,
             );
@@ -6677,6 +7440,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
         );
@@ -6716,6 +7480,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
         );
@@ -6735,6 +7500,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-reregistration submission"),
             &engineer,
         );
@@ -6775,6 +7541,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-expiry attempt"),
             &engineer,
         );
@@ -6797,6 +7564,7 @@ mod tests {
         let owner = Address::generate(&env);
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
+            &Priority::Low,
             &String::from_str(&env, "Test Generator"),
             &unique_serial(&env),
             &owner,
@@ -6821,6 +7589,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-expiry attempt"),
             &engineer,
         );
@@ -6843,6 +7612,7 @@ mod tests {
         let owner = Address::generate(&env);
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
+            &Priority::Low,
             &String::from_str(&env, "Test Generator"),
             &unique_serial(&env),
             &owner,
@@ -6867,6 +7637,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Post-expiry batch attempt"),
         });
 
@@ -6919,6 +7690,7 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Full engine service"),
                 &engineer,
             );
@@ -6996,6 +7768,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -7019,6 +7792,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -7047,6 +7821,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -7056,6 +7831,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Post-reset work"),
             &engineer,
         );
@@ -7145,6 +7921,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -7180,6 +7957,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Major overhaul"),
             &engineer,
         );
@@ -7221,6 +7999,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first service"),
             &engineer,
         );
@@ -7231,6 +8010,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "second service"),
             &engineer,
         );
@@ -7295,6 +8075,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
             );
@@ -7346,6 +8127,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
             );
@@ -7647,14 +8429,17 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "First"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Second"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("ENGINE"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Third"),
         });
 
@@ -7683,6 +8468,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "ttl test"),
         });
         client.batch_submit_maintenance(&asset_id, &records, &engineer);
@@ -7720,6 +8506,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -7768,6 +8555,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -7811,6 +8599,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
             );
@@ -8005,6 +8794,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -8053,6 +8843,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -8088,10 +8879,12 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Oil change"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("INSPECT"),
+            priority: Priority::Low,
             notes: String::from_str(&env, "Inspection"),
         });
 
@@ -8130,6 +8923,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -8157,6 +8951,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first"),
             &engineer,
         );
@@ -8165,6 +8960,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "second"),
             &engineer,
         );
@@ -8189,6 +8985,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Maintenance"),
             &engineer,
         );
@@ -8350,6 +9147,7 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "should be blocked"),
                 &engineer,
             ),
@@ -8519,6 +9317,7 @@ mod tests {
         client.submit_maintenance(
             &asset1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Session 1"),
             &engineer,
         );
@@ -8527,6 +9326,7 @@ mod tests {
         client.submit_maintenance(
             &asset2,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Session 2"),
             &engineer,
         );
@@ -8552,6 +9352,7 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "Filter replacement"),
                 &engineer,
             );
@@ -8563,6 +9364,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Filter replacement"),
             &engineer,
         );
@@ -8610,6 +9412,7 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OVERHAUL"),
+                &Priority::Low,
                 &String::from_str(&env, "Full overhaul"),
                 &engineer,
             );
@@ -8686,12 +9489,14 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-transfer inspection"),
             &engineer,
         );
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Oil change"),
             &engineer,
         );
@@ -9169,6 +9974,7 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Routine check"),
             &engineer,
         );

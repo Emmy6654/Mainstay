@@ -52,5 +52,13 @@ name = "test_collateral_score_cap"
 path = "test_collateral_score_cap.rs"
 
 [[test]]
+name = "test_maintenance_features"
+path = "test_maintenance_features.rs"
+
+[[test]]
 name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
+
+[[test]]
+name = "test_decommissioned_asset_maintenance"
+path = "test_decommissioned_asset_maintenance.rs"

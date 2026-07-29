@@ -7049,6 +7049,7 @@ mod tests {
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "Pre-decommission service"),
             &engineer,
+            &None,
         );
 
         let score_at_decommission = lc_client.get_collateral_score(&asset_id);

@@ -313,7 +313,7 @@ fn fuzz_submit_maintenance_no_panic() {
 
         // Execute the fuzz test: must not panic
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            lifecycle.try_submit_maintenance(&asset_id, &task_type_symbol, &notes, &engineer)
+            lifecycle.try_submit_maintenance(&asset_id, &task_type_symbol, &notes, &engineer, &None)
         }));
 
         match result {
@@ -380,7 +380,7 @@ fn fuzz_empty_notes_error() {
     // Empty notes should be rejected
     let empty_notes = String::from_str(&env, "");
     let result =
-        lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &empty_notes, &engineer);
+        lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &empty_notes, &engineer, &None);
 
     // Should return an error, not panic
     assert!(result.is_err(), "Empty notes should be rejected with structured error");
@@ -438,7 +438,7 @@ fn fuzz_oversized_notes_error() {
         &asset_id,
         &symbol_short!("FUZZ"),
         &oversized_notes,
-        &engineer,
+        &engineer, &None,
     );
 
     // Should return an error, not panic
@@ -496,7 +496,7 @@ fn fuzz_max_length_notes_accepted() {
     // Create notes at exactly max_notes_length (default 256)
     let max_length = "x".repeat(256);
     let max_notes = String::from_str(&env, &max_length);
-    let result = lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &max_notes, &engineer);
+    let result = lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &max_notes, &engineer, &None);
 
     // Should succeed (return Ok)
     assert!(
@@ -555,7 +555,7 @@ fn fuzz_invalid_input_no_state_corruption() {
 
     // Try to submit with empty notes (invalid)
     let empty_notes = String::from_str(&env, "");
-    let _ = lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &empty_notes, &engineer);
+    let _ = lifecycle.try_submit_maintenance(&asset_id, &symbol_short!("FUZZ"), &empty_notes, &engineer, &None);
 
     // Try to submit with oversized notes (invalid)
     let oversized = "x".repeat(500);
@@ -564,7 +564,7 @@ fn fuzz_invalid_input_no_state_corruption() {
         &asset_id,
         &symbol_short!("FUZZ"),
         &oversized_notes,
-        &engineer,
+        &engineer, &None,
     );
 
     // Score should remain unchanged
@@ -580,7 +580,7 @@ fn fuzz_invalid_input_no_state_corruption() {
         &asset_id,
         &symbol_short!("FUZZ"),
         &valid_notes,
-        &engineer,
+        &engineer, &None,
     );
 
     // Score should have improved
