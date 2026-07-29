@@ -111,7 +111,26 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
     let current_ledger = current_time_seconds / 5;
     let mut total_score: u32 = 0;
 
+    // Load duplicate record timestamps for this asset and skip them during scoring
+    let duplicates: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DuplicateRecords(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+
     for record in history.iter() {
+        // Skip records marked as duplicates
+        let mut is_duplicate = false;
+        for d in 0..duplicates.len() {
+            if duplicates.get(d).unwrap() == record.timestamp {
+                is_duplicate = true;
+                break;
+            }
+        }
+        if is_duplicate {
+            continue;
+        }
+
         let record_ledger = record.timestamp / 5;
         let age_ledgers = current_ledger.saturating_sub(record_ledger);
         let recency_weight = if age_ledgers >= super::MAX_AGE_LEDGERS {
