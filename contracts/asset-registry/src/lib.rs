@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::{require_non_empty_vec, require_string_length};
-use shared::{extend_persistent_ttl, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
@@ -1357,9 +1357,8 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn set_lifecycle_contract(env: Env, admin: Address, lifecycle_addr: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().instance().set(&LIFECYCLE_KEY, &lifecycle_addr);
@@ -1388,9 +1387,8 @@ impl AssetRegistry {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         if env.storage().instance().has(&PENDING_ADMIN_KEY) {
@@ -1443,9 +1441,8 @@ impl AssetRegistry {
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &true);
@@ -1463,9 +1460,8 @@ impl AssetRegistry {
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
@@ -2055,9 +2051,8 @@ impl AssetRegistry {
     /// * `admin` - The address that must match the stored admin
     /// * `asset_type` - The symbol of the new asset type to allow
     pub fn add_asset_type(env: Env, admin: Address, asset_type: Symbol) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage()
@@ -2081,9 +2076,8 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::TypeInUse`] if one or more assets of this type are still registered
     pub fn remove_asset_type(env: Env, admin: Address, asset_type: Symbol) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         let count: u64 = env
@@ -2343,6 +2337,90 @@ impl AssetRegistry {
         }
 
         SearchPage { assets: matched, total: total_matched }
+    }
+
+    /// Mark an asset as under maintenance.
+    /// Callable by the asset owner or contract admin.
+    ///
+    /// Sets the asset's status to [`AssetStatus::UnderMaintenance`], which
+    /// signals to integrators (e.g. lending contracts, lifecycle scoring)
+    /// that the asset is temporarily unavailable for normal operation.
+    ///
+    /// # Arguments
+    /// * `caller` - The address initiating the maintenance (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    /// - [`ContractError::AssetDecommissioned`] if the asset is decommissioned
+    pub fn mark_under_maintenance(env: Env, caller: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Reject decommissioned assets
+        let decomm_key = decommissioned_key(asset_id);
+        if env.storage().persistent().get::<_, bool>(&decomm_key).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().set(&maint_key, &true);
+        extend_persistent_ttl(&env, &maint_key);
+
+        env.events().publish(
+            (symbol_short!("MAINT_START"), asset_id),
+            (caller, env.ledger().timestamp()),
+        );
+    }
+
+    /// Mark an asset as having completed maintenance, returning it to [`AssetStatus::Active`].
+    /// Callable by the asset owner or contract admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The address completing maintenance (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    pub fn mark_maintenance_complete(env: Env, caller: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().remove(&maint_key);
+
+        env.events().publish(
+            (symbol_short!("MAINT_END"), asset_id),
+            (caller, env.ledger().timestamp()),
+        );
     }
 }
 
@@ -4186,7 +4264,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_initialize_admin_called_twice_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -4195,8 +4272,14 @@ mod tests {
 
         let admin = Address::generate(&env);
         client.initialize_admin(&admin, &admin);
-        // Second call must panic
-        client.initialize_admin(&admin, &admin);
+        // Second call must fail with AdminAlreadyInitialized
+        let result = client.try_initialize_admin(&admin, &admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AdminAlreadyInitialized as u32,
+            ))),
+        );
     }
 
     #[test]
@@ -6970,6 +7053,7 @@ mod tests {
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "Pre-decommission service"),
             &engineer,
+            &None,
         );
 
         let score_at_decommission = lc_client.get_collateral_score(&asset_id);
@@ -7961,5 +8045,130 @@ mod tests {
             None,
             "get_lending_contract must return None before set_lending_contract is called"
         );
+    }
+
+    #[test]
+    fn test_duplicate_serial_across_owners_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-001-DEDUP");
+
+        // Owner A registers asset with serial X
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model A"),
+            &serial,
+            &owner_a,
+        );
+
+        // Owner B attempts to register same serial X — must panic with DuplicateAsset
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model B"),
+            &serial,
+            &owner_b,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            ))),
+            "serial number deduplication must prevent a different owner from registering the same serial"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_sets_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Initially Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+
+        // Mark under maintenance as owner
+        client.mark_under_maintenance(&owner, &asset_id);
+
+        // Status should now be UnderMaintenance
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    fn test_mark_maintenance_complete_returns_to_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Mark under maintenance
+        client.mark_under_maintenance(&owner, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+        // Complete maintenance
+        client.mark_maintenance_complete(&owner, &asset_id);
+
+        // Status should return to Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let stranger = Address::generate(&env);
+        let result = client.try_mark_under_maintenance(&stranger, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            ))),
+            "non-owner/non-admin must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_decommissioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        // Decommission first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_mark_under_maintenance(&admin, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_admin_can_mark_under_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        client.mark_under_maintenance(&admin, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+        client.mark_maintenance_complete(&admin, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
     }
 }

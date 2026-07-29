@@ -34,9 +34,7 @@ This document lists every `ContractError` variant across the three core contract
 | 15 | `AssetDecommissioned` | The asset has been decommissioned and the requested operation is not permitted on decommissioned assets. |
 | 16 | `ProposalAlreadyExists` | A pending deregister proposal already exists for this asset; wait for it to expire or execute it first. |
 | 17 | `AssetAlreadyDeprecated` | The asset has already been deprecated and cannot be deprecated again. |
-| 17 | `BatchTooLarge` | The batch passed to `batch_register_assets` exceeds the maximum of 50 assets per call. |
-
-> **Note:** codes 17 (`AssetAlreadyDeprecated`) and 17 (`BatchTooLarge`) share the same numeric value in the current source. Treat them as distinct variants; the runtime will emit the same integer for both. A future release should assign `BatchTooLarge` a unique code.
+| 18 | `BatchTooLarge` | The batch passed to `batch_register_assets` exceeds the maximum of 50 assets per call. |
 
 ### Resolution guidance
 
@@ -83,7 +81,11 @@ This document lists every `ContractError` variant across the three core contract
 | 14 | `IssuerRemoved` | The issuer that originally registered the engineer has since been removed from the trusted list, blocking the renewal. |
 | 15 | `TimelockNotExpired` | `execute_revoke_credential` was called before the 48-hour timelock elapsed. |
 | 16 | `ProposalNotFound` | No active revocation proposal exists for the engineer, or it was already executed. |
-| 17 | `BatchRevokeTooLarge` | The batch passed to a batch-revoke call exceeds the maximum of 50 engineers per call. |
+| 17 | `CredentialSuspended` | The credential has been temporarily suspended. |
+| 18 | `EngineerAlreadySuspended` | The engineer is already suspended and cannot be suspended again. |
+| 19 | `InvalidSuspensionPeriod` | The supplied suspension period is invalid or out of range. |
+| 20 | `BatchRevokeTooLarge` | The batch passed to a batch-revoke call exceeds the maximum of 50 engineers per call. |
+| 21 | `CredentialExpired` | The engineer's credential has expired and cannot be used for maintenance submissions. |
 
 ### Resolution guidance
 
@@ -134,6 +136,9 @@ This document lists every `ContractError` variant across the three core contract
 | 19 | `ScoreOverflow` | A score arithmetic operation would overflow a `u32`. |
 | 20 | `NotesTooLong` | The `notes` field is empty or exceeds the configured `max_notes_length` (default 256 characters). |
 | 21 | `ScoreFrozen` | The asset has been decommissioned; score decay and mutation are blocked. |
+| 22 | `AssetDecommissioned` | The asset is decommissioned and cannot accept maintenance records. |
+| 23 | `BatchTooLarge` | Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard). |
+| 24 | `InsufficientSigners` | Fewer valid signers were provided than the configured `admin_threshold` requires. |
 
 ### Resolution guidance
 
@@ -160,6 +165,9 @@ This document lists every `ContractError` variant across the three core contract
 | `ScoreOverflow` | This indicates accumulated scoring data has saturated a `u32`. Contact the admin to reset the score via `reset_score`. |
 | `NotesTooLong` | Keep maintenance notes between 1 and `max_notes_length` characters (configurable, default 256). Empty strings are rejected. |
 | `ScoreFrozen` | The asset was decommissioned in AssetRegistry. Scores and maintenance records for decommissioned assets are frozen and cannot be updated. |
+| `AssetDecommissioned` | The asset has been decommissioned. No new maintenance records can be submitted for decommissioned assets. |
+| `BatchTooLarge` | Split the batch into chunks of ≤ MAX_BATCH_SIZE records per call. |
+| `InsufficientSigners` | Ensure the required number of co-signers from the admin quorum have signed the transaction. Check `admin_threshold` in the contract config. |
 
 ---
 
