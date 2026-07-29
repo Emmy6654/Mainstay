@@ -192,8 +192,8 @@ fn get_config(env: &Env) -> Config {
 }
 
 fn require_admin(env: &Env, caller: &Address) {
-    caller.require_auth();
-    if get_admin(env) != *caller {
+    let stored_admin = get_admin(env);
+    if shared::require_admin(caller, &stored_admin).is_err() {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
     }
 }
@@ -660,11 +660,7 @@ impl LendingContract {
 
     /// Admin-only function to pause the contract.
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &true);
         extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
@@ -673,11 +669,7 @@ impl LendingContract {
 
     /// Admin-only function to unpause the contract.
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &false);
         extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
