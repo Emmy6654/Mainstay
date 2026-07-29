@@ -1502,23 +1502,18 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
-        // Cross-check engineer credential via registry. The lifecycle's
-        // own trait declares `verify_engineer -> Option<bool>` so we keep
-        // the bool contract here. The half-merged code that originally
-        // lived here left an unfinished `if status != ... {` that broke
-        // parsing; this is the closed-up version.
+        // Verify engineer credential via the engineer registry.
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        if !registry.verify_engineer(&engineer).unwrap_or(false) {
-        use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
-        if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-            let status = registry.verify_engineer(&engineer);
-            if status != CredentialStatus::Valid {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
-            }
+        if status != engineer_registry::CredentialStatus::Valid
+            && status != engineer_registry::CredentialStatus::GracePeriod
+        {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+
+        // Verify engineer is explicitly authorized by the asset owner
+        // for this specific asset (DataKey::EngineerAuth check).
         require_engineer_authorized(&env, asset_id, &engineer);
 
         // Validate engineer specialization matches asset type
@@ -1799,29 +1794,17 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Validate engineer credential via batch call to reduce future round-trips.
+        // Verify engineer credential via the engineer registry.
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        // Verify engineer credential through the batch path that already
-        // exists below. The half-merged `if status != CredentialStatus::Valid {`
-        // that originally lived here was never closed and broke parsing;
-        // the batch path is the same check intent expressed via the
-        // already-wired `batch_verify_engineers` API.
-        let mut batch = Vec::new(&env);
-        batch.push_back(engineer.clone());
-        let results = engineer_registry_client.batch_verify_engineers(&batch);
-        let verified = results.get(0).unwrap_or(false);
-        if !verified {
-        use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-            let status = engineer_registry_client.verify_engineer(&engineer);
-            if status != CredentialStatus::Valid {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
-            }
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+
+        // Verify engineer is explicitly authorized by the asset owner
+        // for this specific asset (DataKey::EngineerAuth check).
         require_engineer_authorized(&env, asset_id, &engineer);
 
         // Validate engineer specialization matches asset type
