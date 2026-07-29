@@ -1688,6 +1688,35 @@ impl Lifecycle {
             .persistent()
             .extend_ttl(&xfer_key, TTL_THRESHOLD, TTL_TARGET);
 
+        // Clear all EngineerAuth entries granted by the previous owner so that
+        // engineers authorized by the previous owner cannot submit maintenance
+        // under the new owner without re-authorization.
+        let mut cleared_engineers: Vec<Address> = Vec::new(&env);
+        // Reuse the already-loaded maintenance history (which now includes the
+        // transfer sentinel) to avoid an extra storage read.
+        for record in history.iter() {
+            let eng = record.engineer.clone();
+            let mut already_cleared = false;
+            for cleared in cleared_engineers.iter() {
+                if cleared == eng {
+                    already_cleared = true;
+                    break;
+                }
+            }
+            if !already_cleared {
+                env.storage()
+                    .persistent()
+                    .remove(&engineer_auth_key(asset_id, &eng));
+                cleared_engineers.push_back(eng);
+            }
+        }
+        if !cleared_engineers.is_empty() {
+            env.events().publish(
+                (symbol_short!("AUTH_CLR"), asset_id),
+                cleared_engineers,
+            );
+        }
+
         env.events().publish(
             (EVENT_XFER, asset_id),
             (previous_owner, new_owner, timestamp, sentinel_index),
