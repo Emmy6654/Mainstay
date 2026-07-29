@@ -62,3 +62,7 @@ path = "test_decay_clamps_at_zero.rs"
 [[test]]
 name = "test_decommissioned_asset_maintenance"
 path = "test_decommissioned_asset_maintenance.rs"
+
+[[test]]
+name = "test_collateral_score_decay_intervals"
+path = "test_collateral_score_decay_intervals.rs"
