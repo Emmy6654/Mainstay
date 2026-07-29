@@ -56,5 +56,5 @@ name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
 
 [[test]]
-name = "test_contract_error_discriminants"
-path = "test_contract_error_discriminants.rs"
+name = "test_decommissioned_asset_maintenance"
+path = "test_decommissioned_asset_maintenance.rs"
