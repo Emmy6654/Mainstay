@@ -2,9 +2,9 @@
 
 use lending::{ContractError, LendingContract, LendingContractClient, LoanStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String,
+    Address, Env, String, Symbol, TryFromVal,
 };
 
 fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
@@ -24,6 +24,20 @@ fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
     client.initialize(&deployer, &admin, &token_id, &0);
 
     (contract_id, token_id, admin, token_admin)
+}
+
+fn has_event(env: &Env, contract_id: &Address, symbol: &str) -> bool {
+    let target = Symbol::new(env, symbol);
+    env.events().all().iter().any(|(addr, topics, _data)| {
+        if &addr != contract_id {
+            return false;
+        }
+        topics.iter().any(|topic| {
+            Symbol::try_from_val(env, &topic)
+                .map(|s| s == target)
+                .unwrap_or(false)
+        })
+    })
 }
 
 #[test]
@@ -195,4 +209,53 @@ fn test_loan_disbursal_transfers_funds() {
     // Check borrower received the loan amount
     let final_balance = token_client.balance(&borrower);
     assert_eq!(final_balance, 100_000);
+}
+
+#[test]
+fn test_loan_requested_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+
+    // Mint tokens to contract so the loan can be disbursed
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
+
+    // Request loan
+    client.request_loan(&borrower, &100_000, &0u64);
+
+    // Assert the LOAN_REQUESTED event was emitted by the lending contract
+    assert!(
+        has_event(&env, &contract_id, "LOAN_REQUESTED"),
+        "LOAN_REQUESTED event should be emitted on request_loan"
+    );
+}
+
+#[test]
+fn test_vouch_created_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+
+    // Mint tokens to voucher
+    stellar_asset_client.mint(&voucher, &10_000_000);
+
+    // Vouch for borrower
+    client.vouch(&borrower, &voucher, &1_000);
+
+    // Assert the VOUCH_CREATED event was emitted by the lending contract
+    assert!(
+        has_event(&env, &contract_id, "VOUCH_CREATED"),
+        "VOUCH_CREATED event should be emitted on vouch"
+    );
 }
