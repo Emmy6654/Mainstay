@@ -309,8 +309,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1652 -->
-- #1652: Implement Loan Refinancing with Rate Lock
-
-<!-- handsoff-issue-1653 -->
-- #1653: Implement Cross-Collateral Loans
+<!-- handsoff-issue-1263 -->
+- #1263: Security: training records in engineer registry have no expiry — stale certifications remain valid indefinitely

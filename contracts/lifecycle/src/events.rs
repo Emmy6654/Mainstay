@@ -44,3 +44,6 @@ pub(crate) const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
 
 /// Emitted when an admin anchors maintenance history to a health snapshot via `anchor_history_to_snapshot`.
 pub(crate) const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
+
+/// Emitted when a recurring task is approaching its due date.
+pub(crate) const EVENT_TASK_DUE_SOON: Symbol = symbol_short!("TASK_SOON");

@@ -110,3 +110,28 @@ pub(crate) fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
 pub(crate) fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("SCR_WGT"), asset_type.clone())
 }
+
+/// Retirement state for an asset: `RetirementState`.
+pub(crate) fn retirement_state_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_STE"), asset_id)
+}
+
+/// Retirement certificate for an asset: `RetirementCertificate`.
+pub(crate) fn retirement_certificate_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_CRT"), asset_id)
+}
+
+/// Coordinated task information: `CoordinatedTask`.
+pub(crate) fn coordinated_task_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_TSK"), task_id)
+}
+
+/// Subtask status for coordinated task: `Vec<CoordinatedSubtask>`.
+pub(crate) fn coordinated_subtasks_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_SUB"), task_id)
+}
+
+/// Seasonal adjustment factors for asset type: `SeasonalAdjustment`.
+pub(crate) fn seasonal_adjustment_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("SEAS_ADJ"), asset_type.clone())
+}

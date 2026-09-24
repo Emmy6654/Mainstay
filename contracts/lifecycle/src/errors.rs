@@ -66,6 +66,8 @@ pub enum ContractError {
     BatchRevokeTooLarge = 38,
     /// The admins list supplied to set_admin_quorum exceeds the maximum allowed size (10).
     TooManyAdmins = 39,
+    /// Insufficient fee provided for the maintenance submission priority level (#1313).
+    InsufficientFee = 40,
 }
 
 impl From<SharedContractError> for ContractError {
