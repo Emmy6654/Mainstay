@@ -34,6 +34,8 @@ The engineer credentialing system provides a decentralized, trustless way to ver
 - **What**: Deactivates credential (sets active=false)
 - **Persistence**: Record remains for audit trail
 - **Security**: Prevents unauthorized revocation
+- **Events**: Each revoked credential emits its own `REV_CRED` event, including when
+  revoked in bulk via `batch_revoke_credentials` (see [Event Reference](#event-reference))
 
 ## Data Structures
 
@@ -161,6 +163,10 @@ register_engineer(
 // Revoke a credential
 revoke_credential(engineer_address)
 
+// Revoke multiple credentials in one call
+// Emits one REV_CRED event per engineer (see Event Reference)
+batch_revoke_credentials(engineer_addresses)
+
 // Check if you're a trusted issuer
 is_trusted_issuer(your_address) -> bool
 ```
@@ -176,6 +182,30 @@ remove_trusted_issuer(admin_address, issuer_address)
 // Get all trusted issuers
 get_trusted_issuers() -> Vec<Address>
 ```
+
+## Event Reference
+
+All credential state changes emit events so off-chain indexers can reconstruct the full
+audit trail. Indexers should subscribe to individual events rather than relying on
+summary events, since bulk operations emit one event per affected engineer.
+
+### `REV_CRED` — Credential Revoked
+
+Emitted once for **each** credential that is revoked, whether via `revoke_credential`
+(single) or `batch_revoke_credentials` (bulk). A batch of N revocations therefore emits
+N `REV_CRED` events, one per engineer, so indexers that listen for individual
+revocations never miss a batch revocation.
+
+- **Topics**: `("REV_CRED", engineer_address)`
+- **Data**: the revoked engineer's address
+- **Emission points**:
+  - `revoke_credential(engineer_address)` — one event for the single engineer
+  - `batch_revoke_credentials(engineer_addresses)` — one event per engineer inside the
+    revocation loop (N events for N revocations)
+
+> **Note:** `batch_revoke_credentials` does not emit a single summary event in place of
+> the per-engineer events. Each revocation in the batch produces its own `REV_CRED`
+> event, preserving a complete and unambiguous audit trail.
 
 ## Off-Chain Verification
 
@@ -207,159 +237,6 @@ function credentialHash(credentialData) {
 
 function verifyCredential(onChainHashHex, credentialData) {
   const recomputed = credentialHash(credentialData);
-  const onChain = Buffer.from(onChainHashHex, "hex");
-  return recomputed.length === onChain.length && recomputed.equals(onChain);
+  return recomputed.toString("hex") === onChainHashHex;
 }
 ```
-
-### Reference Implementation (Rust)
-
-```rust
-use sha2::{Digest, Sha256};
-
-fn credential_hash(credential_data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(credential_data);
-    hasher.finalize().into()
-}
-```
-
-### Rejection Criteria
-
-Reject a credential if any of the following hold:
-
-- The recomputed hash does not match the on-chain `credential_hash`.
-- The on-chain `credential_hash` is all-zeros or equals the SHA-256 of an empty string.
-- The canonical `credential_data` cannot be obtained or is ambiguous.
-- The credential is inactive or expired.
-
-## Use Cases
-
-### Maintenance Verification
-- **Requirement**: Only verified engineers can submit maintenance
-- **Process**: Lifecycle contract calls `verify_engineer()`
-- **Result**: Maintenance records are trustworthy
-- **Benefit**: Prevents fraudulent maintenance claims
-
-### Engineer Onboarding
-- **Process**: Engineers apply to trusted issuers
-- **Verification**: Issuers validate qualifications
-- **Issuance**: Credentials stored on-chain
-- **Outcome**: Engineers can perform maintenance
-
-### Credential Management
-- **Tracking**: Monitor credential expiration dates
-- **Renewal**: Process new credentials before expiry
-- **Revocation**: Handle compromised or invalid credentials
-- **Audit**: Maintain complete credential history
-
-## Best Practices
-
-### For Engineers
-- **Protect Keys**: Secure your private wallet keys
-- **Verify Status**: Check credential validity regularly
-- **Plan Renewal**: Renew credentials before expiration
-- **Choose Issuers**: Select reputable trusted issuers
-- **Document**: Keep offline copies of qualifications
-
-### For Issuers
-- **Due Diligence**: Thoroughly verify engineer qualifications
-- **Standardization**: Use consistent credentialing processes
-- **Security**: Implement strong identity verification
-- **Record Keeping**: Maintain offline audit trails
-- **Communication**: Clear credential terms and conditions
-- **Hashing**: Always compute `credential_hash = sha256(credential_data)` and publish the
-  canonical `credential_data` so verifiers can recompute the hash
-
-### For Asset Owners
-- **Verification**: Always check engineer credential status
-- **Reject Invalid**: Don't accept maintenance from unverified engineers
-- **Documentation**: Record engineer addresses used
-- **Quality**: Prefer engineers from reputable issuers
-- **Recompute**: Independently recompute `sha256(credential_data)` and compare it to the
-  on-chain `credential_hash` before trusting a credential
-
-## Integration Points
-
-### With Lifecycle Contract
-- **Automatic Verification**: Maintenance contract validates engineers
-- **Event Emission**: Credential changes emit events
-- **Security**: Prevents unauthorized maintenance submissions
-- **Audit Trail**: Links credentials to maintenance records
-
-### With Asset Registry
-- **Independent**: Separate contract for asset management
-- **Cross-Reference**: Engineers work across multiple assets
-- **Reputation**: Build maintenance history across assets
-- **Flexibility**: Support multiple credentialing systems
-
-## Security Considerations
-
-### Threat Model
-- **Impersonation**: Stolen engineer credentials
-- **False Issuance**: Fraudulent issuer behavior
-- **Expired Credentials**: Using outdated qualifications
-- **Centralization**: Too few trusted issuers
-- **Unverifiable Hashes**: Registering a hash (e.g. all-zeros or the hash of an empty
-  string) that does not correspond to real credential data, making the credential
-  impossible to verify off-chain
-
-### Mitigations
-- **Cryptography**: Hash-based credential verification
-- **Federation**: Multiple independent trusted issuers
-- **Expiration**: Time-limited credential validity
-- **Revocation**: Quick response to compromised credentials
-- **Transparency**: On-chain public verification
-- **Hash Specification**: `credential_hash` is defined as `sha256(credential_data)` and
-  verifiers recompute it off-chain (see [Off-Chain Verification](#off-chain-verification))
-- **Issuer Co-Signature (recommended)**: Require the issuer to co-sign the credential
-  hash to prove knowledge of the credential data. See
-  [Issuer Co-Signature](#issuer-co-signature-recommended) below
-
-### Issuer Co-Signature (Recommended)
-
-The contract cannot recompute `sha256(credential_data)` on-chain, so it cannot by itself
-prove that a registered hash corresponds to real credential data. To close this gap,
-issuers **should** co-sign the credential hash, proving knowledge of the credential data
-at issuance time.
-
-**Recommended scheme:**
-
-1. The issuer computes `credential_hash = sha256(credential_data)`.
-2. The issuer signs the hash (or a domain-separated message containing the hash, the
-   engineer address, and the issuer address) with its private key.
-3. The signature is published alongside the credential and verified off-chain by anyone
-   who wants to confirm the issuer attested to this exact hash.
-
-**Future on-chain enforcement:** A follow-up change could extend `register_engineer` to
-accept an issuer signature over `credential_hash` and verify it on-chain (e.g. via
-`env.crypto().ed25519_verify`), rejecting registrations whose hash is not attested by the
-issuer. This is documented here as guidance; it is not enforced by the current contract.
-
-## Technical Implementation
-
-### Storage Keys
-- **Engineer Data**: `("ENG", engineer_address)`
-- **Trusted Issuers**: `("TRUSTED", issuer_address)`
-- **Issuer List**: `("ISS_LIST")`
-- **Issuer Engineers**: `("ISS_ENGS", issuer_address)`
-
-### TTL Management
-- **Duration**: 518,400 seconds (~6 days)
-- **Extension**: Automatic on all write operations
-- **Purpose**: Prevent data loss and ensure availability
-
-### Error Handling
-- **InvalidCredentialHash**: Zero hash rejection
-- **UntrustedIssuer**: Non-authorized credentialing attempt
-- **EngineerNotFound**: Query for non-existent engineer
-- **CredentialAlreadyRevoked**: Duplicate revocation attempt
-
-## Configuration
-
-### Admin Functions
-- **initialize_admin()**: Set first administrator
-- **get_admin()**: Retrieve current administrator
-- **upgrade()**: Update con
-
-/* … truncated 894 chars — edit only what you need near the top … */
