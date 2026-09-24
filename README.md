@@ -309,11 +309,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1264 -->
-- #1264: Security: asset serial_number is not validated for uniqueness across owners — same machine can be registered twice
-
-<!-- handsoff-issue-1265 -->
-- #1265: Security: score reset (reset_collateral_score) has no timelock — admin can manipulate collateral scores instantly
-
-<!-- handsoff-issue-1294 -->
-- #1294: Refactor: split lifecycle/src/lib.rs into focused modules — file exceeds 554KB
+<!-- handsoff-issue-1263 -->
+- #1263: Security: training records in engineer registry have no expiry — stale certifications remain valid indefinitely

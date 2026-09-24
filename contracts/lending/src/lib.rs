@@ -59,6 +59,22 @@ pub enum ContractError {
     CollateralIneligible = 21,
     /// Requested loan amount exceeds the maximum allowed by the LTV ratio.
     LtvExceeded = 22,
+    /// Market conditions oracle not configured.
+    OracleNotConfigured = 23,
+    /// Loan restructuring request not found.
+    RestructureNotFound = 24,
+    /// Restructuring limit exceeded for borrower.
+    RestructureLimitExceeded = 25,
+    /// Syndicate not found.
+    SyndicateNotFound = 26,
+    /// Only lenders can perform this action.
+    UnauthorizedLender = 27,
+    /// Caller is not a lender in this syndicate.
+    NotSyndicateLender = 28,
+    /// Insurance not found for asset.
+    InsuranceNotFound = 29,
+    /// Insurance verification failed.
+    InsuranceVerificationFailed = 30,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -139,6 +155,80 @@ pub struct LienRecord {
     pub amount: u64,
 }
 
+/// Market conditions for dynamic LTV adjustment (Issue #1645)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCondition {
+    pub volatility: u32,
+    pub timestamp: u64,
+    pub price_change_bps: i32,
+}
+
+/// LTV history record (Issue #1645)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LtvHistory {
+    pub old_ltv_bps: u32,
+    pub new_ltv_bps: u32,
+    pub adjusted_at: u64,
+    pub volatility: u32,
+}
+
+/// Loan syndicate with multiple lenders (Issue #1646)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Syndicate {
+    pub loan_id: u64,
+    pub lenders: Vec<Address>,
+    pub shares: Vec<u64>,
+    pub total_shares: u64,
+    pub quorum_required: u32,
+    pub created_at: u64,
+}
+
+/// Syndicate vote record (Issue #1646)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyndicateVote {
+    pub lender: Address,
+    pub loan_id: u64,
+    pub action: Symbol,
+    pub voted: bool,
+}
+
+/// Loan restructure proposal (Issue #1647)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestructureProposal {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub new_deadline: u64,
+    pub reduced_payment_amount: u64,
+    pub forbearance_end: u64,
+    pub status: u32,
+    pub proposed_at: u64,
+}
+
+/// Collateral insurance record (Issue #1648)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceRecord {
+    pub asset_id: u64,
+    pub policy_id: u64,
+    pub coverage_amount: u64,
+    pub registered_at: u64,
+}
+
+/// Insurance payout record (Issue #1648)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsurancePayout {
+    pub asset_id: u64,
+    pub loss_amount: u64,
+    pub payout_amount: u64,
+    pub claimed_at: u64,
+}
+
 /// Storage keys for the lending contract.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +278,15 @@ const LOAN_SLASHED: Symbol = symbol_short!("loan_sls");
 #[allow(dead_code)]
 const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
+/// Event symbols for new features
+const LTV_ADJUSTED: Symbol = symbol_short!("ltv_adj");
+const SYNDICATE_CREATED: Symbol = symbol_short!("synd_cr");
+const SYNDICATE_VOTED: Symbol = symbol_short!("synd_vt");
+const RESTRUCTURE_PROPOSED: Symbol = symbol_short!("rest_pr");
+const RESTRUCTURE_ACCEPTED: Symbol = symbol_short!("rest_ac");
+const INSURANCE_REGISTERED: Symbol = symbol_short!("ins_reg");
+const INSURANCE_CLAIMED: Symbol = symbol_short!("ins_clm");
+
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
 }
@@ -202,6 +301,43 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
 
 fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("V_HIST"), voucher.clone())
+}
+
+/// Storage keys for new features
+const MARKET_ORACLE_KEY: soroban_sdk::Symbol = symbol_short!("ORACLE");
+const LTV_HISTORY_KEY: soroban_sdk::Symbol = symbol_short!("LTV_HST");
+const RESTRUCTURE_KEY: soroban_sdk::Symbol = symbol_short!("REST");
+const SYNDICATE_KEY: soroban_sdk::Symbol = symbol_short!("SYND");
+const INSURANCE_KEY: soroban_sdk::Symbol = symbol_short!("INS");
+const INSURANCE_PAYOUT_KEY: soroban_sdk::Symbol = symbol_short!("INS_PAY");
+const RESTRUCTURE_COUNT_KEY: soroban_sdk::Symbol = symbol_short!("REST_CNT");
+
+fn market_condition_key() -> soroban_sdk::Symbol {
+    MARKET_ORACLE_KEY
+}
+
+fn ltv_history_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (LTV_HISTORY_KEY, loan_id)
+}
+
+fn restructure_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (RESTRUCTURE_KEY, loan_id)
+}
+
+fn syndicate_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (SYNDICATE_KEY, loan_id)
+}
+
+fn insurance_key(asset_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (INSURANCE_KEY, asset_id)
+}
+
+fn insurance_payout_key(asset_id: u64, index: u64) -> (soroban_sdk::Symbol, u64, u64) {
+    (INSURANCE_PAYOUT_KEY, asset_id, index)
+}
+
+fn restructure_count_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
+    (RESTRUCTURE_COUNT_KEY, borrower.clone())
 }
 
 /// A lien record representing a claim against an asset by a lender.
@@ -344,6 +480,7 @@ mod lifecycle {
     pub trait Lifecycle {
         fn is_collateral_eligible(env: Env, asset_id: u64) -> bool;
         fn get_collateral_score(env: Env, asset_id: u64) -> u32;
+        fn get_min_collateral_score(env: Env) -> u32;
     }
 }
 
@@ -432,6 +569,13 @@ impl LendingContract {
         if let Some(lifecycle_addr) = get_lifecycle_addr(&env) {
             let lc = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
             if !lc.is_collateral_eligible(&asset_id) {
+                panic_with_error!(&env, ContractError::CollateralIneligible);
+            }
+
+            // #1312: Verify collateral score meets minimum eligibility threshold.
+            let collateral_score = lc.get_collateral_score(&asset_id);
+            let min_score = lc.get_min_collateral_score();
+            if collateral_score < min_score {
                 panic_with_error!(&env, ContractError::CollateralIneligible);
             }
 
@@ -1122,6 +1266,315 @@ impl LendingContract {
             .persistent()
             .get(&liens_key(asset_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #1645: Dynamic LTV Adjustment Based on Market Conditions ──
+
+    /// Admin-only: Set the market condition oracle contract address.
+    pub fn set_market_oracle(env: Env, admin: Address, oracle_addr: Address) {
+        require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&MARKET_ORACLE_KEY, &oracle_addr);
+        extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
+    }
+
+    /// Adjust LTV based on current market conditions (volatility).
+    /// Reduces LTV when volatility is elevated to manage risk.
+    pub fn adjust_ltv_for_conditions(env: Env) -> u32 {
+        let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_ORACLE_KEY);
+
+        let volatility = if let Some(m) = market {
+            m.volatility
+        } else {
+            panic_with_error!(&env, ContractError::OracleNotConfigured);
+        };
+
+        let mut config = get_config(&env);
+        let original_ltv = config.max_ltv_bps;
+
+        // Reduce LTV when volatility exceeds 30 bps
+        if volatility > 3000 {
+            // Reduce by 10% for every 1000 bps of volatility above 3000
+            let reduction_factor = ((volatility - 3000) / 1000).min(5000);
+            config.max_ltv_bps = original_ltv.saturating_sub(((original_ltv as u64 * reduction_factor) / 10000) as u32);
+        }
+
+        env.storage().persistent().set(&CONFIG_KEY, &config);
+        extend_persistent_ttl(&env, &CONFIG_KEY);
+
+        // Record history
+        let history = LtvHistory {
+            old_ltv_bps: original_ltv,
+            new_ltv_bps: config.max_ltv_bps,
+            adjusted_at: env.ledger().timestamp(),
+            volatility,
+        };
+
+        let loan_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        env.storage().persistent().set(&ltv_history_key(loan_counter), &history);
+        extend_persistent_ttl(&env, &ltv_history_key(loan_counter));
+
+        // Emit event
+        env.events().publish((LTV_ADJUSTED,), (original_ltv, config.max_ltv_bps, volatility));
+
+        config.max_ltv_bps
+    }
+
+    /// Update market conditions (volatility data from oracle).
+    pub fn update_market_conditions(env: Env, admin: Address, volatility: u32, price_change_bps: i32) {
+        require_admin(&env, &admin);
+
+        let market = MarketCondition {
+            volatility,
+            timestamp: env.ledger().timestamp(),
+            price_change_bps,
+        };
+
+        env.storage().persistent().set(&MARKET_ORACLE_KEY, &market);
+        extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
+    }
+
+    // ── Issue #1646: Loan Syndication Support ──
+
+    /// Create a loan syndicate with multiple lenders.
+    pub fn create_syndicate(
+        env: Env,
+        admin: Address,
+        loan_id: u64,
+        lenders: Vec<Address>,
+        shares: Vec<u64>,
+        quorum_required: u32,
+    ) {
+        require_admin(&env, &admin);
+
+        // Validate lenders and shares match
+        if lenders.len() != shares.len() {
+            panic_with_error!(&env, ContractError::InvalidAdminAddress);
+        }
+
+        // Calculate total shares
+        let mut total_shares: u64 = 0;
+        for share in shares.iter() {
+            total_shares = total_shares.checked_add(*share)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
+        }
+
+        let syndicate = Syndicate {
+            loan_id,
+            lenders,
+            shares,
+            total_shares,
+            quorum_required,
+            created_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&syndicate_key(loan_id), &syndicate);
+        extend_persistent_ttl(&env, &syndicate_key(loan_id));
+
+        env.events().publish((SYNDICATE_CREATED,), (loan_id, quorum_required));
+    }
+
+    /// Cast a vote in a syndicate for a specific action.
+    pub fn syndicate_vote(env: Env, lender: Address, loan_id: u64, action: Symbol, vote: bool) {
+        lender.require_auth();
+
+        let syndicate: Syndicate = env
+            .storage()
+            .persistent()
+            .get(&syndicate_key(loan_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SyndicateNotFound));
+
+        let mut found = false;
+        for l in syndicate.lenders.iter() {
+            if l == &lender {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ContractError::NotSyndicateLender);
+        }
+
+        let vote_record = SyndicateVote {
+            lender,
+            loan_id,
+            action,
+            voted: vote,
+        };
+
+        env.events().publish((SYNDICATE_VOTED,), (loan_id, vote));
+    }
+
+    /// Get syndicate details for a loan.
+    pub fn get_syndicate(env: Env, loan_id: u64) -> Option<Syndicate> {
+        env.storage().persistent().get(&syndicate_key(loan_id))
+    }
+
+    // ── Issue #1647: Loan Restructuring with Forbearance Periods ──
+
+    /// Propose a loan restructure (borrower-only).
+    pub fn propose_loan_restructure(
+        env: Env,
+        borrower: Address,
+        loan_id: u64,
+        new_deadline: u64,
+        reduced_payment_amount: u64,
+    ) {
+        require_not_paused(&env);
+        borrower.require_auth();
+
+        let key = loan_key(&borrower);
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+
+        if loan.status != LoanStatus::Active {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        }
+
+        // Set forbearance period to 30 days from now
+        let forbearance_end = env.ledger().timestamp() + 2_592_000;
+
+        let proposal = RestructureProposal {
+            loan_id,
+            borrower: borrower.clone(),
+            new_deadline,
+            reduced_payment_amount,
+            forbearance_end,
+            status: 0,
+            proposed_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&restructure_key(loan_id), &proposal);
+        extend_persistent_ttl(&env, &restructure_key(loan_id));
+
+        env.events().publish((RESTRUCTURE_PROPOSED,), (loan_id, new_deadline, reduced_payment_amount));
+    }
+
+    /// Accept a loan restructure proposal (lender-only).
+    pub fn accept_restructure(env: Env, lender: Address, loan_id: u64) {
+        require_not_paused(&env);
+        lender.require_auth();
+
+        let proposal: RestructureProposal = env
+            .storage()
+            .persistent()
+            .get(&restructure_key(loan_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::RestructureNotFound));
+
+        // Check restructuring limits (max 3 restructures per borrower)
+        let borrower_count_key = restructure_count_key(&proposal.borrower);
+        let count: u32 = env.storage().persistent().get(&borrower_count_key).unwrap_or(0);
+        if count >= 3 {
+            panic_with_error!(&env, ContractError::RestructureLimitExceeded);
+        }
+
+        // Update loan deadline
+        let mut loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_key(&proposal.borrower))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+
+        loan.deadline = proposal.new_deadline;
+        env.storage().persistent().set(&loan_key(&proposal.borrower), &loan);
+        extend_persistent_ttl(&env, &loan_key(&proposal.borrower));
+
+        // Increment restructure count
+        env.storage().persistent().set(&borrower_count_key, &(count + 1));
+        extend_persistent_ttl(&env, &borrower_count_key);
+
+        env.events().publish((RESTRUCTURE_ACCEPTED,), (loan_id, proposal.new_deadline));
+    }
+
+    /// Get restructure proposal details.
+    pub fn get_restructure(env: Env, loan_id: u64) -> Option<RestructureProposal> {
+        env.storage().persistent().get(&restructure_key(loan_id))
+    }
+
+    // ── Issue #1648: Collateral Insurance Integration ──
+
+    /// Register collateral insurance (lender-only).
+    pub fn register_collateral_insurance(
+        env: Env,
+        lender: Address,
+        asset_id: u64,
+        policy_id: u64,
+        coverage_amount: u64,
+    ) {
+        require_not_paused(&env);
+        lender.require_auth();
+
+        let insurance = InsuranceRecord {
+            asset_id,
+            policy_id,
+            coverage_amount,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&insurance_key(asset_id), &insurance);
+        extend_persistent_ttl(&env, &insurance_key(asset_id));
+
+        env.events().publish((INSURANCE_REGISTERED,), (asset_id, policy_id, coverage_amount));
+    }
+
+    /// Claim insurance for asset loss (lender-only).
+    pub fn claim_insurance(env: Env, lender: Address, asset_id: u64, loss_amount: u64) -> u64 {
+        require_not_paused(&env);
+        lender.require_auth();
+
+        let insurance: InsuranceRecord = env
+            .storage()
+            .persistent()
+            .get(&insurance_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::InsuranceNotFound));
+
+        // Payout is capped at coverage amount
+        let payout = loss_amount.min(insurance.coverage_amount);
+
+        let payout_record = InsurancePayout {
+            asset_id,
+            loss_amount,
+            payout_amount: payout,
+            claimed_at: env.ledger().timestamp(),
+        };
+
+        // Store payout history
+        let payout_index: u64 = env.storage().persistent().get(&symbol_short!("INS_IDX")).unwrap_or(0);
+        env.storage().persistent().set(&insurance_payout_key(asset_id, payout_index), &payout_record);
+        extend_persistent_ttl(&env, &insurance_payout_key(asset_id, payout_index));
+        env.storage().persistent().set(&symbol_short!("INS_IDX"), &(payout_index + 1));
+
+        env.events().publish((INSURANCE_CLAIMED,), (asset_id, loss_amount, payout));
+
+        payout
+    }
+
+    /// Get insurance record for an asset.
+    pub fn get_insurance(env: Env, asset_id: u64) -> Option<InsuranceRecord> {
+        env.storage().persistent().get(&insurance_key(asset_id))
+    }
+
+    /// Get insurance payout history for an asset.
+    pub fn get_insurance_payouts(env: Env, asset_id: u64) -> Vec<InsurancePayout> {
+        let mut payouts = Vec::new(&env);
+        let mut index = 0u64;
+
+        loop {
+            let payout: Option<InsurancePayout> = env.storage().persistent()
+                .get(&insurance_payout_key(asset_id, index));
+            if payout.is_none() {
+                break;
+            }
+            payouts.push_back(payout.unwrap());
+            index += 1;
+        }
+
+        payouts
     }
 }
 
