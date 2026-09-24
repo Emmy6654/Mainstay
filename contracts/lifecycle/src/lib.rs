@@ -5579,8 +5579,12 @@ impl Lifecycle {
             }
         }
 
-        let cert_hash_data = format!(&env, "{}:{}:{}", asset_id, final_score, now);
-        let cert_hash: BytesN<32> = env.crypto().sha256(&cert_hash_data.into_bytes()).into();
+        let mut cert_hash_buf = [0u8; 24];
+        cert_hash_buf[0..8].copy_from_slice(&asset_id.to_le_bytes());
+        cert_hash_buf[8..12].copy_from_slice(&final_score.to_le_bytes());
+        cert_hash_buf[12..20].copy_from_slice(&now.to_le_bytes());
+        let cert_hash_data = Bytes::from_slice(&env, &cert_hash_buf);
+        let cert_hash: BytesN<32> = env.crypto().sha256(&cert_hash_data).into();
 
         let certificate = RetirementCertificate {
             asset_id,
@@ -5673,10 +5677,16 @@ impl Lifecycle {
         let completion_deadline = now.checked_add(DEFAULT_COORDINATED_TASK_TIMEOUT)
             .unwrap_or(u64::MAX);
 
+        let task_type_symbol = if let Ok(s) = core::str::from_utf8(task_type.as_ref()) {
+            Symbol::new(&env, &String::from_str(&env, s))
+        } else {
+            symbol_short!("UNKOWN")
+        };
+
         let task = CoordinatedTask {
             task_id,
             asset_ids: asset_ids.clone(),
-            task_type: Symbol::new(&env, &String::from_utf8(&env, task_type.clone()).unwrap()),
+            task_type: task_type_symbol,
             status: CoordinationStatus::Active,
             created_at: now,
             created_by: engineer.clone(),
