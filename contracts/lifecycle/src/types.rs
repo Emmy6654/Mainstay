@@ -254,4 +254,18 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
+    /// Stores `Vec<DisputeRecord>` for a given asset (issue #1319).
+    Disputes(u64),
+}
+
+/// A dispute record for challenging maintenance record authenticity (issue #1319).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub asset_id: u64,
+    pub maintenance_timestamp: u64,
+    pub reason: String,
+    pub disputed_at: u64,
+    pub is_resolved: bool,
+    pub admin_decision: Option<Symbol>, // "UPHELD", "REJECTED", etc.
 }
