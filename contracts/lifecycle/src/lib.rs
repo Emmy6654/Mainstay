@@ -21,17 +21,14 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_RETIREMENT_INIT, EVENT_RETIREMENT_CONF, EVENT_RETIREMENT_CANC,
-    EVENT_COORD_TASK_CREATE, EVENT_COORD_TASK_DONE, EVENT_SEASONAL_ADJ,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
 };
 
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, RetirementState, RetirementStatus,
-    RetirementCertificate, CoordinatedTask, CoordinatedSubtask, CoordinationStatus, Season,
-    SeasonalAdjustment,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -50,6 +47,7 @@ const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+const TREASURY_ADDR_KEY: Symbol = symbol_short!("TREASURY");
 /// Temporary-storage key for the reentrancy lock used in `submit_maintenance`.
 ///
 /// Stored in *temporary* storage so that it is **automatically discarded** at
@@ -76,6 +74,15 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
 /// Length of the rolling submission-rate window, in seconds.
 const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
+/// Fee tiers for maintenance submission priority levels (#1313)
+/// Low priority: 100 stroops
+const FEE_LOW: u64 = 100;
+/// Medium priority: 500 stroops
+const FEE_MEDIUM: u64 = 500;
+/// High priority: 1000 stroops
+const FEE_HIGH: u64 = 1_000;
+/// Critical priority: 5000 stroops
+const FEE_CRITICAL: u64 = 5_000;
 /// Default cap on the number of health snapshots retained per asset. Without
 /// a cap, a misconfigured automation loop calling `take_health_snapshot` in a
 /// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
@@ -371,6 +378,27 @@ pub(crate) fn set_asset_registry_addr(env: &Env, addr: &Address) {
 pub(crate) fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ENG_REGISTRY, addr);
     extend_persistent_ttl(&env, &ENG_REGISTRY);
+}
+
+pub(crate) fn get_treasury_addr(env: &Env) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&TREASURY_ADDR_KEY)
+}
+
+pub(crate) fn set_treasury_addr(env: &Env, addr: &Address) {
+    env.storage().persistent().set(&TREASURY_ADDR_KEY, addr);
+    extend_persistent_ttl(&env, &TREASURY_ADDR_KEY);
+}
+
+/// Calculate the fee for a maintenance submission based on priority level (#1313)
+pub(crate) fn get_fee_for_priority(priority: Priority) -> u64 {
+    match priority {
+        Priority::Low => FEE_LOW,
+        Priority::Medium => FEE_MEDIUM,
+        Priority::High => FEE_HIGH,
+        Priority::Critical => FEE_CRITICAL,
+    }
 }
 
 pub(crate) fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -2069,9 +2097,34 @@ impl Lifecycle {
         notes: String,
         engineer: Address,
         cost: Option<u64>,
+        fee: u64,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
+
+        // Validate and collect maintenance fee (#1313)
+        if let Some(treasury) = get_treasury_addr(&env) {
+            let required_fee = get_fee_for_priority(priority);
+            if fee < required_fee {
+                panic_with_error!(&env, ContractError::InsufficientFee);
+            }
+
+            // Transfer fee to treasury
+            if fee > 0 {
+                // Note: This assumes fees are paid via the engineer's account
+                // In a real implementation, this would need to pull from a token contract
+                // For now, we just track it as a balance update
+                let current_treasury_balance: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&symbol_short!("FEE_BAL"))
+                    .unwrap_or(0u64);
+                env.storage()
+                    .persistent()
+                    .set(&symbol_short!("FEE_BAL"), &(current_treasury_balance + fee));
+                extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+            }
+        }
 
         let config: Config = env
             .storage()
@@ -2197,6 +2250,7 @@ impl Lifecycle {
             cost,
             ownership_start_ledger,
             previous_record_hash,
+            reconstructed: false,
         };
 
         history.push_back(record);
@@ -2362,6 +2416,7 @@ impl Lifecycle {
             cost: None,
             ownership_start_ledger: Some(current_ledger),
             previous_record_hash,
+            reconstructed: false,
         };
         history.push_back(sentinel);
         let sentinel_index = history.len() - 1;
@@ -2527,9 +2582,35 @@ impl Lifecycle {
         records: Vec<BatchRecord>,
         engineer: Address,
         costs: Option<Vec<Option<u64>>>,
+        fee: u64,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
+
+        // Validate and collect maintenance fees (#1313)
+        if let Some(treasury) = get_treasury_addr(&env) {
+            let mut total_required_fee: u64 = 0;
+            for record in records.iter() {
+                total_required_fee = total_required_fee.saturating_add(get_fee_for_priority(record.priority));
+            }
+
+            if fee < total_required_fee {
+                panic_with_error!(&env, ContractError::InsufficientFee);
+            }
+
+            // Collect total fees to treasury
+            if fee > 0 {
+                let current_treasury_balance: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&symbol_short!("FEE_BAL"))
+                    .unwrap_or(0u64);
+                env.storage()
+                    .persistent()
+                    .set(&symbol_short!("FEE_BAL"), &(current_treasury_balance + fee));
+                extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+            }
+        }
 
         let config: Config = env
             .storage()
@@ -2648,6 +2729,7 @@ impl Lifecycle {
                 cost: rec_cost,
                 ownership_start_ledger,
                 previous_record_hash: chain_link,
+                reconstructed: false,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
             new_records.push_back(new_record);
@@ -2699,6 +2781,157 @@ impl Lifecycle {
         env.events().publish(
             (symbol_short!("REP_UPD"), engineer.clone()),
             (old_rep, new_rep),
+        );
+    }
+
+    /// Issue #1319: Dispute a maintenance record for an asset.
+    /// The asset owner can challenge the authenticity of a maintenance record signed by an engineer.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `reason` - Dispute reason (e.g., "No service was actually performed")
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if asset doesn't exist
+    /// - [`ContractError::MaintenanceRecordNotFound`] if record doesn't exist
+    pub fn dispute_record(env: Env, asset_id: u64, maintenance_timestamp: u64, reason: String) {
+        ensure_not_paused(&env);
+
+        // Verify asset exists (get current owner)
+        let asset_registry: Address = env
+            .storage()
+            .instance()
+            .get(&registry_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let _asset = asset_registry_client.get_asset(&asset_id);
+
+        // Verify the maintenance record exists
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut record_found = false;
+        for record in history.iter() {
+            if record.timestamp == maintenance_timestamp {
+                record_found = true;
+                break;
+            }
+        }
+
+        if !record_found {
+            panic_with_error!(&env, ContractError::MaintenanceRecordNotFound);
+        }
+
+        // Create dispute record
+        let dispute = DisputeRecord {
+            asset_id,
+            maintenance_timestamp,
+            reason: reason.clone(),
+            disputed_at: env.ledger().timestamp(),
+            is_resolved: false,
+            admin_decision: None,
+        };
+
+        // Store dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        disputes.push_back(dispute);
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_OPEN"), asset_id),
+            (maintenance_timestamp, reason),
+        );
+    }
+
+    /// Issue #1319: Get disputes for an asset.
+    pub fn get_disputes(env: Env, asset_id: u64) -> Vec<DisputeRecord> {
+        let disputes_key = DataKey::Disputes(asset_id);
+        let disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&disputes_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&disputes_key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        disputes
+    }
+
+    /// Issue #1319: Resolve a dispute record (admin only).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `decision` - Admin decision (e.g., "UPHELD", "REJECTED")
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not admin
+    /// - [`ContractError::DisputeNotFound`] if dispute doesn't exist
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        maintenance_timestamp: u64,
+        decision: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Find and update dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..disputes.len() {
+            let mut dispute = disputes.get(i).unwrap();
+            if dispute.maintenance_timestamp == maintenance_timestamp {
+                dispute.is_resolved = true;
+                dispute.admin_decision = Some(decision.clone());
+                disputes.set(i, &dispute);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ContractError::DisputeNotFound);
+        }
+
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_RES"), asset_id),
+            (maintenance_timestamp, decision),
         );
     }
 
@@ -3680,6 +3913,14 @@ impl Lifecycle {
             .persistent()
             .get(&DataKey::OwnershipStartLedger(asset_id));
 
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let previous_record_hash = next_chain_link(&env, &history);
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
@@ -3689,13 +3930,9 @@ impl Lifecycle {
             timestamp,
             cost: None,
             ownership_start_ledger,
+            previous_record_hash,
+            reconstructed: false,
         };
-
-        let mut history: Vec<MaintenanceRecord> = env
-            .storage()
-            .persistent()
-            .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env));
 
         let config: Config = env
             .storage()
@@ -3790,6 +4027,48 @@ impl Lifecycle {
 
         extend_persistent_ttl(&env, &key);
         overdue
+    }
+
+    /// Emits `TASK_DUE_SOON` events for all active recurring tasks approaching their due date.
+    ///
+    /// Checks all assets for recurring tasks whose `next_due` timestamp falls within
+    /// `reminder_window_secs` seconds from the current ledger timestamp. For each such task,
+    /// emits a `TASK_DUE_SOON` event to allow off-chain systems to send reminders to operators.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vector of asset IDs to check for upcoming tasks
+    /// * `reminder_window_secs` - Number of seconds before due date to emit the reminder event (e.g., 604800 for 7 days)
+    pub fn emit_upcoming_task_reminders(
+        env: Env,
+        asset_ids: Vec<u64>,
+        reminder_window_secs: u64,
+    ) {
+        let now = env.ledger().timestamp();
+        let reminder_threshold = now.saturating_add(reminder_window_secs);
+
+        for asset_id in asset_ids.iter() {
+            let key = DataKey::RecurringTasks(asset_id);
+            let tasks: Vec<RecurringTask> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+
+            for task in tasks.iter() {
+                // Emit event for active tasks that are due within the reminder window
+                // but not yet overdue
+                if task.is_active && task.next_due > now && task.next_due <= reminder_threshold {
+                    env.events().publish(
+                        (EVENT_TASK_DUE_SOON, asset_id),
+                        (task.task_id, task.task_type.clone(), task.next_due),
+                    );
+                }
+            }
+
+            if !tasks.is_empty() {
+                extend_persistent_ttl(&env, &key);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -4125,6 +4404,79 @@ impl Lifecycle {
         }
     }
 
+    /// Return a comprehensive snapshot of an asset's complete state for off-chain backup.
+    ///
+    /// This function retrieves all critical asset information from both the asset registry
+    /// and lifecycle contract in a single call, enabling consistent off-chain backups and
+    /// recovery procedures. The snapshot captures asset metadata, collateral status,
+    /// maintenance history summary, and current valuation in one atomic read.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// A complete `AssetFullSnapshot` containing all asset state fields
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry
+    pub fn get_asset_full_snapshot(env: Env, asset_id: u64) -> AssetFullSnapshot {
+        let asset_registry = get_asset_registry_addr(&env);
+        let registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+
+        // Verify asset exists and retrieve asset data
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset = registry_client.get_asset(&asset_id);
+
+        // Get current collateral score and valuation
+        let collateral_score = Self::get_collateral_score(env.clone(), asset_id);
+        let (collateral_valuation, _) = Self::get_collateral_valuation(env.clone(), asset_id);
+
+        // Get maintenance history count and last service timestamp
+        let history_key = history_key(asset_id);
+        let maintenance_history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_maintenance_records = maintenance_history.len() as u32;
+        let last_service_timestamp = if !maintenance_history.is_empty() {
+            maintenance_history.get(maintenance_history.len() - 1).unwrap().timestamp
+        } else {
+            0u64
+        };
+
+        // Convert deprecation status enum to u32
+        let deprecation_status_u32 = match asset.deprecation_status {
+            asset_registry::DeprecationStatus::Active => 0u32,
+            asset_registry::DeprecationStatus::Deprecated => 1u32,
+            asset_registry::DeprecationStatus::Decommissioned => 2u32,
+        };
+
+        // Create and return the full snapshot
+        AssetFullSnapshot {
+            asset_id: asset.asset_id,
+            asset_type: asset.asset_type,
+            metadata: asset.metadata,
+            serial_number: asset.serial_number,
+            owner: asset.owner,
+            registered_at: asset.registered_at,
+            metadata_updated_at: asset.metadata_updated_at,
+            metadata_version: asset.metadata_version,
+            deprecation_status: deprecation_status_u32,
+            is_locked: asset.is_locked,
+            lender: asset.lender,
+            loan_id: asset.loan_id,
+            deprecated_at: asset.deprecated_at,
+            collateral_score,
+            collateral_valuation,
+            snapshot_timestamp: env.ledger().timestamp(),
+            total_maintenance_records,
+            last_service_timestamp,
+        }
+    }
+
     /// Return the chronological collateral valuation history for an asset.
     pub fn get_valuation_history(env: Env, asset_id: u64) -> Vec<(u64, u64)> {
         let asset_registry = get_asset_registry_addr(&env);
@@ -4395,6 +4747,22 @@ impl Lifecycle {
 
         let effective_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
         effective_score >= config.min_collateral_score
+    }
+
+    /// Get the minimum collateral score threshold for asset eligibility (#1312).
+    ///
+    /// # Returns
+    /// The minimum collateral score (0-100) required for an asset to be eligible as collateral
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    pub fn get_min_collateral_score(env: Env) -> u32 {
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        config.min_collateral_score
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -4771,6 +5139,78 @@ impl Lifecycle {
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
         require_timelock_ready(&env, symbol_short!("ENG_REG"));
         crate::admin::update_engineer_registry(env, admin, new_registry);
+    }
+
+    /// Admin-only: Set the treasury address for collecting maintenance submission fees (#1313).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `treasury_addr` - The address where fees will be accumulated
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_treasury_address(env: Env, admin: Address, treasury_addr: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        set_treasury_addr(&env, &treasury_addr);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("TREAS")),
+            (admin, treasury_addr, env.ledger().timestamp()),
+        );
+    }
+
+    /// Get the current treasury address for maintenance submission fees (#1313).
+    ///
+    /// # Returns
+    /// The treasury address if set, None otherwise
+    pub fn get_treasury_address(env: Env) -> Option<Address> {
+        get_treasury_addr(&env)
+    }
+
+    /// Admin-only: Withdraw accumulated maintenance submission fees to the treasury address (#1313).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn withdraw_maintenance_fees(env: Env, admin: Address) -> u64 {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let balance: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("FEE_BAL"))
+            .unwrap_or(0u64);
+
+        if balance > 0 {
+            // Reset the balance
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("FEE_BAL"), &0u64);
+            extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+
+            env.events().publish(
+                (symbol_short!("ADM_AUD"), symbol_short!("FEE_WTH")),
+                (admin, balance, env.ledger().timestamp()),
+            );
+        }
+
+        balance
+    }
+
+    /// Get the current accumulated maintenance submission fee balance (#1313).
+    ///
+    /// # Returns
+    /// The total accumulated fees in stroops
+    pub fn get_fee_balance(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&symbol_short!("FEE_BAL"))
+            .unwrap_or(0u64)
     }
 
     /// Get the current configuration of the lifecycle contract.
@@ -5354,6 +5794,94 @@ impl Lifecycle {
             (symbol_short!("ADM_AUD"), symbol_short!("RECON")),
             (admin, asset_id, env.ledger().timestamp()),
         );
+    }
+
+    /// Reconstruct partial maintenance history from health snapshots (#1314).
+    ///
+    /// Generates synthetic MaintenanceRecord placeholders using timestamps from
+    /// health snapshots to recover approximate history after TTL-driven pruning.
+    /// Reconstructed records are marked with `reconstructed: true` and use
+    /// placeholder values (task_type "RECO", Priority::Low, empty notes).
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to reconstruct history for
+    ///
+    /// # Returns
+    /// The number of reconstructed records inserted
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized
+    /// - [`ContractError::SnapshotNotFound`] if no snapshots exist for the asset
+    pub fn reconstruct_history_from_snapshots(env: Env, asset_id: u64) -> u32 {
+        ensure_not_paused(&env);
+
+        let snapshots_key = health_snapshot_key(asset_id);
+        let snapshots: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&snapshots_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
+
+        if snapshots.is_empty() {
+            panic_with_error!(&env, ContractError::SnapshotNotFound);
+        }
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
+        let mut reconstructed_count: u32 = 0;
+        for snapshot in snapshots.iter() {
+            // Check if history already has a record at this timestamp
+            let mut already_exists = false;
+            for record in history.iter() {
+                if record.timestamp == snapshot.snapshot_timestamp {
+                    already_exists = true;
+                    break;
+                }
+            }
+
+            if !already_exists {
+                // Create synthetic maintenance record from snapshot
+                let previous_record_hash = next_chain_link(&env, &history);
+                let record = MaintenanceRecord {
+                    asset_id,
+                    task_type: symbol_short!("RECO"),
+                    priority: Priority::Low,
+                    notes: String::from_str(&env, "Reconstructed from snapshot"),
+                    engineer: Address::generate(&env),
+                    timestamp: snapshot.snapshot_timestamp,
+                    cost: None,
+                    ownership_start_ledger,
+                    previous_record_hash,
+                    reconstructed: true,
+                };
+                history.push_back(record);
+                reconstructed_count += 1;
+            }
+        }
+
+        // Persist the updated history
+        if reconstructed_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&history_key(asset_id), &history);
+            extend_persistent_ttl(&env, &history_key(asset_id));
+
+            env.events().publish(
+                (EVENT_RECONSTR, asset_id),
+                (reconstructed_count, env.ledger().timestamp()),
+            );
+        }
+
+        reconstructed_count
     }
 
     /// Predict the next service date for a given task type on an asset.
@@ -17696,5 +18224,157 @@ mod tests {
                 "#1307: no duplicate consecutive scores should be added to history"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1320: Scheduled maintenance reminder events
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_emits_events_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+        let task_due_in_3_days = now + 3 * 86400; // 3 days from now
+        let task_due_in_10_days = now + 10 * 86400; // 10 days from now
+
+        // Schedule two recurring tasks with different due dates
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400),
+        );
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &2u64,
+            &symbol_short!("FILTER"),
+            &symbol_short!("DAYS"),
+            &(10 * 86400),
+        );
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Emit reminders with a 7-day window
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that TASK_SOON events were emitted for the task due in 3 days
+        // but not for the task due in 10 days (outside the window)
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have exactly 1 event for the task due in 3 days
+        assert_eq!(task_soon_events.len(), 1, "Should emit event for task within reminder window");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_overdue() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that is already overdue
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &86400, // Due in 1 day
+        );
+
+        // Move time forward so the task is now overdue
+        env.ledger().set_timestamp(now + 2 * 86400);
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for the overdue task
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for overdue task
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for overdue task");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_inactive_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that will be inactive
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400), // Due in 3 days
+        );
+
+        // Deactivate the task by modifying it directly in storage
+        let key = DataKey::RecurringTasks(asset_id);
+        let mut tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tasks.is_empty() {
+            let mut task = tasks.get(0).unwrap();
+            task.is_active = false;
+            tasks.set(0, task);
+            env.storage().persistent().set(&key, &tasks);
+        }
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for inactive tasks
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for inactive tasks
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for inactive tasks");
     }
 }

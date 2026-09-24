@@ -55,6 +55,10 @@ pub struct MaintenanceRecord {
     /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
     /// `None` for the oldest record currently visible for this asset.
     pub previous_record_hash: Option<Bytes>,
+    /// Whether this record was reconstructed from health snapshots (#1314).
+    /// Reconstructed records are synthetic placeholders generated to recover
+    /// approximate history after TTL-driven pruning, not actual submissions.
+    pub reconstructed: bool,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -142,6 +146,50 @@ pub struct HealthSnapshot {
     /// Set to `true` by `anchor_history_to_snapshot` to mark that lost or pruned
     /// maintenance records have been partially recovered via this snapshot.
     pub reconstructed: bool,
+}
+
+/// A comprehensive snapshot of an asset's complete state, including all critical
+/// on-chain data from both the asset registry and lifecycle contract.
+/// Used for off-chain backup and recovery purposes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetFullSnapshot {
+    /// Asset ID (unique identifier)
+    pub asset_id: u64,
+    /// Asset type classification (e.g., equipment category)
+    pub asset_type: Symbol,
+    /// Asset metadata description
+    pub metadata: String,
+    /// Physical serial number of the asset
+    pub serial_number: String,
+    /// Current owner address
+    pub owner: Address,
+    /// Timestamp when asset was registered
+    pub registered_at: u64,
+    /// Timestamp of last metadata update
+    pub metadata_updated_at: u64,
+    /// Version number of asset metadata
+    pub metadata_version: u32,
+    /// Asset deprecation status (0=Active, 1=Deprecated, 2=Decommissioned)
+    pub deprecation_status: u32,
+    /// Whether asset is locked as collateral
+    pub is_locked: bool,
+    /// Lender address if locked (None if not locked)
+    pub lender: Option<Address>,
+    /// Loan ID if locked (None if not locked)
+    pub loan_id: Option<u64>,
+    /// Deprecation timestamp (None if still active)
+    pub deprecated_at: Option<u64>,
+    /// Current collateral score (0-100)
+    pub collateral_score: u32,
+    /// Collateral valuation (historical value in stroops)
+    pub collateral_valuation: u64,
+    /// Timestamp of snapshot (when this data was captured)
+    pub snapshot_timestamp: u64,
+    /// Total maintenance records for this asset
+    pub total_maintenance_records: u32,
+    /// Timestamp of last maintenance service
+    pub last_service_timestamp: u64,
 }
 
 /// An on-chain governance proposal to change a task-type score weight.
@@ -299,14 +347,18 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
-    /// Stores `RetirementState` for a given asset.
-    RetirementState(u64),
-    /// Stores `RetirementCertificate` for a given asset.
-    RetirementCertificate(u64),
-    /// Stores coordinated task information for cross-asset maintenance.
-    CoordinatedTask(u64),
-    /// Stores subtask status mapping for coordinated tasks.
-    CoordinatedSubtasks(u64),
-    /// Stores seasonal adjustment factors per asset type.
-    SeasonalFactors(Symbol),
+    /// Stores `Vec<DisputeRecord>` for a given asset (issue #1319).
+    Disputes(u64),
+}
+
+/// A dispute record for challenging maintenance record authenticity (issue #1319).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub asset_id: u64,
+    pub maintenance_timestamp: u64,
+    pub reason: String,
+    pub disputed_at: u64,
+    pub is_resolved: bool,
+    pub admin_decision: Option<Symbol>, // "UPHELD", "REJECTED", etc.
 }

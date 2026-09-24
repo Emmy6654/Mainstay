@@ -306,3 +306,8 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 - [Stellar Development Foundation](https://stellar.org) for Soroban
 - The global engineering community for maintaining the machines that power the world
+
+## Handsoff notes
+
+<!-- handsoff-issue-1263 -->
+- #1263: Security: training records in engineer registry have no expiry — stale certifications remain valid indefinitely
