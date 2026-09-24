@@ -48,6 +48,9 @@ jobs:
       - name: Check ContractError variants are documented
         run: bash scripts/check_error_reference.sh
 
+      - name: Validate symbol_short! usages are within 9-character limit
+        run: bash scripts/check_symbol_short.sh
+
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 
