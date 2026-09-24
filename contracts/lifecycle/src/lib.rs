@@ -5970,6 +5970,202 @@ impl Lifecycle {
         env.storage().persistent().set(&peer_group_key, &peer_group);
         shared::extend_persistent_ttl(&env, &peer_group_key);
     }
+
+    // =========================================================================
+    // Additional Helper Functions for Better Integration
+    // =========================================================================
+
+    /// Apply degradation curve specific to asset category when computing decay.
+    pub fn apply_category_degradation(
+        env: Env,
+        asset_id: u64,
+        base_score: u32,
+        category: Symbol,
+    ) -> u32 {
+        if let Some(curve) = Self::get_category_degradation_curve(env.clone(), category) {
+            // Apply category-specific degradation curve
+            if base_score <= curve.floor {
+                curve.floor
+            } else {
+                let degradation = (curve.initial_rate + curve.acceleration).min(base_score - curve.floor);
+                base_score.saturating_sub(degradation).max(curve.floor)
+            }
+        } else {
+            base_score
+        }
+    }
+
+    /// Check if score movement constitutes an anomaly.
+    pub fn check_score_anomaly(
+        env: Env,
+        asset_id: u64,
+        new_score: u32,
+    ) -> Option<(u32, u32)> { // Returns (stdev_multiple, baseline_score) if anomaly detected
+        let baseline_key = score_baseline_key(asset_id);
+        let baseline_scores: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&baseline_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if baseline_scores.len() < 2 {
+            return None; // Not enough data
+        }
+
+        // Calculate mean
+        let mut sum: u64 = 0;
+        for i in 0..baseline_scores.len() {
+            sum = sum.saturating_add(baseline_scores.get(i).unwrap());
+        }
+        let mean = (sum / baseline_scores.len() as u64) as u32;
+
+        // Calculate standard deviation
+        let mut variance_sum: u64 = 0;
+        for i in 0..baseline_scores.len() {
+            let val = baseline_scores.get(i).unwrap() as u32;
+            let diff = if val > mean { val - mean } else { mean - val };
+            variance_sum = variance_sum.saturating_add((diff as u64) * (diff as u64));
+        }
+        let variance = variance_sum / baseline_scores.len() as u64;
+
+        // Simple sqrt approximation for stdev
+        let stdev = (variance as f64).sqrt() as u32;
+
+        if stdev == 0 {
+            return None;
+        }
+
+        // Check if new_score is > 2 stdev away from mean
+        let distance = if new_score > mean {
+            new_score - mean
+        } else {
+            mean - new_score
+        } as u32;
+
+        let stdev_multiple = distance / (stdev + 1); // +1 to avoid division by zero
+
+        if stdev_multiple > 2 {
+            Some((stdev_multiple, mean))
+        } else {
+            None
+        }
+    }
+
+    /// Record baseline score for anomaly detection.
+    pub fn record_score_baseline(env: Env, asset_id: u64, score: u32) {
+        let baseline_key = score_baseline_key(asset_id);
+        let mut baseline_scores: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&baseline_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Keep last 20 scores for moving average
+        const MAX_BASELINE: usize = 20;
+        if baseline_scores.len() >= MAX_BASELINE {
+            baseline_scores.remove(0);
+        }
+
+        baseline_scores.push_back(score as u64);
+        env.storage().persistent().set(&baseline_key, &baseline_scores);
+        shared::extend_persistent_ttl(&env, &baseline_key);
+    }
+
+    /// Get list of registered score providers.
+    pub fn get_score_providers(env: Env) -> Vec<Address> {
+        let providers_key = score_providers_key();
+        env.storage()
+            .persistent()
+            .get(&providers_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get provider reputation.
+    pub fn get_provider_reputation(env: Env, provider: Address) -> u32 {
+        let rep_key = provider_reputation_key();
+        let reputation_map: Map<Address, u32> = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or_else(|| Map::new(&env));
+
+        reputation_map.get(provider).unwrap_or(100) // Default 100
+    }
+
+    /// Clear old external scores older than a threshold (maintenance function).
+    pub fn clear_old_external_scores(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let ext_scores_key = external_scores_key(asset_id);
+        let mut scores: Vec<ExternalScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut filtered: Vec<ExternalScoreEntry> = Vec::new(&env);
+
+        for s in 0..scores.len() {
+            let entry = scores.get(s).unwrap();
+            if current_time.saturating_sub(entry.timestamp) < age_seconds {
+                filtered.push_back(entry);
+            }
+        }
+
+        env.storage().persistent().set(&ext_scores_key, &filtered);
+        shared::extend_persistent_ttl(&env, &ext_scores_key);
+    }
+
+    /// Batch clear anomalies older than a threshold.
+    pub fn clear_old_anomalies(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let anomalies_key = score_anomalies_key(asset_id);
+        let mut anomalies: Vec<ScoreAnomaly> = env
+            .storage()
+            .persistent()
+            .get(&anomalies_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut filtered: Vec<ScoreAnomaly> = Vec::new(&env);
+
+        for a in 0..anomalies.len() {
+            let anomaly = anomalies.get(a).unwrap();
+            if current_time.saturating_sub(anomaly.timestamp) < age_seconds {
+                filtered.push_back(anomaly);
+            }
+        }
+
+        env.storage().persistent().set(&anomalies_key, &filtered);
+        shared::extend_persistent_ttl(&env, &anomalies_key);
+    }
+
+    /// Get all external scores for an asset.
+    pub fn get_external_scores(env: Env, asset_id: u64) -> Vec<ExternalScoreEntry> {
+        let ext_scores_key = external_scores_key(asset_id);
+        env.storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 }
 
 #[cfg(test)]
