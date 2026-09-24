@@ -110,3 +110,59 @@ pub(crate) fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
 pub(crate) fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("SCR_WGT"), asset_type.clone())
 }
+
+// ---------------------------------------------------------------------------
+// Cross-Contract Score Consensus keys (Issue #1637)
+// ---------------------------------------------------------------------------
+
+/// External scores submitted by providers for an asset: `Vec<ExternalScoreEntry>`.
+pub(crate) fn external_scores_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("EXT_SCR"), asset_id)
+}
+
+/// List of authorized score providers: `Vec<Address>`.
+pub(crate) fn score_providers_key() -> Symbol {
+    symbol_short!("PROVIDERS")
+}
+
+/// Provider reputation scores: `Map<Address, u32>`.
+pub(crate) fn provider_reputation_key() -> Symbol {
+    symbol_short!("PROV_REP")
+}
+
+// ---------------------------------------------------------------------------
+// Score Anomaly Detection keys (Issue #1639)
+// ---------------------------------------------------------------------------
+
+/// Baseline scores for anomaly detection: `Vec<u64>`.
+pub(crate) fn score_baseline_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("BASE_SCR"), asset_id)
+}
+
+/// Detected anomalies for an asset: `Vec<ScoreAnomaly>`.
+pub(crate) fn score_anomalies_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("ANOM_SCR"), asset_id)
+}
+
+// ---------------------------------------------------------------------------
+// Score Degradation Curves keys (Issue #1638)
+// ---------------------------------------------------------------------------
+
+/// Degradation curve for an asset category: `DegradationCurve`.
+pub(crate) fn degradation_curve_key(category: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("DEG_CURVE"), category.clone())
+}
+
+/// All degradation curves: `Map<Symbol, DegradationCurve>`.
+pub(crate) fn degradation_curves_key() -> Symbol {
+    symbol_short!("ALL_CURVES")
+}
+
+// ---------------------------------------------------------------------------
+// Peer Comparison Scoring keys (Issue #1640)
+// ---------------------------------------------------------------------------
+
+/// Peer group statistics: `PeerGroup`.
+pub(crate) fn peer_group_key(group_id: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("PEER_GRP"), group_id.clone())
+}

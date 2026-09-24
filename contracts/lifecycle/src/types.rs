@@ -159,6 +159,55 @@ pub struct WeightProposal {
     pub executed: bool,
 }
 
+/// External score submitted by a provider for cross-contract consensus (Issue #1637).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalScoreEntry {
+    pub provider: Address,
+    pub score: u32,
+    pub timestamp: u64,
+    /// Reputation score of the provider (0-100, higher is better).
+    pub provider_reputation: u32,
+}
+
+/// Score anomaly detection entry (Issue #1639).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreAnomaly {
+    pub asset_id: u64,
+    pub timestamp: u64,
+    pub baseline_score: u32,
+    pub observed_score: u32,
+    pub standard_deviation_multiple: u32, // Multiple of stdev (e.g., 2 for >2 stdev)
+    pub investigation_status: Symbol, // "PENDING", "RESOLVED", "FALSE_POSITIVE"
+}
+
+/// Degradation curve parameters per asset category (Issue #1638).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradationCurve {
+    pub category: Symbol,
+    pub initial_rate: u32,    // Initial degradation rate per interval
+    pub acceleration: u32,     // How much the rate accelerates per interval
+    pub floor: u32,           // Minimum score that cannot be degraded further
+    pub version: u32,         // Curve version for tracking changes
+    pub created_at: u64,      // Timestamp when curve was created
+}
+
+/// Peer group statistics for relative scoring (Issue #1640).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerGroup {
+    pub group_id: Symbol,
+    pub asset_type: Symbol,
+    pub age_range_min: u64,   // Minimum age in seconds
+    pub age_range_max: u64,   // Maximum age in seconds
+    pub member_count: u32,
+    pub mean_score: u32,
+    pub median_score: u32,
+    pub stdev: u32,
+}
+
 /// A recurring maintenance task definition.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,4 +255,20 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
+    /// Stores `Vec<ExternalScoreEntry>` for external scores from providers (Issue #1637).
+    ExternalScores(u64),
+    /// Stores `Vec<Address>` of authorized score providers (Issue #1637).
+    ScoreProviders,
+    /// Stores provider reputation scores: `Map<Address, u32>` (Issue #1637).
+    ProviderReputation,
+    /// Stores `Vec<u64>` of baseline scores for anomaly detection (Issue #1639).
+    ScoreBaseline(u64),
+    /// Stores `Vec<ScoreAnomaly>` for detected anomalies (Issue #1639).
+    ScoreAnomalies(u64),
+    /// Stores `DegradationCurve` for each asset category (Issue #1638).
+    DegradationCurve(Symbol),
+    /// Stores `Map<Symbol, DegradationCurve>` of all degradation curves (Issue #1638).
+    DegradationCurves,
+    /// Stores `PeerGroup` statistics for relative scoring (Issue #1640).
+    PeerGroup(Symbol),
 }
