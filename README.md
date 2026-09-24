@@ -311,3 +311,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-1264 -->
 - #1264: Security: asset serial_number is not validated for uniqueness across owners — same machine can be registered twice
+
+<!-- handsoff-issue-1265 -->
+- #1265: Security: score reset (reset_collateral_score) has no timelock — admin can manipulate collateral scores instantly
