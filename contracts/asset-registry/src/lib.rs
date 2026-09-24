@@ -296,6 +296,90 @@ pub struct SearchPage {
     pub total: u32,
 }
 
+/// Issue #1629: Asset usage tracking and analytics data
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageAnalytics {
+    pub asset_id: u64,
+    pub total_usage_hours: u64,
+    pub usage_percentage: u32,
+    pub last_usage_update: u64,
+    pub maintenance_threshold_hours: u64,
+}
+
+/// Issue #1629: A single usage record for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageRecord {
+    pub hours_used: u64,
+    pub recorded_at: u64,
+}
+
+/// Issue #1630: Asset warranty information
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Warranty {
+    pub warranty_id: u64,
+    pub start_date: u64,
+    pub expiry_date: u64,
+    pub coverage_type: String,
+    pub provider: String,
+    pub is_active: bool,
+}
+
+/// Issue #1630: Warranty claim with history tracking
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarrantyClaim {
+    pub claim_id: u64,
+    pub warranty_id: u64,
+    pub claim_reason: String,
+    pub claimed_at: u64,
+    pub claim_status: ClaimStatus,
+}
+
+/// Issue #1630: Warranty claim status
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClaimStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+    Settled = 3,
+}
+
+/// Issue #1631: Asset compliance certification
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceCert {
+    pub cert_id: u64,
+    pub cert_type: String,
+    pub issuer: String,
+    pub expiry_date: u64,
+    pub standard: String,
+    pub issue_date: u64,
+}
+
+/// Issue #1631: Compliance status for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceStatus {
+    pub asset_id: u64,
+    pub is_compliant: bool,
+    pub expired_count: u32,
+    pub active_count: u32,
+    pub last_verified_at: u64,
+}
+
+/// Issue #1632: Maintenance window for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceWindow {
+    pub day_of_week: u32,
+    pub start_hour: u32,
+    pub end_hour: u32,
+}
+
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
@@ -340,6 +424,50 @@ fn asset_key(id: u64) -> (Symbol, u64) {
 
 fn metadata_history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("META_HIS"), asset_id)
+}
+
+// Issue #1629: Storage keys for usage tracking
+fn usage_analytics_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_ANA"), asset_id)
+}
+
+fn usage_records_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_REC"), asset_id)
+}
+
+// Issue #1630: Storage keys for warranty tracking
+fn warranties_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR"), asset_id)
+}
+
+fn warranty_claims_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR_CL"), asset_id)
+}
+
+fn warranty_counter_key() -> Symbol {
+    symbol_short!("WARR_CTR")
+}
+
+fn claim_counter_key() -> Symbol {
+    symbol_short!("CLM_CTR")
+}
+
+// Issue #1631: Storage keys for compliance tracking
+fn compliance_certs_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_C"), asset_id)
+}
+
+fn compliance_status_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_S"), asset_id)
+}
+
+fn cert_counter_key() -> Symbol {
+    symbol_short!("CERT_CTR")
+}
+
+// Issue #1632: Storage keys for maintenance windows
+fn maintenance_windows_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MAINT_W"), asset_id)
 }
 
 fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
