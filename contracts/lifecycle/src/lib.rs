@@ -2690,6 +2690,157 @@ impl Lifecycle {
         );
     }
 
+    /// Issue #1319: Dispute a maintenance record for an asset.
+    /// The asset owner can challenge the authenticity of a maintenance record signed by an engineer.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `reason` - Dispute reason (e.g., "No service was actually performed")
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if asset doesn't exist
+    /// - [`ContractError::MaintenanceRecordNotFound`] if record doesn't exist
+    pub fn dispute_record(env: Env, asset_id: u64, maintenance_timestamp: u64, reason: String) {
+        ensure_not_paused(&env);
+
+        // Verify asset exists (get current owner)
+        let asset_registry: Address = env
+            .storage()
+            .instance()
+            .get(&registry_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let _asset = asset_registry_client.get_asset(&asset_id);
+
+        // Verify the maintenance record exists
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut record_found = false;
+        for record in history.iter() {
+            if record.timestamp == maintenance_timestamp {
+                record_found = true;
+                break;
+            }
+        }
+
+        if !record_found {
+            panic_with_error!(&env, ContractError::MaintenanceRecordNotFound);
+        }
+
+        // Create dispute record
+        let dispute = DisputeRecord {
+            asset_id,
+            maintenance_timestamp,
+            reason: reason.clone(),
+            disputed_at: env.ledger().timestamp(),
+            is_resolved: false,
+            admin_decision: None,
+        };
+
+        // Store dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        disputes.push_back(dispute);
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_OPEN"), asset_id),
+            (maintenance_timestamp, reason),
+        );
+    }
+
+    /// Issue #1319: Get disputes for an asset.
+    pub fn get_disputes(env: Env, asset_id: u64) -> Vec<DisputeRecord> {
+        let disputes_key = DataKey::Disputes(asset_id);
+        let disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&disputes_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&disputes_key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        disputes
+    }
+
+    /// Issue #1319: Resolve a dispute record (admin only).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `decision` - Admin decision (e.g., "UPHELD", "REJECTED")
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not admin
+    /// - [`ContractError::DisputeNotFound`] if dispute doesn't exist
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        maintenance_timestamp: u64,
+        decision: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Find and update dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..disputes.len() {
+            let mut dispute = disputes.get(i).unwrap();
+            if dispute.maintenance_timestamp == maintenance_timestamp {
+                dispute.is_resolved = true;
+                dispute.admin_decision = Some(decision.clone());
+                disputes.set(i, &dispute);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ContractError::DisputeNotFound);
+        }
+
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_RES"), asset_id),
+            (maintenance_timestamp, decision),
+        );
+    }
+
     /// Apply time-based decay to an asset's collateral score.
     /// Can be called by anyone to ensure scores reflect current maintenance status.
     /// Uses configured decay rate and interval settings.
