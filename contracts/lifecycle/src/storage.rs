@@ -111,26 +111,27 @@ pub(crate) fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, S
     (symbol_short!("SCR_WGT"), asset_type.clone())
 }
 
-// ---------------------------------------------------------------------------
-// New keys for issues #1641-1644
-// ---------------------------------------------------------------------------
-
-/// Score breakdown for an asset (issue #1641): `ScoreBreakdown`.
-pub(crate) fn score_breakdown_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("SCBRKDN"), asset_id)
+/// Retirement state for an asset: `RetirementState`.
+pub(crate) fn retirement_state_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_STE"), asset_id)
 }
 
-/// Recovery plans for an asset (issue #1642): `Vec<RecoveryPlan>`.
-pub(crate) fn recovery_plans_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("RECPLANS"), asset_id)
+/// Retirement certificate for an asset: `RetirementCertificate`.
+pub(crate) fn retirement_certificate_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_CRT"), asset_id)
 }
 
-/// Circuit breaker configuration (issue #1644): `CircuitBreakerConfig`.
-pub(crate) fn circuit_breaker_config_key() -> Symbol {
-    symbol_short!("CB_CFG")
+/// Coordinated task information: `CoordinatedTask`.
+pub(crate) fn coordinated_task_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_TSK"), task_id)
 }
 
-/// Forced score changes log for an asset (issue #1644): `Vec<ForcedScoreChange>`.
-pub(crate) fn forced_score_changes_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("FORCED_SC"), asset_id)
+/// Subtask status for coordinated task: `Vec<CoordinatedSubtask>`.
+pub(crate) fn coordinated_subtasks_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_SUB"), task_id)
+}
+
+/// Seasonal adjustment factors for asset type: `SeasonalAdjustment`.
+pub(crate) fn seasonal_adjustment_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("SEAS_ADJ"), asset_type.clone())
 }
