@@ -20,7 +20,7 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
 };
 
 use crate::errors::ContractError;
@@ -3778,6 +3778,48 @@ impl Lifecycle {
 
         extend_persistent_ttl(&env, &key);
         overdue
+    }
+
+    /// Emits `TASK_DUE_SOON` events for all active recurring tasks approaching their due date.
+    ///
+    /// Checks all assets for recurring tasks whose `next_due` timestamp falls within
+    /// `reminder_window_secs` seconds from the current ledger timestamp. For each such task,
+    /// emits a `TASK_DUE_SOON` event to allow off-chain systems to send reminders to operators.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vector of asset IDs to check for upcoming tasks
+    /// * `reminder_window_secs` - Number of seconds before due date to emit the reminder event (e.g., 604800 for 7 days)
+    pub fn emit_upcoming_task_reminders(
+        env: Env,
+        asset_ids: Vec<u64>,
+        reminder_window_secs: u64,
+    ) {
+        let now = env.ledger().timestamp();
+        let reminder_threshold = now.saturating_add(reminder_window_secs);
+
+        for asset_id in asset_ids.iter() {
+            let key = DataKey::RecurringTasks(asset_id);
+            let tasks: Vec<RecurringTask> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+
+            for task in tasks.iter() {
+                // Emit event for active tasks that are due within the reminder window
+                // but not yet overdue
+                if task.is_active && task.next_due > now && task.next_due <= reminder_threshold {
+                    env.events().publish(
+                        (EVENT_TASK_DUE_SOON, asset_id),
+                        (task.task_id, task.task_type.clone(), task.next_due),
+                    );
+                }
+            }
+
+            if !tasks.is_empty() {
+                extend_persistent_ttl(&env, &key);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -17234,5 +17276,157 @@ mod tests {
                 "#1307: no duplicate consecutive scores should be added to history"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1320: Scheduled maintenance reminder events
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_emits_events_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+        let task_due_in_3_days = now + 3 * 86400; // 3 days from now
+        let task_due_in_10_days = now + 10 * 86400; // 10 days from now
+
+        // Schedule two recurring tasks with different due dates
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400),
+        );
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &2u64,
+            &symbol_short!("FILTER"),
+            &symbol_short!("DAYS"),
+            &(10 * 86400),
+        );
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Emit reminders with a 7-day window
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that TASK_SOON events were emitted for the task due in 3 days
+        // but not for the task due in 10 days (outside the window)
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have exactly 1 event for the task due in 3 days
+        assert_eq!(task_soon_events.len(), 1, "Should emit event for task within reminder window");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_overdue() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that is already overdue
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &86400, // Due in 1 day
+        );
+
+        // Move time forward so the task is now overdue
+        env.ledger().set_timestamp(now + 2 * 86400);
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for the overdue task
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for overdue task
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for overdue task");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_inactive_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that will be inactive
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400), // Due in 3 days
+        );
+
+        // Deactivate the task by modifying it directly in storage
+        let key = DataKey::RecurringTasks(asset_id);
+        let mut tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tasks.is_empty() {
+            let mut task = tasks.get(0).unwrap();
+            task.is_active = false;
+            tasks.set(0, task);
+            env.storage().persistent().set(&key, &tasks);
+        }
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for inactive tasks
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for inactive tasks
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for inactive tasks");
     }
 }
