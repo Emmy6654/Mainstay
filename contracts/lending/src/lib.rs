@@ -344,6 +344,7 @@ mod lifecycle {
     pub trait Lifecycle {
         fn is_collateral_eligible(env: Env, asset_id: u64) -> bool;
         fn get_collateral_score(env: Env, asset_id: u64) -> u32;
+        fn get_min_collateral_score(env: Env) -> u32;
     }
 }
 
@@ -432,6 +433,13 @@ impl LendingContract {
         if let Some(lifecycle_addr) = get_lifecycle_addr(&env) {
             let lc = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
             if !lc.is_collateral_eligible(&asset_id) {
+                panic_with_error!(&env, ContractError::CollateralIneligible);
+            }
+
+            // #1312: Verify collateral score meets minimum eligibility threshold.
+            let collateral_score = lc.get_collateral_score(&asset_id);
+            let min_score = lc.get_min_collateral_score();
+            if collateral_score < min_score {
                 panic_with_error!(&env, ContractError::CollateralIneligible);
             }
 

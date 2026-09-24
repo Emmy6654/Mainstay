@@ -55,6 +55,10 @@ pub struct MaintenanceRecord {
     /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
     /// `None` for the oldest record currently visible for this asset.
     pub previous_record_hash: Option<Bytes>,
+    /// Whether this record was reconstructed from health snapshots (#1314).
+    /// Reconstructed records are synthetic placeholders generated to recover
+    /// approximate history after TTL-driven pruning, not actual submissions.
+    pub reconstructed: bool,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
