@@ -55,6 +55,10 @@ pub struct MaintenanceRecord {
     /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
     /// `None` for the oldest record currently visible for this asset.
     pub previous_record_hash: Option<Bytes>,
+    /// Whether this record was reconstructed from health snapshots (#1314).
+    /// Reconstructed records are synthetic placeholders generated to recover
+    /// approximate history after TTL-driven pruning, not actual submissions.
+    pub reconstructed: bool,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -144,6 +148,50 @@ pub struct HealthSnapshot {
     pub reconstructed: bool,
 }
 
+/// A comprehensive snapshot of an asset's complete state, including all critical
+/// on-chain data from both the asset registry and lifecycle contract.
+/// Used for off-chain backup and recovery purposes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetFullSnapshot {
+    /// Asset ID (unique identifier)
+    pub asset_id: u64,
+    /// Asset type classification (e.g., equipment category)
+    pub asset_type: Symbol,
+    /// Asset metadata description
+    pub metadata: String,
+    /// Physical serial number of the asset
+    pub serial_number: String,
+    /// Current owner address
+    pub owner: Address,
+    /// Timestamp when asset was registered
+    pub registered_at: u64,
+    /// Timestamp of last metadata update
+    pub metadata_updated_at: u64,
+    /// Version number of asset metadata
+    pub metadata_version: u32,
+    /// Asset deprecation status (0=Active, 1=Deprecated, 2=Decommissioned)
+    pub deprecation_status: u32,
+    /// Whether asset is locked as collateral
+    pub is_locked: bool,
+    /// Lender address if locked (None if not locked)
+    pub lender: Option<Address>,
+    /// Loan ID if locked (None if not locked)
+    pub loan_id: Option<u64>,
+    /// Deprecation timestamp (None if still active)
+    pub deprecated_at: Option<u64>,
+    /// Current collateral score (0-100)
+    pub collateral_score: u32,
+    /// Collateral valuation (historical value in stroops)
+    pub collateral_valuation: u64,
+    /// Timestamp of snapshot (when this data was captured)
+    pub snapshot_timestamp: u64,
+    /// Total maintenance records for this asset
+    pub total_maintenance_records: u32,
+    /// Timestamp of last maintenance service
+    pub last_service_timestamp: u64,
+}
+
 /// An on-chain governance proposal to change a task-type score weight.
 ///
 /// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`
@@ -224,6 +272,99 @@ pub struct RecurringTask {
     pub is_active: bool,
 }
 
+/// Status of an asset retirement process.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementStatus {
+    Pending = 0,
+    Confirmed = 1,
+    Cancelled = 2,
+    Archived = 3,
+}
+
+/// Asset retirement state during the decommissioning workflow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetirementState {
+    pub asset_id: u64,
+    pub status: RetirementStatus,
+    pub initiated_at: u64,
+    pub initiated_by: Address,
+    pub reason: Bytes,
+    pub review_period_end: u64,
+    pub final_score: Option<u32>,
+}
+
+/// Certificate issued upon retirement of an asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetirementCertificate {
+    pub asset_id: u64,
+    pub retired_at: u64,
+    pub final_score: u32,
+    pub total_maintenance_count: u32,
+    pub total_cost: u64,
+    pub reason: Bytes,
+    pub certificate_hash: Bytes,
+}
+
+/// Status of a coordinated maintenance task across multiple assets.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinationStatus {
+    Active = 0,
+    Completed = 1,
+    Failed = 2,
+    Cancelled = 3,
+}
+
+/// Coordinated maintenance task spanning multiple assets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatedTask {
+    pub task_id: u64,
+    pub asset_ids: Vec<u64>,
+    pub task_type: Symbol,
+    pub status: CoordinationStatus,
+    pub created_at: u64,
+    pub created_by: Address,
+    pub completion_deadline: u64,
+    pub completed_at: Option<u64>,
+}
+
+/// Subtask status for a coordinated task on a specific asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatedSubtask {
+    pub asset_id: u64,
+    pub subtask_id: u64,
+    pub status: CoordinationStatus,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub notes: Bytes,
+}
+
+/// Season enum for seasonal score adjustments.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Season {
+    Winter = 0,
+    Spring = 1,
+    Summer = 2,
+    Fall = 3,
+}
+
+/// Seasonal adjustment factors for an asset type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeasonalAdjustment {
+    pub asset_type: Symbol,
+    pub winter_factor: u32,
+    pub spring_factor: u32,
+    pub summer_factor: u32,
+    pub fall_factor: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -255,20 +396,18 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
-    /// Stores `Vec<ExternalScoreEntry>` for external scores from providers (Issue #1637).
-    ExternalScores(u64),
-    /// Stores `Vec<Address>` of authorized score providers (Issue #1637).
-    ScoreProviders,
-    /// Stores provider reputation scores: `Map<Address, u32>` (Issue #1637).
-    ProviderReputation,
-    /// Stores `Vec<u64>` of baseline scores for anomaly detection (Issue #1639).
-    ScoreBaseline(u64),
-    /// Stores `Vec<ScoreAnomaly>` for detected anomalies (Issue #1639).
-    ScoreAnomalies(u64),
-    /// Stores `DegradationCurve` for each asset category (Issue #1638).
-    DegradationCurve(Symbol),
-    /// Stores `Map<Symbol, DegradationCurve>` of all degradation curves (Issue #1638).
-    DegradationCurves,
-    /// Stores `PeerGroup` statistics for relative scoring (Issue #1640).
-    PeerGroup(Symbol),
+    /// Stores `Vec<DisputeRecord>` for a given asset (issue #1319).
+    Disputes(u64),
+}
+
+/// A dispute record for challenging maintenance record authenticity (issue #1319).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub asset_id: u64,
+    pub maintenance_timestamp: u64,
+    pub reason: String,
+    pub disputed_at: u64,
+    pub is_resolved: bool,
+    pub admin_decision: Option<Symbol>, // "UPHELD", "REJECTED", etc.
 }

@@ -111,58 +111,27 @@ pub(crate) fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, S
     (symbol_short!("SCR_WGT"), asset_type.clone())
 }
 
-// ---------------------------------------------------------------------------
-// Cross-Contract Score Consensus keys (Issue #1637)
-// ---------------------------------------------------------------------------
-
-/// External scores submitted by providers for an asset: `Vec<ExternalScoreEntry>`.
-pub(crate) fn external_scores_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("EXT_SCR"), asset_id)
+/// Retirement state for an asset: `RetirementState`.
+pub(crate) fn retirement_state_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_STE"), asset_id)
 }
 
-/// List of authorized score providers: `Vec<Address>`.
-pub(crate) fn score_providers_key() -> Symbol {
-    symbol_short!("PROVIDERS")
+/// Retirement certificate for an asset: `RetirementCertificate`.
+pub(crate) fn retirement_certificate_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RTR_CRT"), asset_id)
 }
 
-/// Provider reputation scores: `Map<Address, u32>`.
-pub(crate) fn provider_reputation_key() -> Symbol {
-    symbol_short!("PROV_REP")
+/// Coordinated task information: `CoordinatedTask`.
+pub(crate) fn coordinated_task_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_TSK"), task_id)
 }
 
-// ---------------------------------------------------------------------------
-// Score Anomaly Detection keys (Issue #1639)
-// ---------------------------------------------------------------------------
-
-/// Baseline scores for anomaly detection: `Vec<u64>`.
-pub(crate) fn score_baseline_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("BASE_SCR"), asset_id)
+/// Subtask status for coordinated task: `Vec<CoordinatedSubtask>`.
+pub(crate) fn coordinated_subtasks_key(task_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COOD_SUB"), task_id)
 }
 
-/// Detected anomalies for an asset: `Vec<ScoreAnomaly>`.
-pub(crate) fn score_anomalies_key(asset_id: u64) -> (Symbol, u64) {
-    (symbol_short!("ANOM_SCR"), asset_id)
-}
-
-// ---------------------------------------------------------------------------
-// Score Degradation Curves keys (Issue #1638)
-// ---------------------------------------------------------------------------
-
-/// Degradation curve for an asset category: `DegradationCurve`.
-pub(crate) fn degradation_curve_key(category: &Symbol) -> (Symbol, Symbol) {
-    (symbol_short!("DEG_CURVE"), category.clone())
-}
-
-/// All degradation curves: `Map<Symbol, DegradationCurve>`.
-pub(crate) fn degradation_curves_key() -> Symbol {
-    symbol_short!("ALL_CURVES")
-}
-
-// ---------------------------------------------------------------------------
-// Peer Comparison Scoring keys (Issue #1640)
-// ---------------------------------------------------------------------------
-
-/// Peer group statistics: `PeerGroup`.
-pub(crate) fn peer_group_key(group_id: &Symbol) -> (Symbol, Symbol) {
-    (symbol_short!("PEER_GRP"), group_id.clone())
+/// Seasonal adjustment factors for asset type: `SeasonalAdjustment`.
+pub(crate) fn seasonal_adjustment_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("SEAS_ADJ"), asset_type.clone())
 }
