@@ -290,3 +290,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-1295 -->
 - #1295: Refactor: engineer-registry lib.rs is 198KB — split into credential, suspension, and admin modules
+
+<!-- handsoff-issue-1650 -->
+- #1650: Implement Interest Rate Tiering Based on Risk
