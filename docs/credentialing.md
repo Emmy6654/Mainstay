@@ -55,6 +55,41 @@ pub struct Engineer {
 - **Security**: Prevents credential tampering and forgery
 - **Format**: 32-byte SHA-256 hash
 
+#### Contract Requirement: `credential_hash == sha256(credential_data)`
+
+The `credential_hash` passed to `register_engineer` **MUST** be the SHA-256 digest of the
+canonical credential data for that engineer. The contract stores the hash as an opaque
+`BytesN<32>` and cannot recompute it on-chain, so it enforces only the zero-hash guard
+(see [Zero-Hash Protection](#zero-hash-protection)). Correctness of the hash therefore
+depends on the issuer computing it exactly as specified below.
+
+- **Definition**: `credential_hash = sha256(credential_data)`
+- **`credential_data`**: the canonical, deterministic serialization of the engineer's
+  credential payload (see [Canonical Credential Data](#canonical-credential-data)).
+- **Encoding**: raw 32-byte SHA-256 digest, no hex prefix, no truncation, no padding.
+- **Prohibited values**: all-zeros, the SHA-256 of an empty string
+  (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`), or any hash
+  not derived from real credential data. These are unverifiable off-chain and are
+  treated as invalid credentials by verifiers.
+
+> **Note:** The contract cannot validate that a non-zero hash corresponds to real
+> credential data. Issuers are responsible for computing the hash correctly, and
+> verifiers are responsible for recomputing it off-chain (see
+> [Off-Chain Verification](#off-chain-verification)).
+
+#### Canonical Credential Data
+
+To make hashes reproducible across issuers and verifiers, `credential_data` must be a
+deterministic byte string. The recommended canonical form is the UTF-8 encoding of a
+JSON object with sorted keys and no insignificant whitespace, for example:
+
+```json
+{"engineer":"G...ADDRESS","issuer":"G...ADDRESS","licenses":["LIC-123"],"name":"Jane Doe","valid_from":1700000000}
+```
+
+Any change to the payload (including key order or whitespace) changes the hash, so the
+exact serialization used at issuance must be published alongside the credential.
+
 ## Trusted Issuer Model
 
 ### Issuer Registration
@@ -68,6 +103,8 @@ pub struct Engineer {
 - **Standards**: Follow consistent credentialing standards
 - **Security**: Protect issuer private keys
 - **Compliance**: Follow regulatory requirements
+- **Hashing**: Compute `credential_hash = sha256(credential_data)` exactly as specified
+  above and publish the canonical `credential_data` so verifiers can recompute it
 
 ### Issuer Benefits
 - **Reputation**: Build trusted brand in ecosystem
@@ -113,6 +150,7 @@ get_engineers_by_issuer(issuer_address) -> Vec<Address>
 ### For Issuers
 ```rust
 // Register a new engineer
+// credential_hash MUST equal sha256(credential_data); see "Credential Hash" above.
 register_engineer(
     engineer_address,
     credential_hash,
@@ -138,6 +176,62 @@ remove_trusted_issuer(admin_address, issuer_address)
 // Get all trusted issuers
 get_trusted_issuers() -> Vec<Address>
 ```
+
+## Off-Chain Verification
+
+Because the contract stores `credential_hash` as an opaque `BytesN<32>`, verifiers must
+recompute the hash from the credential data to confirm it matches what was registered.
+
+### Verification Procedure
+
+1. **Fetch the on-chain record**: call `get_engineer(address)` and read
+   `credential_hash`, `issuer`, `issued_at`, and `expires_at`.
+2. **Obtain the credential data**: retrieve the canonical `credential_data` published by
+   the issuer for that engineer (the exact bytes used at issuance).
+3. **Recompute the hash**: compute `sha256(credential_data)` using the same canonical
+   serialization described in [Canonical Credential Data](#canonical-credential-data).
+4. **Compare**: the recomputed 32-byte digest must equal the on-chain `credential_hash`
+   byte-for-byte. If they differ, the credential is unverifiable and must be rejected.
+5. **Check status**: also confirm `active == true` and `expires_at` is in the future
+   (or call `verify_engineer(address)`).
+
+### Reference Implementation (JavaScript)
+
+```js
+import { createHash } from "crypto";
+
+// credentialData must be the exact canonical bytes used at issuance.
+function credentialHash(credentialData) {
+  return createHash("sha256").update(credentialData).digest(); // 32-byte Buffer
+}
+
+function verifyCredential(onChainHashHex, credentialData) {
+  const recomputed = credentialHash(credentialData);
+  const onChain = Buffer.from(onChainHashHex, "hex");
+  return recomputed.length === onChain.length && recomputed.equals(onChain);
+}
+```
+
+### Reference Implementation (Rust)
+
+```rust
+use sha2::{Digest, Sha256};
+
+fn credential_hash(credential_data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(credential_data);
+    hasher.finalize().into()
+}
+```
+
+### Rejection Criteria
+
+Reject a credential if any of the following hold:
+
+- The recomputed hash does not match the on-chain `credential_hash`.
+- The on-chain `credential_hash` is all-zeros or equals the SHA-256 of an empty string.
+- The canonical `credential_data` cannot be obtained or is ambiguous.
+- The credential is inactive or expired.
 
 ## Use Cases
 
@@ -174,12 +268,16 @@ get_trusted_issuers() -> Vec<Address>
 - **Security**: Implement strong identity verification
 - **Record Keeping**: Maintain offline audit trails
 - **Communication**: Clear credential terms and conditions
+- **Hashing**: Always compute `credential_hash = sha256(credential_data)` and publish the
+  canonical `credential_data` so verifiers can recompute the hash
 
 ### For Asset Owners
 - **Verification**: Always check engineer credential status
 - **Reject Invalid**: Don't accept maintenance from unverified engineers
 - **Documentation**: Record engineer addresses used
 - **Quality**: Prefer engineers from reputable issuers
+- **Recompute**: Independently recompute `sha256(credential_data)` and compare it to the
+  on-chain `credential_hash` before trusting a credential
 
 ## Integration Points
 
@@ -202,6 +300,9 @@ get_trusted_issuers() -> Vec<Address>
 - **False Issuance**: Fraudulent issuer behavior
 - **Expired Credentials**: Using outdated qualifications
 - **Centralization**: Too few trusted issuers
+- **Unverifiable Hashes**: Registering a hash (e.g. all-zeros or the hash of an empty
+  string) that does not correspond to real credential data, making the credential
+  impossible to verify off-chain
 
 ### Mitigations
 - **Cryptography**: Hash-based credential verification
@@ -209,6 +310,31 @@ get_trusted_issuers() -> Vec<Address>
 - **Expiration**: Time-limited credential validity
 - **Revocation**: Quick response to compromised credentials
 - **Transparency**: On-chain public verification
+- **Hash Specification**: `credential_hash` is defined as `sha256(credential_data)` and
+  verifiers recompute it off-chain (see [Off-Chain Verification](#off-chain-verification))
+- **Issuer Co-Signature (recommended)**: Require the issuer to co-sign the credential
+  hash to prove knowledge of the credential data. See
+  [Issuer Co-Signature](#issuer-co-signature-recommended) below
+
+### Issuer Co-Signature (Recommended)
+
+The contract cannot recompute `sha256(credential_data)` on-chain, so it cannot by itself
+prove that a registered hash corresponds to real credential data. To close this gap,
+issuers **should** co-sign the credential hash, proving knowledge of the credential data
+at issuance time.
+
+**Recommended scheme:**
+
+1. The issuer computes `credential_hash = sha256(credential_data)`.
+2. The issuer signs the hash (or a domain-separated message containing the hash, the
+   engineer address, and the issuer address) with its private key.
+3. The signature is published alongside the credential and verified off-chain by anyone
+   who wants to confirm the issuer attested to this exact hash.
+
+**Future on-chain enforcement:** A follow-up change could extend `register_engineer` to
+accept an issuer signature over `credential_hash` and verify it on-chain (e.g. via
+`env.crypto().ed25519_verify`), rejecting registrations whose hash is not attested by the
+issuer. This is documented here as guidance; it is not enforced by the current contract.
 
 ## Technical Implementation
 
@@ -234,23 +360,6 @@ get_trusted_issuers() -> Vec<Address>
 ### Admin Functions
 - **initialize_admin()**: Set first administrator
 - **get_admin()**: Retrieve current administrator
-- **upgrade()**: Update contract code
+- **upgrade()**: Update con
 
-### Issuer Management
-- **add_trusted_issuer()**: Add new credentialing authority
-- **remove_trusted_issuer()**: Remove existing authority
-- **is_trusted_issuer()**: Check issuer status
-- **get_trusted_issuers()**: List all authorities
-
-## Future Enhancements
-
-### Potential Improvements
-1. **Multi-Level Credentials**: Different credential levels (basic, advanced, expert)
-2. **Specialization**: Credentials for specific asset types or industries
-3. **Reputation System**: Engineer ratings based on maintenance quality
-4. **Cross-Chain Verification**: Verify credentials from other blockchain networks
-5. **Zero-Knowledge Proofs**: Privacy-enhanced credential verification
-
----
-
-*This documentation describes the credentialing system as implemented in the engineer registry contract. For implementation details, refer to the source code in contracts/engineer-registry/src/lib.rs.*
+/* … truncated 894 chars — edit only what you need near the top … */
