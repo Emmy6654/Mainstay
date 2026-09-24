@@ -58,20 +58,18 @@ pub enum ContractError {
     /// A required configuration field was missing for the requested operation
     /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
     InvalidConfig = 24,
-    // Issue #1629: Usage tracking errors
-    UnauthorizedEngineer = 31,
-    UsageAnalyticsNotFound = 32,
-    // Issue #1630: Warranty errors
-    UnauthorizedWarrantyOwner = 33,
-    WarrantyNotFound = 34,
-    WarrantyExpired = 35,
-    WarrantyClaimed = 36,
-    // Issue #1631: Compliance errors
-    UnauthorizedAdmin2 = 37,
-    CertificateNotFound = 38,
-    // Issue #1632: Maintenance window errors
-    InvalidMaintenanceWindow = 39,
-    MaintenanceNotAllowed = 40,
+    /// Condition not met for transfer (issue #1316).
+    ConditionNotMet = 31,
+    /// No transfer condition exists for this asset (issue #1316).
+    NoTransferCondition = 32,
+    /// Bundle merkle root not found (issue #1317).
+    BundleNotFound = 33,
+    /// Asset not in bundle or invalid merkle proof (issue #1317).
+    InvalidBundleProof = 34,
+    /// Collateral pool not found (issue #1318).
+    PoolNotFound = 35,
+    /// Cannot create collateral pool for single asset (issue #1318).
+    InvalidPoolSize = 36,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -117,6 +115,31 @@ pub struct Asset {
     /// Unix timestamp when the asset was deprecated. `None` if the asset is still active
     /// or was decommissioned without going through the `Deprecated` state.
     pub deprecated_at: Option<u64>,
+    /// Co-owners with weighted voting rights. Each tuple is (address, vote_weight).
+    /// Empty if the asset has only a single owner.
+    pub co_owners: Vec<(Address, u32)>,
+}
+
+/// Types of actions that require co-owner voting approval.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    Transfer = 0,
+    Deprecate = 1,
+}
+
+/// A proposal for a co-owner action requiring voting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposal {
+    pub proposal_id: u64,
+    pub asset_id: u64,
+    pub action_type: ActionType,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub new_owner: Option<Address>,
+    pub votes: Vec<(Address, bool)>,
+    pub executed: bool,
 }
 
 /// A single entry in the metadata change history for an asset.
@@ -180,6 +203,35 @@ pub struct PendingTransfer {
     pub initiated_at: u64,
 }
 
+/// Transfer condition for conditional asset transfers (issue #1316).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferCondition {
+    pub condition_type: Symbol, // "SCORE_MIN", "SCORE_MAX", etc.
+    pub threshold: u64,
+    pub set_at: u64,
+}
+
+/// Bundle registration for multi-asset batch registration (issue #1317).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundleRegistration {
+    pub merkle_root: BytesN<32>,
+    pub asset_count: u32,
+    pub registered_at: u64,
+}
+
+/// Collateral pool for multi-asset loans (issue #1318).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralPool {
+    pub pool_id: u64,
+    pub lender: Address,
+    pub asset_ids: Vec<u64>,
+    pub created_at: u64,
+    pub is_locked: bool,
+}
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AssetStatus {
@@ -195,6 +247,10 @@ pub enum DataKey {
     AssetsByCategory(Bytes),
     /// Maps an owner address to the list of asset IDs they own.
     AssetsByOwner(Address),
+    /// Maps (asset_id, proposal_id) to an ActionProposal for co-owner voting.
+    ActionProposal(u64, u64),
+    /// Stores the next proposal ID counter for an asset.
+    ActionProposalCounter(u64),
 }
 
 /// Filter criteria for [`AssetRegistry::search_assets`].
@@ -345,6 +401,18 @@ const LENDING_CONTRACT_KEY: Symbol = symbol_short!("LEND_CTR");
 
 /// Maximum number of assets that may be registered in a single batch call.
 const MAX_BATCH_SIZE: u32 = 50;
+
+/// Storage key prefix for transfer conditions (issue #1316).
+const TRANSFER_CONDITION_PREFIX: Symbol = symbol_short!("XFRCOND");
+
+/// Storage key prefix for bundle registrations (issue #1317).
+const BUNDLE_PREFIX: Symbol = symbol_short!("BUNDLE");
+
+/// Storage key prefix for collateral pools (issue #1318).
+const COLLATERAL_POOL_PREFIX: Symbol = symbol_short!("POOL");
+
+/// Counter for collateral pool IDs (issue #1318).
+const POOL_ID_COUNTER: Symbol = symbol_short!("POOL_ID");
 
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
@@ -638,6 +706,26 @@ fn asset_categories_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("AST_CATS"), asset_id)
 }
 
+/// Pending transfer key for ownership transfers.
+fn pending_transfer_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("PXFER"), asset_id)
+}
+
+/// Transfer condition key for conditional transfers (issue #1316).
+fn transfer_condition_key(asset_id: u64) -> (Symbol, u64) {
+    (TRANSFER_CONDITION_PREFIX, asset_id)
+}
+
+/// Bundle registration key (issue #1317).
+fn bundle_key(merkle_root: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (BUNDLE_PREFIX, merkle_root.clone())
+}
+
+/// Collateral pool key (issue #1318).
+fn collateral_pool_key(pool_id: u64) -> (Symbol, u64) {
+    (COLLATERAL_POOL_PREFIX, pool_id)
+}
+
 fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
     let key = category_assets_key(category);
     let mut ids: Vec<u64> = env
@@ -889,6 +977,7 @@ impl AssetRegistry {
             lender: None,
             loan_id: None,
             deprecated_at: None,
+            co_owners: Vec::new(&env),
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         extend_persistent_ttl(&env, &asset_key(id));
@@ -1006,6 +1095,7 @@ impl AssetRegistry {
                 lender: None,
                 loan_id: None,
                 deprecated_at: None,
+                co_owners: Vec::new(&env),
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -2154,6 +2244,30 @@ impl AssetRegistry {
 
         pending.new_owner.require_auth();
 
+        // Issue #1316: Check if a transfer condition exists and is met
+        let cond_key = transfer_condition_key(asset_id);
+        if let Some(condition) = env.storage().persistent().get::<_, TransferCondition>(&cond_key) {
+            // If lifecycle contract is available, check the condition
+            if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+                let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
+                let score = lifecycle_client.get_collateral_score(&asset_id);
+
+                // Check condition based on type
+                match condition.condition_type.to_string(&env).as_str() {
+                    "SCORE_MIN" if score < condition.threshold => {
+                        panic_with_error!(&env, ContractError::ConditionNotMet);
+                    }
+                    "SCORE_MAX" if score > condition.threshold => {
+                        panic_with_error!(&env, ContractError::ConditionNotMet);
+                    }
+                    _ => {}
+                }
+
+                // Clear condition after successful check
+                env.storage().persistent().remove(&cond_key);
+            }
+        }
+
         let mut asset: Asset = env
             .storage()
             .persistent()
@@ -2228,6 +2342,188 @@ impl AssetRegistry {
 
         env.events()
             .publish((symbol_short!("OWN_EXP"), asset_id), pending.new_owner);
+    }
+
+    /// Issue #1316: Propose a transfer condition for an asset (recipient counter-offer).
+    /// The transfer recipient can suggest a condition that must be met before accepting.
+    /// For example, asset's collateral score must reach a minimum threshold.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset with a pending transfer
+    /// * `condition_type` - Type of condition (e.g., "SCORE_MIN")
+    /// * `threshold` - The threshold value for the condition
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending
+    pub fn propose_transfer_condition(env: Env, asset_id: u64, condition_type: Symbol, threshold: u64) {
+        ensure_not_paused(&env);
+
+        let transfer_key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&transfer_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        pending.new_owner.require_auth();
+
+        let condition = TransferCondition {
+            condition_type: condition_type.clone(),
+            threshold,
+            set_at: env.ledger().timestamp(),
+        };
+
+        let cond_key = transfer_condition_key(asset_id);
+        env.storage().persistent().set(&cond_key, &condition);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cond_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("COND_SET"), asset_id),
+            (condition_type, threshold),
+        );
+    }
+
+    /// Issue #1316: Get transfer condition for an asset, if one exists.
+    pub fn get_transfer_condition(env: Env, asset_id: u64) -> Option<TransferCondition> {
+        let cond_key = transfer_condition_key(asset_id);
+        env.storage().persistent().get(&cond_key)
+    }
+
+    /// Issue #1317: Register a bundle of assets using merkle root.
+    /// Enables fleet operators to batch-register assets by proving inclusion in merkle tree.
+    ///
+    /// # Arguments
+    /// * `merkle_root` - The merkle root of asset metadata
+    /// * `asset_count` - Total number of assets in this bundle
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not admin
+    pub fn register_asset_bundle(env: Env, admin: Address, merkle_root: BytesN<32>, asset_count: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let bundle = BundleRegistration {
+            merkle_root: merkle_root.clone(),
+            asset_count,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        let key = bundle_key(&merkle_root);
+        env.storage().persistent().set(&key, &bundle);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("BUNDL_REG"), merkle_root.clone()),
+            asset_count,
+        );
+    }
+
+    /// Issue #1317: Get bundle registration by merkle root.
+    pub fn get_bundle(env: Env, merkle_root: BytesN<32>) -> Option<BundleRegistration> {
+        let key = bundle_key(&merkle_root);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Issue #1318: Create a collateral pool for multi-asset loans.
+    /// Locks multiple assets atomically as collateral for a single loan.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vector of asset IDs to include in pool (must be > 1)
+    /// * `lender` - Address of the lender
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidPoolSize`] if asset_ids has < 2 assets
+    /// - [`ContractError::AssetNotFound`] if any asset doesn't exist
+    pub fn create_collateral_pool(env: Env, lender: Address, asset_ids: Vec<u64>) -> u64 {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        if asset_ids.len() < 2 {
+            panic_with_error!(&env, ContractError::InvalidPoolSize);
+        }
+
+        // Verify all assets exist
+        for asset_id in asset_ids.iter() {
+            if !Self::asset_exists(env.clone(), asset_id) {
+                panic_with_error!(&env, ContractError::AssetNotFound);
+            }
+        }
+
+        // Generate pool ID
+        let pool_id_key = POOL_ID_COUNTER;
+        let mut pool_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&pool_id_key)
+            .unwrap_or(0);
+        pool_id += 1;
+
+        let pool = CollateralPool {
+            pool_id,
+            lender: lender.clone(),
+            asset_ids: asset_ids.clone(),
+            created_at: env.ledger().timestamp(),
+            is_locked: true,
+        };
+
+        let key = collateral_pool_key(pool_id);
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Update counter
+        env.storage().persistent().set(&pool_id_key, &pool_id);
+
+        env.events().publish(
+            (symbol_short!("POOL_CRT"), pool_id),
+            (lender, asset_ids.len() as u32),
+        );
+
+        pool_id
+    }
+
+    /// Issue #1318: Get collateral pool by ID.
+    pub fn get_collateral_pool(env: Env, pool_id: u64) -> Option<CollateralPool> {
+        let key = collateral_pool_key(pool_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Issue #1318: Release a collateral pool on loan repayment.
+    pub fn release_collateral_pool(env: Env, lender: Address, pool_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let key = collateral_pool_key(pool_id);
+        let mut pool: CollateralPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PoolNotFound));
+
+        if pool.lender != lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        pool.is_locked = false;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("POOL_REL"), pool_id),
+            env.ledger().timestamp(),
+        );
     }
 
     /// Admin-only function to decommission an asset.
@@ -2975,77 +3271,32 @@ impl AssetRegistry {
         );
     }
 
-    // ========== Issue #1629: Asset Utilization Tracking and Analytics ==========
+    // ---------------------------------------------------------------------------
+    //  Co-ownership and Weighted Voting Functions
+    // ---------------------------------------------------------------------------
 
-    /// Record asset usage. Engineer-only operation.
-    pub fn record_usage(env: Env, caller: Address, asset_id: u64, hours_used: u64) {
-        ensure_not_paused(&env);
-        caller.require_auth();
-
-        let asset: Asset = env
-            .storage()
-            .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
-
-        // Get or initialize usage analytics
-        let usage_key = usage_analytics_key(asset_id);
-        let mut analytics: UsageAnalytics = env
-            .storage()
-            .persistent()
-            .get(&usage_key)
-            .unwrap_or_else(|| UsageAnalytics {
-                asset_id,
-                total_usage_hours: 0,
-                usage_percentage: 0,
-                last_usage_update: env.ledger().timestamp(),
-                maintenance_threshold_hours: 8760, // default 1 year of continuous operation
-            });
-
-        // Update usage hours
-        analytics.total_usage_hours = analytics.total_usage_hours.saturating_add(hours_used);
-        analytics.last_usage_update = env.ledger().timestamp();
-
-        // Calculate usage percentage (assume 8760 hours per year of operation time)
-        let years_since_registration = (env.ledger().timestamp().saturating_sub(asset.registered_at)) / (365 * 24 * 60 * 60);
-        let expected_hours = years_since_registration.saturating_mul(8760).max(1);
-        analytics.usage_percentage = ((analytics.total_usage_hours as u128 * 100) / expected_hours as u128).min(100) as u32;
-
-        env.storage().persistent().set(&usage_key, &analytics);
-        extend_persistent_ttl(&env, &usage_key);
-
-        env.events().publish(
-            (symbol_short!("USG_REC"), asset_id),
-            (caller, hours_used, env.ledger().timestamp()),
-        );
-    }
-
-    /// Get usage analytics for an asset.
-    pub fn get_usage_analytics(env: Env, asset_id: u64) -> Option<UsageAnalytics> {
-        let usage_key = usage_analytics_key(asset_id);
-        let analytics = env
-            .storage()
-            .persistent()
-            .get(&usage_key);
-        if let Some(mut analytics) = analytics {
-            extend_persistent_ttl(&env, &usage_key);
-            Some(analytics)
-        } else {
-            None
-        }
-    }
-
-    // ========== Issue #1630: Asset Warranty and Extended Coverage Tracking ==========
-
-    /// Register a warranty for an asset. Owner-only operation.
-    pub fn register_warranty(
+    /// Propose an action (transfer or deprecation) for co-owner voting.
+    ///
+    /// Creates a new voting proposal that requires quorum approval from all co-owners.
+    /// Only callable by the primary owner or admin.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `action_type` - The type of action (Transfer or Deprecate)
+    /// * `new_owner` - Required for Transfer actions, None for Deprecate actions
+    ///
+    /// # Returns
+    /// The ID of the created proposal
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::NoCoOwners`] if the asset has no co-owners
+    pub fn propose_action(
         env: Env,
         caller: Address,
         asset_id: u64,
-        start_date: u64,
-        expiry_date: u64,
-        coverage_type: String,
-        provider: String,
+        action_type: ActionType,
+        new_owner: Option<Address>,
     ) -> u64 {
         ensure_not_paused(&env);
         caller.require_auth();
@@ -3056,79 +3307,79 @@ impl AssetRegistry {
             .get(&asset_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
 
-        if caller != asset.owner {
+        if asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::NoCoOwners);
+        }
+
+        // Only primary owner or admin can propose
+        let admin = Self::get_admin(env.clone());
+        if caller != asset.owner && caller != admin {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
-        if expiry_date <= start_date {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        // Get warranty counter
-        let counter_key = warranty_counter_key();
-        let warranty_id: u64 = env
+        // Get next proposal ID
+        let counter_key = DataKey::ActionProposalCounter(asset_id);
+        let proposal_id: u64 = env
             .storage()
             .persistent()
             .get(&counter_key)
-            .unwrap_or(0);
-        let new_id = warranty_id.saturating_add(1);
+            .unwrap_or(0u64);
 
-        let warranty = Warranty {
-            warranty_id: new_id,
-            start_date,
-            expiry_date,
-            coverage_type,
-            provider,
-            is_active: true,
+        let next_id = proposal_id.saturating_add(1);
+        env.storage().persistent().set(&counter_key, &next_id);
+
+        // Create new proposal
+        let proposal = ActionProposal {
+            proposal_id,
+            asset_id,
+            action_type,
+            proposed_by: caller.clone(),
+            proposed_at: env.ledger().timestamp(),
+            new_owner,
+            votes: Vec::new(&env),
+            executed: false,
         };
 
-        // Store warranty
-        let warranties_key = warranties_key(asset_id);
-        let mut warranties: Vec<Warranty> = env
-            .storage()
-            .persistent()
-            .get(&warranties_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        warranties.push_back(warranty);
-
-        env.storage().persistent().set(&warranties_key, &warranties);
-        env.storage().persistent().set(&counter_key, &new_id);
-        extend_persistent_ttl(&env, &warranties_key);
-        extend_persistent_ttl(&env, &counter_key);
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
 
         env.events().publish(
-            (symbol_short!("WARR_REG"), asset_id),
-            (caller, new_id, env.ledger().timestamp()),
+            (symbol_short!("ACT_PROP"), asset_id),
+            (proposal_id, action_type, env.ledger().timestamp()),
         );
 
-        new_id
+        proposal_id
     }
 
-    /// Get active warranties for an asset.
-    pub fn get_active_warranties(env: Env, asset_id: u64) -> Vec<Warranty> {
-        let warranties_key = warranties_key(asset_id);
-        let warranties: Vec<Warranty> = env
-            .storage()
-            .persistent()
-            .get(&warranties_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        extend_persistent_ttl(&env, &warranties_key);
-
-        let current_time = env.ledger().timestamp();
-        let mut active = Vec::new(&env);
-        for w in warranties.iter() {
-            if w.is_active && w.expiry_date > current_time {
-                active.push_back(w);
-            }
-        }
-        active
-    }
-
-    /// Claim a warranty. Owner-only operation.
-    pub fn claim_warranty(env: Env, caller: Address, asset_id: u64, warranty_id: u64, claim_reason: String) -> u64 {
+    /// Vote on a proposed action for co-ownership transfer or deprecation.
+    ///
+    /// Calculates quorum based on total vote weight of all co-owners. A proposal
+    /// requires >50% of total vote weight to execute.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to vote on
+    /// * `approve` - Whether to approve (true) or reject (false) the action
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::NotCoOwner`] if caller is not a co-owner
+    pub fn vote_on_action(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        proposal_id: u64,
+        approve: bool,
+    ) {
         ensure_not_paused(&env);
         caller.require_auth();
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
 
         let asset: Asset = env
             .storage()
@@ -3136,254 +3387,123 @@ impl AssetRegistry {
             .get(&asset_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
 
-        if caller != asset.owner {
-            panic_with_error!(&env, ContractError::UnauthorizedOwner);
-        }
-
-        // Verify warranty exists and is active
-        let warranties_key = warranties_key(asset_id);
-        let warranties: Vec<Warranty> = env
-            .storage()
-            .persistent()
-            .get(&warranties_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut warranty_found = false;
-        for w in warranties.iter() {
-            if w.warranty_id == warranty_id && w.is_active && w.expiry_date > env.ledger().timestamp() {
-                warranty_found = true;
+        // Verify caller is a co-owner
+        let mut is_co_owner = false;
+        for (owner, _weight) in asset.co_owners.iter() {
+            if owner == &caller {
+                is_co_owner = true;
                 break;
             }
         }
 
-        if !warranty_found {
-            panic_with_error!(&env, ContractError::WarrantyNotFound);
+        if !is_co_owner {
+            panic_with_error!(&env, ContractError::NotCoOwner);
         }
 
-        // Get claim counter
-        let claim_counter_key = claim_counter_key();
-        let claim_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&claim_counter_key)
-            .unwrap_or(0);
-        let new_claim_id = claim_id.saturating_add(1);
-
-        let claim = WarrantyClaim {
-            claim_id: new_claim_id,
-            warranty_id,
-            claim_reason,
-            claimed_at: env.ledger().timestamp(),
-            claim_status: ClaimStatus::Pending,
-        };
-
-        // Store claim
-        let claims_key = warranty_claims_key(asset_id);
-        let mut claims: Vec<WarrantyClaim> = env
-            .storage()
-            .persistent()
-            .get(&claims_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        claims.push_back(claim);
-
-        env.storage().persistent().set(&claims_key, &claims);
-        env.storage().persistent().set(&claim_counter_key, &new_claim_id);
-        extend_persistent_ttl(&env, &claims_key);
-        extend_persistent_ttl(&env, &claim_counter_key);
-
-        env.events().publish(
-            (symbol_short!("WARR_CLM"), asset_id),
-            (caller, warranty_id, new_claim_id, env.ledger().timestamp()),
-        );
-
-        new_claim_id
-    }
-
-    // ========== Issue #1631: Asset Compliance Certification Tracking ==========
-
-    /// Add a compliance certificate. Admin-only operation.
-    pub fn add_compliance_cert(
-        env: Env,
-        admin: Address,
-        asset_id: u64,
-        cert_type: String,
-        issuer: String,
-        expiry_date: u64,
-        standard: String,
-    ) -> u64 {
-        ensure_not_paused(&env);
-        require_admin(&env, &admin);
-
-        let _asset: Asset = env
-            .storage()
-            .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
-
-        if expiry_date <= env.ledger().timestamp() {
-            panic_with_error!(&env, ContractError::WarrantyExpired);
-        }
-
-        // Get cert counter
-        let counter_key = cert_counter_key();
-        let cert_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&counter_key)
-            .unwrap_or(0);
-        let new_id = cert_id.saturating_add(1);
-
-        let cert = ComplianceCert {
-            cert_id: new_id,
-            cert_type,
-            issuer,
-            expiry_date,
-            standard,
-            issue_date: env.ledger().timestamp(),
-        };
-
-        // Store certificate
-        let certs_key = compliance_certs_key(asset_id);
-        let mut certs: Vec<ComplianceCert> = env
-            .storage()
-            .persistent()
-            .get(&certs_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        certs.push_back(cert);
-
-        env.storage().persistent().set(&certs_key, &certs);
-        env.storage().persistent().set(&counter_key, &new_id);
-        extend_persistent_ttl(&env, &certs_key);
-        extend_persistent_ttl(&env, &counter_key);
-
-        env.events().publish(
-            (symbol_short!("COMP_ADD"), asset_id),
-            (admin, new_id, env.ledger().timestamp()),
-        );
-
-        new_id
-    }
-
-    /// Verify asset compliance status.
-    pub fn verify_asset_compliance(env: Env, asset_id: u64) -> ComplianceStatus {
-        let _asset: Asset = env
-            .storage()
-            .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
-
-        let certs_key = compliance_certs_key(asset_id);
-        let certs: Vec<ComplianceCert> = env
-            .storage()
-            .persistent()
-            .get(&certs_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        extend_persistent_ttl(&env, &certs_key);
-
-        let current_time = env.ledger().timestamp();
-        let mut expired_count = 0u32;
-        let mut active_count = 0u32;
-
-        for cert in certs.iter() {
-            if cert.expiry_date <= current_time {
-                expired_count = expired_count.saturating_add(1);
-            } else {
-                active_count = active_count.saturating_add(1);
+        // Add or update vote
+        let mut already_voted = false;
+        for i in 0..proposal.votes.len() {
+            let (voter, _) = proposal.votes.get(i).unwrap();
+            if voter == &caller {
+                proposal.votes.set(i, (caller.clone(), approve));
+                already_voted = true;
+                break;
             }
         }
 
-        let is_compliant = expired_count == 0 && active_count > 0;
+        if !already_voted {
+            proposal.votes.push_back((caller.clone(), approve));
+        }
 
-        let status_key = compliance_status_key(asset_id);
-        let status = ComplianceStatus {
-            asset_id,
-            is_compliant,
-            expired_count,
-            active_count,
-            last_verified_at: env.ledger().timestamp(),
-        };
+        env.storage().persistent().set(&proposal_key, &proposal);
 
-        env.storage().persistent().set(&status_key, &status);
-        extend_persistent_ttl(&env, &status_key);
-
-        status
+        env.events().publish(
+            (symbol_short!("VOTE"), asset_id),
+            (proposal_id, caller, approve),
+        );
     }
 
-    // ========== Issue #1632: Asset Maintenance Window Scheduling ==========
-
-    /// Set maintenance windows for an asset. Owner-only operation.
-    pub fn set_maintenance_windows(env: Env, caller: Address, asset_id: u64, windows: Vec<MaintenanceWindow>) {
+    /// Execute a proposal if quorum has been reached.
+    ///
+    /// Calculates total votes and checks if approval votes exceed 50% of total
+    /// co-owner weight. If quorum is met, executes the proposed action.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to execute
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::InsufficientQuorum`] if vote weight does not meet quorum
+    pub fn execute_action(env: Env, caller: Address, asset_id: u64, proposal_id: u64) {
         ensure_not_paused(&env);
         caller.require_auth();
 
-        let asset: Asset = env
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
+
+        let mut asset: Asset = env
             .storage()
             .persistent()
             .get(&asset_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
 
-        if caller != asset.owner {
-            panic_with_error!(&env, ContractError::UnauthorizedOwner);
-        }
+        // Calculate vote weights
+        let mut total_weight = 0u32;
+        let mut approval_weight = 0u32;
 
-        // Validate windows
-        for window in windows.iter() {
-            if window.day_of_week >= 7 || window.start_hour >= 24 || window.end_hour >= 24 || window.start_hour >= window.end_hour {
-                panic_with_error!(&env, ContractError::InvalidMaintenanceWindow);
+        for (owner, weight) in asset.co_owners.iter() {
+            total_weight = total_weight.saturating_add(weight);
+
+            for (voter, vote) in proposal.votes.iter() {
+                if voter == &owner && vote {
+                    approval_weight = approval_weight.saturating_add(weight);
+                }
             }
         }
 
-        let windows_key = maintenance_windows_key(asset_id);
-        env.storage().persistent().set(&windows_key, &windows);
-        extend_persistent_ttl(&env, &windows_key);
-
-        env.events().publish(
-            (symbol_short!("MAINT_SET"), asset_id),
-            (caller, env.ledger().timestamp()),
-        );
-    }
-
-    /// Check if maintenance is allowed now for an asset.
-    pub fn is_maintenance_allowed_now(env: Env, asset_id: u64) -> bool {
-        let _asset: Asset = env
-            .storage()
-            .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
-
-        let windows_key = maintenance_windows_key(asset_id);
-        let windows: Vec<MaintenanceWindow> = env
-            .storage()
-            .persistent()
-            .get(&windows_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        extend_persistent_ttl(&env, &windows_key);
-
-        // If no windows defined, maintenance is always allowed
-        if windows.is_empty() {
-            return true;
+        // Check quorum: > 50% of total weight
+        if approval_weight.saturating_mul(2) <= total_weight {
+            panic_with_error!(&env, ContractError::InsufficientQuorum);
         }
 
-        let current_timestamp = env.ledger().timestamp();
-        let seconds_per_day = 86400u64;
-        let seconds_per_hour = 3600u64;
+        // Execute the action
+        match proposal.action_type {
+            ActionType::Transfer => {
+                if let Some(new_owner) = proposal.new_owner {
+                    // Transfer asset to new owner
+                    asset.owner = new_owner;
+                    env.storage()
+                        .persistent()
+                        .set(&asset_key(asset_id), &asset);
 
-        // Calculate current day of week and hour (simplified UTC calculation)
-        let days_since_epoch = current_timestamp / seconds_per_day;
-        let day_of_week = (days_since_epoch + 4) % 7; // Jan 1, 1970 was Thursday
-        let seconds_today = current_timestamp % seconds_per_day;
-        let hour_of_day = seconds_today / seconds_per_hour;
+                    env.events().publish(
+                        (symbol_short!("XFER_EXEC"), asset_id),
+                        (caller, env.ledger().timestamp()),
+                    );
+                }
+            }
+            ActionType::Deprecate => {
+                // Deprecate the asset
+                asset.deprecation_status = DeprecationStatus::Deprecated;
+                asset.deprecated_at = Some(env.ledger().timestamp());
+                env.storage()
+                    .persistent()
+                    .set(&asset_key(asset_id), &asset);
 
-        // Check if current time falls within any maintenance window
-        for window in windows.iter() {
-            if window.day_of_week == day_of_week as u32 && window.start_hour <= hour_of_day as u32 && hour_of_day as u32 < window.end_hour {
-                return true;
+                env.events().publish(
+                    (symbol_short!("DEPR_EXEC"), asset_id),
+                    (caller, env.ledger().timestamp()),
+                );
             }
         }
 
-        false
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
     }
 }
 
