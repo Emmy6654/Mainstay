@@ -223,6 +223,99 @@ pub struct RecurringTask {
     pub is_active: bool,
 }
 
+/// Status of an asset retirement process.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementStatus {
+    Pending = 0,
+    Confirmed = 1,
+    Cancelled = 2,
+    Archived = 3,
+}
+
+/// Asset retirement state during the decommissioning workflow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetirementState {
+    pub asset_id: u64,
+    pub status: RetirementStatus,
+    pub initiated_at: u64,
+    pub initiated_by: Address,
+    pub reason: Bytes,
+    pub review_period_end: u64,
+    pub final_score: Option<u32>,
+}
+
+/// Certificate issued upon retirement of an asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetirementCertificate {
+    pub asset_id: u64,
+    pub retired_at: u64,
+    pub final_score: u32,
+    pub total_maintenance_count: u32,
+    pub total_cost: u64,
+    pub reason: Bytes,
+    pub certificate_hash: Bytes,
+}
+
+/// Status of a coordinated maintenance task across multiple assets.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinationStatus {
+    Active = 0,
+    Completed = 1,
+    Failed = 2,
+    Cancelled = 3,
+}
+
+/// Coordinated maintenance task spanning multiple assets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatedTask {
+    pub task_id: u64,
+    pub asset_ids: Vec<u64>,
+    pub task_type: Symbol,
+    pub status: CoordinationStatus,
+    pub created_at: u64,
+    pub created_by: Address,
+    pub completion_deadline: u64,
+    pub completed_at: Option<u64>,
+}
+
+/// Subtask status for a coordinated task on a specific asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatedSubtask {
+    pub asset_id: u64,
+    pub subtask_id: u64,
+    pub status: CoordinationStatus,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub notes: Bytes,
+}
+
+/// Season enum for seasonal score adjustments.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Season {
+    Winter = 0,
+    Spring = 1,
+    Summer = 2,
+    Fall = 3,
+}
+
+/// Seasonal adjustment factors for an asset type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeasonalAdjustment {
+    pub asset_type: Symbol,
+    pub winter_factor: u32,
+    pub spring_factor: u32,
+    pub summer_factor: u32,
+    pub fall_factor: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
