@@ -66,6 +66,20 @@ pub enum ContractError {
     BatchRevokeTooLarge = 38,
     /// The admins list supplied to set_admin_quorum exceeds the maximum allowed size (10).
     TooManyAdmins = 39,
+    /// Asset retirement is not initiated or not found.
+    RetirementNotFound = 40,
+    /// Asset is already in retirement process.
+    AlreadyRetiring = 41,
+    /// Retirement review period has not expired yet.
+    RetirementReviewPending = 42,
+    /// Coordinated task not found.
+    CoordinatedTaskNotFound = 43,
+    /// All subtasks must be completed before marking coordination done.
+    CoordinatedTaskIncomplete = 44,
+    /// Asset type has no seasonal adjustment factors configured.
+    SeasonalAdjustmentNotFound = 45,
+    /// Seasonal factor values are invalid (must be 0-100 range).
+    InvalidSeasonalFactor = 46,
 }
 
 impl From<SharedContractError> for ContractError {

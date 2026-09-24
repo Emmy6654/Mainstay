@@ -13,21 +13,25 @@ pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key, submission_window_key,
+    transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR,
+    EVENT_RECONSTR, EVENT_RETIREMENT_INIT, EVENT_RETIREMENT_CONF, EVENT_RETIREMENT_CANC,
+    EVENT_COORD_TASK_CREATE, EVENT_COORD_TASK_DONE, EVENT_SEASONAL_ADJ,
 };
 
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, RetirementState, RetirementStatus,
+    RetirementCertificate, CoordinatedTask, CoordinatedSubtask, CoordinationStatus, Season,
+    SeasonalAdjustment,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -77,6 +81,14 @@ const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
 /// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
+/// Default retirement review period: 7 days in seconds.
+const DEFAULT_RETIREMENT_REVIEW_PERIOD: u64 = 604_800;
+/// Default coordinated task timeout: 30 days in seconds.
+const DEFAULT_COORDINATED_TASK_TIMEOUT: u64 = 2_592_000;
+/// Maximum next coordinated task ID.
+const MAX_COORDINATED_TASK_ID: u64 = u64::MAX;
+/// Next coordinated task ID storage key.
+const NEXT_COORD_TASK_ID_KEY: Symbol = symbol_short!("NXTTID");
 
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
@@ -5478,6 +5490,446 @@ impl Lifecycle {
             page.push_back(all.get(i).unwrap());
         }
         page
+    }
+
+    // =========================================================================
+    // Issue #1633: Asset Retirement and Decommissioning Workflow
+    // =========================================================================
+
+    /// Initiate retirement of an asset (owner-only). Starts a 7-day review period.
+    pub fn initiate_retirement(env: Env, owner: Address, asset_id: u64, reason: Bytes) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        let now = env.ledger().timestamp();
+        let review_period_end = now.checked_add(DEFAULT_RETIREMENT_REVIEW_PERIOD)
+            .unwrap_or(u64::MAX);
+
+        let state = RetirementState {
+            asset_id,
+            status: RetirementStatus::Pending,
+            initiated_at: now,
+            initiated_by: owner.clone(),
+            reason: reason.clone(),
+            review_period_end,
+            final_score: None,
+        };
+
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_INIT, asset_id),
+            (owner.clone(), reason),
+        );
+    }
+
+    /// Confirm retirement of an asset after review period ends (owner-only).
+    pub fn confirm_retirement(env: Env, owner: Address, asset_id: u64) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        let mut state: RetirementState = env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::RetirementNotFound));
+
+        if state.status != RetirementStatus::Pending {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < state.review_period_end {
+            panic_with_error!(env, ContractError::RetirementReviewPending);
+        }
+
+        let score_key = score_key(asset_id);
+        let final_score: u32 = env.storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or(0);
+
+        state.status = RetirementStatus::Confirmed;
+        state.final_score = Some(final_score);
+
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.storage().persistent().set(&frozen_key(asset_id), &true);
+        env.storage().persistent().set(&frozen_score_key(asset_id), &final_score);
+        extend_persistent_ttl(&env, &frozen_key(asset_id));
+        extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env.storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_cost: u64 = 0;
+        for record in history.iter() {
+            if let Some(cost) = record.cost {
+                total_cost = total_cost.saturating_add(cost);
+            }
+        }
+
+        let cert_hash_data = format!(&env, "{}:{}:{}", asset_id, final_score, now);
+        let cert_hash: BytesN<32> = env.crypto().sha256(&cert_hash_data.into_bytes()).into();
+
+        let certificate = RetirementCertificate {
+            asset_id,
+            retired_at: now,
+            final_score,
+            total_maintenance_count: history.len() as u32,
+            total_cost,
+            reason: state.reason.clone(),
+            certificate_hash: cert_hash.into(),
+        };
+
+        let cert_key = retirement_certificate_key(asset_id);
+        env.storage().persistent().set(&cert_key, &certificate);
+        extend_persistent_ttl(&env, &cert_key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_CONF, asset_id),
+            (owner.clone(), final_score),
+        );
+    }
+
+    /// Cancel pending retirement of an asset (owner-only).
+    pub fn cancel_retirement(env: Env, owner: Address, asset_id: u64) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        let mut state: RetirementState = env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::RetirementNotFound));
+
+        if state.status != RetirementStatus::Pending {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        state.status = RetirementStatus::Cancelled;
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_CANC, asset_id),
+            owner.clone(),
+        );
+    }
+
+    /// Get retirement state for an asset.
+    pub fn get_retirement_state(env: Env, asset_id: u64) -> Option<RetirementState> {
+        let key = retirement_state_key(asset_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Get retirement certificate for an asset.
+    pub fn get_retirement_certificate(env: Env, asset_id: u64) -> Option<RetirementCertificate> {
+        let key = retirement_certificate_key(asset_id);
+        env.storage().persistent().get(&key)
+    }
+
+    // =========================================================================
+    // Issue #1634: Cross-Asset Maintenance Coordination
+    // =========================================================================
+
+    /// Create a coordinated maintenance task across multiple assets (engineer-only).
+    pub fn create_coordinated_task(
+        env: Env,
+        engineer: Address,
+        asset_ids: Vec<u64>,
+        task_type: Bytes,
+    ) -> u64 {
+        engineer.require_auth();
+        ensure_not_paused(&env);
+
+        let engineer_registry = get_engineer_registry_addr(&env);
+        let client = engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
+        if !client.is_engineer(&engineer) {
+            panic_with_error!(env, ContractError::UnauthorizedEngineer);
+        }
+
+        let now = env.ledger().timestamp();
+        let id_key = NEXT_COORD_TASK_ID_KEY;
+        let task_id: u64 = env.storage()
+            .persistent()
+            .get(&id_key)
+            .unwrap_or(1);
+
+        if task_id >= MAX_COORDINATED_TASK_ID {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        let completion_deadline = now.checked_add(DEFAULT_COORDINATED_TASK_TIMEOUT)
+            .unwrap_or(u64::MAX);
+
+        let task = CoordinatedTask {
+            task_id,
+            asset_ids: asset_ids.clone(),
+            task_type: Symbol::new(&env, &String::from_utf8(&env, task_type.clone()).unwrap()),
+            status: CoordinationStatus::Active,
+            created_at: now,
+            created_by: engineer.clone(),
+            completion_deadline,
+            completed_at: None,
+        };
+
+        let task_key = coordinated_task_key(task_id);
+        env.storage().persistent().set(&task_key, &task);
+        extend_persistent_ttl(&env, &task_key);
+
+        let mut subtasks: Vec<CoordinatedSubtask> = Vec::new(&env);
+        for (idx, asset_id) in asset_ids.iter().enumerate() {
+            let subtask = CoordinatedSubtask {
+                asset_id,
+                subtask_id: idx as u64,
+                status: CoordinationStatus::Active,
+                started_at: None,
+                completed_at: None,
+                notes: Bytes::new(&env),
+            };
+            subtasks.push_back(subtask);
+        }
+
+        let subtasks_key = coordinated_subtasks_key(task_id);
+        env.storage().persistent().set(&subtasks_key, &subtasks);
+        extend_persistent_ttl(&env, &subtasks_key);
+
+        env.storage().persistent().set(&id_key, &(task_id.checked_add(1).unwrap_or(MAX_COORDINATED_TASK_ID)));
+        extend_persistent_ttl(&env, &id_key);
+
+        env.events().publish(
+            (EVENT_COORD_TASK_CREATE, task_id),
+            (engineer.clone(), asset_ids.len()),
+        );
+
+        task_id
+    }
+
+    /// Get status of a coordinated task.
+    pub fn get_coordinated_task_status(env: Env, task_id: u64) -> Option<CoordinationStatus> {
+        let key = coordinated_task_key(task_id);
+        if let Some(task) = env.storage().persistent().get::<_, CoordinatedTask>(&key) {
+            Some(task.status)
+        } else {
+            None
+        }
+    }
+
+    /// Mark a subtask as completed within a coordinated task.
+    pub fn complete_coordinated_subtask(
+        env: Env,
+        engineer: Address,
+        task_id: u64,
+        asset_id: u64,
+    ) {
+        engineer.require_auth();
+        ensure_not_paused(&env);
+
+        let task_key = coordinated_task_key(task_id);
+        let task: CoordinatedTask = env.storage()
+            .persistent()
+            .get(&task_key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::CoordinatedTaskNotFound));
+
+        if task.status != CoordinationStatus::Active {
+            panic_with_error!(env, ContractError::CoordinatedTaskNotFound);
+        }
+
+        let subtasks_key = coordinated_subtasks_key(task_id);
+        let mut subtasks: Vec<CoordinatedSubtask> = env.storage()
+            .persistent()
+            .get(&subtasks_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        let now = env.ledger().timestamp();
+        for subtask in subtasks.iter_mut() {
+            if subtask.asset_id == asset_id {
+                subtask.status = CoordinationStatus::Completed;
+                subtask.completed_at = Some(now);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(env, ContractError::CoordinatedTaskNotFound);
+        }
+
+        let mut all_complete = true;
+        for subtask in subtasks.iter() {
+            if subtask.status != CoordinationStatus::Completed {
+                all_complete = false;
+                break;
+            }
+        }
+
+        env.storage().persistent().set(&subtasks_key, &subtasks);
+        extend_persistent_ttl(&env, &subtasks_key);
+
+        if all_complete {
+            let mut completed_task = task.clone();
+            completed_task.status = CoordinationStatus::Completed;
+            completed_task.completed_at = Some(now);
+            env.storage().persistent().set(&task_key, &completed_task);
+            extend_persistent_ttl(&env, &task_key);
+
+            env.events().publish(
+                (EVENT_COORD_TASK_DONE, task_id),
+                (engineer.clone(), now),
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #1635: Predictive Maintenance Score Using Historical Patterns
+    // =========================================================================
+
+    /// Predict the next maintenance date for an asset based on historical patterns.
+    pub fn predict_next_maintenance_date(env: Env, asset_id: u64) -> Option<(u64, u32)> {
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env.storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.len() < 2 {
+            return None;
+        }
+
+        let mut intervals: Vec<u64> = Vec::new(&env);
+        for i in 1..history.len() {
+            let current = history.get(i).unwrap();
+            let previous = history.get(i - 1).unwrap();
+            let interval = current.timestamp.saturating_sub(previous.timestamp);
+            if interval > 0 {
+                intervals.push_back(interval);
+            }
+        }
+
+        if intervals.is_empty() {
+            return None;
+        }
+
+        let mut sum: u64 = 0;
+        for interval in intervals.iter() {
+            sum = sum.saturating_add(interval);
+        }
+        let avg_interval = sum / intervals.len() as u64;
+
+        let last_record = history.get(history.len() - 1).unwrap();
+        let predicted_date = last_record.timestamp.saturating_add(avg_interval);
+
+        let mut trend = 100u32;
+        if intervals.len() >= 2 {
+            let last_interval = intervals.get(intervals.len() - 1).unwrap();
+            let prev_interval = intervals.get(intervals.len() - 2).unwrap();
+            if last_interval > prev_interval {
+                trend = 80;
+            } else if last_interval < prev_interval {
+                trend = 120;
+            }
+        }
+
+        Some((predicted_date, trend))
+    }
+
+    // =========================================================================
+    // Issue #1636: Seasonal Score Adjustments
+    // =========================================================================
+
+    /// Get current season based on ledger timestamp.
+    pub fn current_season(env: Env) -> Season {
+        let timestamp = env.ledger().timestamp();
+        let days_in_year = (timestamp / 86400) % 365;
+        if days_in_year >= 79 && days_in_year < 172 {
+            Season::Spring
+        } else if days_in_year >= 172 && days_in_year < 265 {
+            Season::Summer
+        } else if days_in_year >= 265 && days_in_year < 355 {
+            Season::Fall
+        } else {
+            Season::Winter
+        }
+    }
+
+    /// Set seasonal adjustment factors for an asset type.
+    pub fn set_seasonal_adjustment(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        winter_factor: u32,
+        spring_factor: u32,
+        summer_factor: u32,
+        fall_factor: u32,
+    ) {
+        admin.require_auth();
+        let config: Config = env.storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+        require_quorum(&env, &config, &admin);
+
+        if winter_factor > 100 || spring_factor > 100 || summer_factor > 100 || fall_factor > 100 {
+            panic_with_error!(env, ContractError::InvalidSeasonalFactor);
+        }
+
+        let adjustment = SeasonalAdjustment {
+            asset_type: asset_type.clone(),
+            winter_factor,
+            spring_factor,
+            summer_factor,
+            fall_factor,
+        };
+
+        let key = seasonal_adjustment_key(&asset_type);
+        env.storage().persistent().set(&key, &adjustment);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_SEASONAL_ADJ, asset_type),
+            (winter_factor, spring_factor, summer_factor, fall_factor),
+        );
+    }
+
+    /// Apply seasonal adjustment to a base score.
+    pub fn apply_seasonal_adjustment(env: Env, asset_type: Symbol, base_score: u32) -> u32 {
+        let key = seasonal_adjustment_key(&asset_type);
+        let adjustment: SeasonalAdjustment = match env.storage().persistent().get(&key) {
+            Some(adj) => adj,
+            None => return base_score,
+        };
+
+        let season = Self::current_season(&env);
+        let factor = match season {
+            Season::Winter => adjustment.winter_factor,
+            Season::Spring => adjustment.spring_factor,
+            Season::Summer => adjustment.summer_factor,
+            Season::Fall => adjustment.fall_factor,
+        };
+
+        if factor == 0 {
+            return base_score;
+        }
+
+        ((base_score as u64).saturating_mul(factor as u64) / 100) as u32
+    }
+
+    /// Get seasonal adjustment factors for an asset type.
+    pub fn get_seasonal_adjustment(env: Env, asset_type: Symbol) -> Option<SeasonalAdjustment> {
+        let key = seasonal_adjustment_key(&asset_type);
+        env.storage().persistent().get(&key)
     }
 }
 

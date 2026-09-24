@@ -44,3 +44,21 @@ pub(crate) const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
 
 /// Emitted when an admin anchors maintenance history to a health snapshot via `anchor_history_to_snapshot`.
 pub(crate) const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
+
+/// Emitted when asset retirement is initiated via `initiate_retirement`.
+pub(crate) const EVENT_RETIREMENT_INIT: Symbol = symbol_short!("RTR_INIT");
+
+/// Emitted when asset retirement is confirmed via `confirm_retirement`.
+pub(crate) const EVENT_RETIREMENT_CONF: Symbol = symbol_short!("RTR_CONF");
+
+/// Emitted when asset retirement is cancelled via `cancel_retirement`.
+pub(crate) const EVENT_RETIREMENT_CANC: Symbol = symbol_short!("RTR_CANC");
+
+/// Emitted when a coordinated maintenance task is created via `create_coordinated_task`.
+pub(crate) const EVENT_COORD_TASK_CREATE: Symbol = symbol_short!("COOD_CRT");
+
+/// Emitted when a coordinated task is completed via `complete_coordinated_task`.
+pub(crate) const EVENT_COORD_TASK_DONE: Symbol = symbol_short!("COOD_DON");
+
+/// Emitted when seasonal adjustment factors are configured via `set_seasonal_adjustment`.
+pub(crate) const EVENT_SEASONAL_ADJ: Symbol = symbol_short!("SEAS_SET");
