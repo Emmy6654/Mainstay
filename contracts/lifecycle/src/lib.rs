@@ -26,7 +26,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
 };
 use shared::extend_persistent_ttl;
@@ -4110,6 +4110,79 @@ impl Lifecycle {
         } else {
             let (timestamp, value) = history.get(history.len() - 1).unwrap();
             (value, timestamp)
+        }
+    }
+
+    /// Return a comprehensive snapshot of an asset's complete state for off-chain backup.
+    ///
+    /// This function retrieves all critical asset information from both the asset registry
+    /// and lifecycle contract in a single call, enabling consistent off-chain backups and
+    /// recovery procedures. The snapshot captures asset metadata, collateral status,
+    /// maintenance history summary, and current valuation in one atomic read.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// A complete `AssetFullSnapshot` containing all asset state fields
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry
+    pub fn get_asset_full_snapshot(env: Env, asset_id: u64) -> AssetFullSnapshot {
+        let asset_registry = get_asset_registry_addr(&env);
+        let registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+
+        // Verify asset exists and retrieve asset data
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset = registry_client.get_asset(&asset_id);
+
+        // Get current collateral score and valuation
+        let collateral_score = Self::get_collateral_score(env.clone(), asset_id);
+        let (collateral_valuation, _) = Self::get_collateral_valuation(env.clone(), asset_id);
+
+        // Get maintenance history count and last service timestamp
+        let history_key = history_key(asset_id);
+        let maintenance_history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_maintenance_records = maintenance_history.len() as u32;
+        let last_service_timestamp = if !maintenance_history.is_empty() {
+            maintenance_history.get(maintenance_history.len() - 1).unwrap().timestamp
+        } else {
+            0u64
+        };
+
+        // Convert deprecation status enum to u32
+        let deprecation_status_u32 = match asset.deprecation_status {
+            asset_registry::DeprecationStatus::Active => 0u32,
+            asset_registry::DeprecationStatus::Deprecated => 1u32,
+            asset_registry::DeprecationStatus::Decommissioned => 2u32,
+        };
+
+        // Create and return the full snapshot
+        AssetFullSnapshot {
+            asset_id: asset.asset_id,
+            asset_type: asset.asset_type,
+            metadata: asset.metadata,
+            serial_number: asset.serial_number,
+            owner: asset.owner,
+            registered_at: asset.registered_at,
+            metadata_updated_at: asset.metadata_updated_at,
+            metadata_version: asset.metadata_version,
+            deprecation_status: deprecation_status_u32,
+            is_locked: asset.is_locked,
+            lender: asset.lender,
+            loan_id: asset.loan_id,
+            deprecated_at: asset.deprecated_at,
+            collateral_score,
+            collateral_valuation,
+            snapshot_timestamp: env.ledger().timestamp(),
+            total_maintenance_records,
+            last_service_timestamp,
         }
     }
 
