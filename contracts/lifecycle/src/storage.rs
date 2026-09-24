@@ -110,3 +110,27 @@ pub(crate) fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
 pub(crate) fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("SCR_WGT"), asset_type.clone())
 }
+
+// ---------------------------------------------------------------------------
+// New keys for issues #1641-1644
+// ---------------------------------------------------------------------------
+
+/// Score breakdown for an asset (issue #1641): `ScoreBreakdown`.
+pub(crate) fn score_breakdown_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("SCBRKDN"), asset_id)
+}
+
+/// Recovery plans for an asset (issue #1642): `Vec<RecoveryPlan>`.
+pub(crate) fn recovery_plans_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("RECPLANS"), asset_id)
+}
+
+/// Circuit breaker configuration (issue #1644): `CircuitBreakerConfig`.
+pub(crate) fn circuit_breaker_config_key() -> Symbol {
+    symbol_short!("CB_CFG")
+}
+
+/// Forced score changes log for an asset (issue #1644): `Vec<ForcedScoreChange>`.
+pub(crate) fn forced_score_changes_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("FORCED_SC"), asset_id)
+}

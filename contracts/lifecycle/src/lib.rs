@@ -13,7 +13,8 @@ pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key, submission_window_key,
+    transfer_hist_key, submission_window_key, score_breakdown_key, recovery_plans_key,
+    circuit_breaker_config_key, forced_score_changes_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
@@ -27,7 +28,8 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, ScoreBreakdown, FactorContribution,
+    RecoveryPlan, RecoveryAction, RecoveryOption, CircuitBreakerConfig, ForcedScoreChange,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -5478,6 +5480,408 @@ impl Lifecycle {
             page.push_back(all.get(i).unwrap());
         }
         page
+    }
+
+    // =========================================================================
+    // Issue #1641 — Score Impact Attribution
+    // =========================================================================
+
+    /// Compute and store the score breakdown showing factor contributions.
+    pub fn compute_score_breakdown(env: Env, asset_id: u64) -> ScoreBreakdown {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let current_score = apply_decay(&env, asset_id, false, false, 100);
+        let current_time = env.ledger().timestamp();
+
+        let maintenance_frequency = history.len() as u32;
+        let maintenance_contribution = (maintenance_frequency.min(100) * 30) / 100;
+
+        let age_contribution = if !history.is_empty() {
+            let first_record = history.get(0).unwrap();
+            let age_seconds = current_time.saturating_sub(first_record.timestamp);
+            let age_days = (age_seconds / 86400).min(365);
+            (age_days as u32 * 20) / 365
+        } else {
+            0u32
+        };
+
+        let condition_contribution = current_score.saturating_sub(
+            maintenance_contribution.saturating_add(age_contribution)
+        ).min(50);
+
+        let breakdown = ScoreBreakdown {
+            asset_id,
+            total_score: current_score,
+            maintenance_frequency_contribution: maintenance_contribution,
+            age_contribution,
+            condition_contribution,
+            timestamp: current_time,
+        };
+
+        let key = score_breakdown_key(asset_id);
+        env.storage().persistent().set(&key, &breakdown);
+        extend_persistent_ttl(&env, &key);
+
+        breakdown
+    }
+
+    /// Get the score breakdown for an asset.
+    pub fn get_score_breakdown(env: Env, asset_id: u64) -> Option<ScoreBreakdown> {
+        let key = score_breakdown_key(asset_id);
+        let breakdown: Option<ScoreBreakdown> = env.storage().persistent().get(&key);
+        if breakdown.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        breakdown
+    }
+
+    /// Get factor sensitivity analysis for an asset (shows how each factor impacts score).
+    pub fn get_factor_sensitivity(env: Env, asset_id: u64) -> Vec<FactorContribution> {
+        let breakdown = Self::compute_score_breakdown(env.clone(), asset_id);
+        let mut factors: Vec<FactorContribution> = Vec::new(&env);
+
+        let maintenance_pct = if breakdown.total_score > 0 {
+            (breakdown.maintenance_frequency_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        let age_pct = if breakdown.total_score > 0 {
+            (breakdown.age_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        let condition_pct = if breakdown.total_score > 0 {
+            (breakdown.condition_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("MAINT"),
+            percentage: maintenance_pct,
+            contribution: breakdown.maintenance_frequency_contribution,
+        });
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("AGE"),
+            percentage: age_pct,
+            contribution: breakdown.age_contribution,
+        });
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("COND"),
+            percentage: condition_pct,
+            contribution: breakdown.condition_contribution,
+        });
+
+        factors
+    }
+
+    // =========================================================================
+    // Issue #1642 — Score Recovery Plans
+    // =========================================================================
+
+    /// Create a recovery plan for an asset (owner-only).
+    pub fn create_score_recovery_plan(
+        env: Env,
+        asset_id: u64,
+        owner: Address,
+        actions: Vec<RecoveryAction>,
+        deadline: u64,
+    ) -> RecoveryPlan {
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        let registry_client = ::asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset_owner = registry_client.get_owner(&asset_id);
+
+        if asset_owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedAsset);
+        }
+
+        let plan = RecoveryPlan {
+            asset_id,
+            owner: owner.clone(),
+            actions,
+            deadline,
+            created_at: env.ledger().timestamp(),
+            completed: false,
+        };
+
+        let key = recovery_plans_key(asset_id);
+        let mut plans: Vec<RecoveryPlan> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        plans.push_back(plan.clone());
+        env.storage().persistent().set(&key, &plans);
+        extend_persistent_ttl(&env, &key);
+
+        plan
+    }
+
+    /// Get recovery options for an asset.
+    pub fn get_score_recovery_options(env: Env, asset_id: u64) -> Vec<RecoveryOption> {
+        let mut options: Vec<RecoveryOption> = Vec::new(&env);
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("MAINT_SCHED"),
+            description: String::from_str(&env, "Increase maintenance schedule"),
+            estimated_score_improvement: 15u32,
+            estimated_cost: 500_000_000u64,
+        });
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("UPGRADE"),
+            description: String::from_str(&env, "Perform major upgrade"),
+            estimated_score_improvement: 25u32,
+            estimated_cost: 1_000_000_000u64,
+        });
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("REPLACE"),
+            description: String::from_str(&env, "Replace critical components"),
+            estimated_score_improvement: 35u32,
+            estimated_cost: 2_000_000_000u64,
+        });
+
+        options
+    }
+
+    /// Get recovery plans for an asset.
+    pub fn get_recovery_plans(env: Env, asset_id: u64) -> Vec<RecoveryPlan> {
+        let key = recovery_plans_key(asset_id);
+        let plans: Vec<RecoveryPlan> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        extend_persistent_ttl(&env, &key);
+        plans
+    }
+
+    // =========================================================================
+    // Issue #1643 — Weighted Moving Average for Smoother Scores
+    // =========================================================================
+
+    /// Compute weighted moving average of scores for smoother trend analysis.
+    pub fn compute_weighted_moving_average(
+        env: Env,
+        asset_id: u64,
+        window: u32,
+        weights: Vec<u32>,
+    ) -> u32 {
+        if window == 0 {
+            return 0u32;
+        }
+
+        let mut weight_sum = 0u32;
+        for i in 0..weights.len() {
+            weight_sum = weight_sum
+                .checked_add(weights.get(i).unwrap())
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+        }
+
+        if weight_sum != 100 {
+            panic_with_error!(&env, ContractError::InvalidWeight);
+        }
+
+        let history_key = score_history_key(asset_id);
+        let history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return 0u32;
+        }
+
+        let actual_window = (history.len() as u32).min(window) as usize;
+        let start_idx = history.len() - actual_window;
+
+        let mut weighted_sum = 0u64;
+        let mut weight_sum_used = 0u32;
+
+        for i in 0..actual_window {
+            let record = history.get((start_idx + i) as u32).unwrap();
+            let weight_idx = (weights.len() as i32 - actual_window as i32 + i as i32).max(0) as usize;
+            let weight = if weight_idx < weights.len() {
+                weights.get(weight_idx as u32).unwrap()
+            } else {
+                0u32
+            };
+
+            weighted_sum = weighted_sum
+                .checked_add((record.score as u64) * (weight as u64))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+            weight_sum_used = weight_sum_used.saturating_add(weight);
+        }
+
+        if weight_sum_used == 0 {
+            return 0u32;
+        }
+        (weighted_sum / weight_sum_used as u64) as u32
+    }
+
+    /// Compute exponential weighted moving average (recent scores weighted more).
+    pub fn compute_exponential_weighted_average(env: Env, asset_id: u64) -> u32 {
+        let history_key = score_history_key(asset_id);
+        let history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return 0u32;
+        }
+
+        let alpha = 30u32;
+        let mut ewma = history.get(0).unwrap().score as u64;
+
+        for i in 1..history.len() {
+            let current_score = history.get(i as u32).unwrap().score as u64;
+            ewma = (current_score * (alpha as u64) + ewma * ((100u64 - alpha as u64))) / 100u64;
+        }
+
+        ewma as u32
+    }
+
+    // =========================================================================
+    // Issue #1644 — Score Circuit Breaker for Large Changes
+    // =========================================================================
+
+    /// Initialize circuit breaker configuration.
+    pub fn set_circuit_breaker_config(env: Env, admin: Address, max_change: u32, require_approval: bool) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        require_quorum(&env, &config, &admin);
+
+        let cb_config = CircuitBreakerConfig {
+            max_score_change: max_change,
+            require_approval_for_large_changes: require_approval,
+            approval_threshold: 2u32,
+        };
+
+        let key = circuit_breaker_config_key();
+        env.storage().persistent().set(&key, &cb_config);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("CB_CFG"), admin.clone()),
+            (max_change, require_approval),
+        );
+    }
+
+    /// Validate if a score change is within circuit breaker limits.
+    pub fn validate_score_change(env: Env, old_score: u32, new_score: u32) -> bool {
+        let key = circuit_breaker_config_key();
+        let cb_config: Option<CircuitBreakerConfig> = env.storage().persistent().get(&key);
+
+        match cb_config {
+            None => true,
+            Some(config) => {
+                let change = if new_score > old_score {
+                    new_score - old_score
+                } else {
+                    old_score - new_score
+                };
+
+                change <= config.max_score_change
+            }
+        }
+    }
+
+    /// Force a score change with admin approval (requires quorum).
+    pub fn force_score_change_with_approval(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        new_score: u32,
+        justification: String,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        require_quorum(&env, &config, &admin);
+
+        let old_score = env
+            .storage()
+            .persistent()
+            .get(&score_key(asset_id))
+            .unwrap_or(0u32);
+
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &new_score);
+        extend_persistent_ttl(&env, &score_key(asset_id));
+
+        let forced_change = ForcedScoreChange {
+            asset_id,
+            old_score,
+            new_score,
+            justification,
+            timestamp: env.ledger().timestamp(),
+            approved_by: config.admins.clone(),
+        };
+
+        let key = forced_score_changes_key(asset_id);
+        let mut changes: Vec<ForcedScoreChange> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        changes.push_back(forced_change);
+        env.storage().persistent().set(&key, &changes);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("FORCED_SC"), asset_id),
+            (old_score, new_score),
+        );
+    }
+
+    /// Get the forced score change log for an asset.
+    pub fn get_forced_score_changes(env: Env, asset_id: u64) -> Vec<ForcedScoreChange> {
+        let key = forced_score_changes_key(asset_id);
+        let changes: Vec<ForcedScoreChange> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        extend_persistent_ttl(&env, &key);
+        changes
+    }
+
+    /// Get the circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> Option<CircuitBreakerConfig> {
+        let key = circuit_breaker_config_key();
+        let config: Option<CircuitBreakerConfig> = env.storage().persistent().get(&key);
+        if config.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        config
     }
 }
 

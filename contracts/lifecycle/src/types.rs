@@ -206,4 +206,87 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
+    /// Stores `ScoreBreakdown` for a given asset (issue #1641).
+    ScoreBreakdown(u64),
+    /// Stores `Vec<RecoveryPlan>` for a given asset (issue #1642).
+    RecoveryPlans(u64),
+    /// Stores circuit breaker configuration (issue #1644).
+    CircuitBreakerConfig,
+    /// Stores forced score change logs (issue #1644).
+    ForcedScoreChanges(u64),
+}
+
+/// Factor contribution to the total collateral score (issue #1641).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactorContribution {
+    pub factor: Symbol,
+    pub percentage: u32,
+    pub contribution: u32,
+}
+
+/// Score breakdown showing which factors contributed to the score (issue #1641).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreBreakdown {
+    pub asset_id: u64,
+    pub total_score: u32,
+    pub maintenance_frequency_contribution: u32,
+    pub age_contribution: u32,
+    pub condition_contribution: u32,
+    pub timestamp: u64,
+}
+
+/// Recovery plan for improving asset score (issue #1642).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryPlan {
+    pub asset_id: u64,
+    pub owner: Address,
+    pub actions: Vec<RecoveryAction>,
+    pub deadline: u64,
+    pub created_at: u64,
+    pub completed: bool,
+}
+
+/// Individual recovery action (issue #1642).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryAction {
+    pub action_type: Symbol,
+    pub description: String,
+    pub target_score_improvement: u32,
+    pub completed: bool,
+    pub completed_at: Option<u64>,
+}
+
+/// Recovery option available for an asset (issue #1642).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryOption {
+    pub option_type: Symbol,
+    pub description: String,
+    pub estimated_score_improvement: u32,
+    pub estimated_cost: u64,
+}
+
+/// Circuit breaker configuration (issue #1644).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerConfig {
+    pub max_score_change: u32,
+    pub require_approval_for_large_changes: bool,
+    pub approval_threshold: u32,
+}
+
+/// Log entry for forced score changes (issue #1644).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForcedScoreChange {
+    pub asset_id: u64,
+    pub old_score: u32,
+    pub new_score: u32,
+    pub justification: String,
+    pub timestamp: u64,
+    pub approved_by: Vec<Address>,
 }
