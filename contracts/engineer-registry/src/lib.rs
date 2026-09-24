@@ -5526,4 +5526,113 @@ mod tests {
         assert_eq!(emitted_date, ts);
         assert_eq!(emitted_hash, cert_hash);
     }
+
+    #[test]
+    fn test_specialization_hierarchy_and_matching() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let hvac = symbol_short!("HVAC");
+        let heating = symbol_short!("HEATING");
+        let cooling = symbol_short!("COOLING");
+        client.add_specialization_hierarchy(&hvac, &heating);
+        client.add_specialization_hierarchy(&hvac, &cooling);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.set_engineer_specialization(&engineer, &heating);
+
+        let applicable = client.get_applicable_engineers(&hvac);
+        assert!(applicable.contains(&engineer));
+
+        let cooling_only = client.get_applicable_engineers(&cooling);
+        assert!(!cooling_only.contains(&engineer));
+    }
+
+    #[test]
+    fn test_submit_and_get_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &4,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 4);
+        assert_eq!(count, 1);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 1);
+    }
+
+    #[test]
+    fn test_dispute_review_excludes_from_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &5,
+            &feedback,
+            &ReviewVisibility::PeersOnly,
+        );
+        client.dispute_review(&engineer, &reviewer);
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 0);
+        assert_eq!(count, 0);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reviewer not authorized")]
+    fn test_unauthorized_reviewer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &3,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
+    }
 }
