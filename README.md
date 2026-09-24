@@ -306,3 +306,8 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 - [Stellar Development Foundation](https://stellar.org) for Soroban
 - The global engineering community for maintaining the machines that power the world
+
+## Handsoff notes
+
+<!-- handsoff-issue-1231 -->
+- #1231: Fix: CONFIG_KEY is allow(dead_code) in lending — config is never stored or read via this key
