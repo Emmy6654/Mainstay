@@ -71,6 +71,9 @@ pub struct Engineer {
     pub reputation_score: u32,
     pub notes: Option<soroban_sdk::String>,
     pub specializations: Vec<Symbol>,
+    /// Unix timestamp of the engineer's last activity (submission or update).
+    /// Used to apply reputation decay when fetching the score.
+    pub last_active_at: u64,
 }
 
 #[contracttype]
@@ -138,9 +141,39 @@ const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
+/// Default reputation decay interval: 90 days in seconds (#1315)
+const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
+/// Default decay rate: 5% per interval (#1315)
+const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
+}
+
+/// Calculate decayed reputation based on time since last activity.
+/// Returns the reputation score after applying decay if the inactive period exceeds the threshold.
+/// Decay is applied at DEFAULT_DECAY_RATE_BPS per DEFAULT_DECAY_INTERVAL_SECS.
+fn apply_reputation_decay(engineer: &Engineer, now: u64) -> u32 {
+    let time_inactive = now.saturating_sub(engineer.last_active_at);
+    if time_inactive < DEFAULT_DECAY_INTERVAL_SECS {
+        // No decay yet
+        return engineer.reputation_score;
+    }
+
+    // Calculate number of intervals elapsed
+    let intervals_elapsed = time_inactive / DEFAULT_DECAY_INTERVAL_SECS;
+
+    // Apply decay: score *= (1 - decay_rate)^intervals_elapsed
+    // For efficiency, approximate with linear decay: score * (1 - decay_rate * intervals_elapsed)
+    // But cap at minimum 0 to avoid underflow
+    let decay_factor_bps = DEFAULT_DECAY_RATE_BPS as u64 * intervals_elapsed;
+    if decay_factor_bps >= 10_000 {
+        // Complete decay
+        0u32
+    } else {
+        let remaining_bps = 10_000u64 - decay_factor_bps;
+        ((engineer.reputation_score as u64 * remaining_bps / 10_000u64) as u32)
+    }
 }
 
 fn ensure_not_paused(env: &Env) {
@@ -356,6 +389,7 @@ impl EngineerRegistry {
             reputation_score: 0,
             notes,
             specializations: Vec::new(&env),
+            last_active_at: now,
         };
         env.storage()
             .persistent()
@@ -1488,6 +1522,7 @@ impl EngineerRegistry {
             .saturating_add(delta as i64)
             .clamp(0, 1000) as u32;
         record.reputation_score = new_rep;
+        record.last_active_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -1516,7 +1551,10 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
-            .map(|e| e.reputation_score)
+            .map(|e| {
+                let now = env.ledger().timestamp();
+                apply_reputation_decay(&e, now)
+            })
             .unwrap_or(0)
     }
 
@@ -5487,5 +5525,114 @@ mod tests {
         assert_eq!(emitted_type, symbol_short!("SAFETY"));
         assert_eq!(emitted_date, ts);
         assert_eq!(emitted_hash, cert_hash);
+    }
+
+    #[test]
+    fn test_specialization_hierarchy_and_matching() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let hvac = symbol_short!("HVAC");
+        let heating = symbol_short!("HEATING");
+        let cooling = symbol_short!("COOLING");
+        client.add_specialization_hierarchy(&hvac, &heating);
+        client.add_specialization_hierarchy(&hvac, &cooling);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.set_engineer_specialization(&engineer, &heating);
+
+        let applicable = client.get_applicable_engineers(&hvac);
+        assert!(applicable.contains(&engineer));
+
+        let cooling_only = client.get_applicable_engineers(&cooling);
+        assert!(!cooling_only.contains(&engineer));
+    }
+
+    #[test]
+    fn test_submit_and_get_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &4,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 4);
+        assert_eq!(count, 1);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 1);
+    }
+
+    #[test]
+    fn test_dispute_review_excludes_from_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &5,
+            &feedback,
+            &ReviewVisibility::PeersOnly,
+        );
+        client.dispute_review(&engineer, &reviewer);
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 0);
+        assert_eq!(count, 0);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reviewer not authorized")]
+    fn test_unauthorized_reviewer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &3,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
     }
 }

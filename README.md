@@ -309,5 +309,5 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1231 -->
-- #1231: Fix: CONFIG_KEY is allow(dead_code) in lending — config is never stored or read via this key
+<!-- handsoff-issue-1263 -->
+- #1263: Security: training records in engineer registry have no expiry — stale certifications remain valid indefinitely

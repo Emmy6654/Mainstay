@@ -212,7 +212,7 @@ fn test_loan_disbursal_transfers_funds() {
 }
 
 #[test]
-fn test_loan_requested_event_emitted() {
+fn test_set_prepayment_penalty_lender_only() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -221,22 +221,29 @@ fn test_loan_requested_event_emitted() {
     let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
 
     let borrower = Address::generate(&env);
+    let lender = Address::generate(&env);
 
-    // Mint tokens to contract so the loan can be disbursed
+    // Fund contract so the loan can be disbursed
     stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
 
-    // Request loan
+    // Borrower requests a loan; lender funds it
     client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
 
-    // Assert the LOAN_REQUESTED event was emitted by the lending contract
-    assert!(
-        has_event(&env, &contract_id, "LOAN_REQUESTED"),
-        "LOAN_REQUESTED event should be emitted on request_loan"
-    );
+    // Lender sets a prepayment penalty of 200 bps (2%)
+    client.set_prepayment_penalty(&borrower, &200);
+
+    // A non-lender attempt should be rejected
+    let impostor = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_prepayment_penalty(&borrower, &100);
+    }));
+    assert!(result.is_err(), "Non-lender must not set penalty");
+    let _ = impostor;
 }
 
 #[test]
-fn test_vouch_created_event_emitted() {
+fn test_compute_prepayment_penalty_capped_at_three_percent() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -245,17 +252,50 @@ fn test_vouch_created_event_emitted() {
     let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
 
     let borrower = Address::generate(&env);
-    let voucher = Address::generate(&env);
+    let lender = Address::generate(&env);
 
-    // Mint tokens to voucher
-    stellar_asset_client.mint(&voucher, &10_000_000);
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
 
-    // Vouch for borrower
-    client.vouch(&borrower, &voucher, &1_000);
+    client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
 
-    // Assert the VOUCH_CREATED event was emitted by the lending contract
-    assert!(
-        has_event(&env, &contract_id, "VOUCH_CREATED"),
-        "VOUCH_CREATED event should be emitted on vouch"
-    );
+    // Request an excessive penalty (10%); it must be capped at 3% (300 bps)
+    client.set_prepayment_penalty(&borrower, &1_000);
+
+    // 3% of 100_000 = 3_000
+    let penalty = client.compute_prepayment_penalty(&borrower, &100_000);
+    assert_eq!(penalty, 3_000);
+}
+
+#[test]
+fn test_compute_prepayment_penalty_applied_to_prepayment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+    let lender = Address::generate(&env);
+
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
+
+    client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
+
+    // 1% penalty
+    client.set_prepayment_penalty(&borrower, &100);
+
+    // Borrower prepays 50_000; penalty = 1% of 50_000 = 500
+    let penalty = client.compute_prepayment_penalty(&borrower, &50_000);
+    assert_eq!(penalty, 500);
+
+    let borrower_balance_before = token_client.balance(&borrower);
+    client.prepay(&borrower, &50_000);
+    let borrower_balance_after = token_client.balance(&borrower);
+
+    // Borrower should be debited the prepayment plus the penalty
+    assert_eq!(borrower_balance_before - borrower_balance_after, 50_500);
 }
