@@ -16,4 +16,5 @@ pub enum SharedContractError {
     TimelockNotExpired = 5,
     ProposalNotFound = 6,
     PendingAdminAlreadyExists = 7,
+    InvalidSuspensionPeriod = 8,
 }

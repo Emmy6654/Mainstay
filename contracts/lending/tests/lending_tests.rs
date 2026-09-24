@@ -2,9 +2,9 @@
 
 use lending::{ContractError, LendingContract, LendingContractClient, LoanStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String,
+    Address, Env, String, Symbol, TryFromVal,
 };
 
 fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
@@ -24,6 +24,20 @@ fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
     client.initialize(&deployer, &admin, &token_id, &0);
 
     (contract_id, token_id, admin, token_admin)
+}
+
+fn has_event(env: &Env, contract_id: &Address, symbol: &str) -> bool {
+    let target = Symbol::new(env, symbol);
+    env.events().all().iter().any(|(addr, topics, _data)| {
+        if &addr != contract_id {
+            return false;
+        }
+        topics.iter().any(|topic| {
+            Symbol::try_from_val(env, &topic)
+                .map(|s| s == target)
+                .unwrap_or(false)
+        })
+    })
 }
 
 #[test]
