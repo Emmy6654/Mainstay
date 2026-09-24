@@ -115,6 +115,31 @@ pub struct Asset {
     /// Unix timestamp when the asset was deprecated. `None` if the asset is still active
     /// or was decommissioned without going through the `Deprecated` state.
     pub deprecated_at: Option<u64>,
+    /// Co-owners with weighted voting rights. Each tuple is (address, vote_weight).
+    /// Empty if the asset has only a single owner.
+    pub co_owners: Vec<(Address, u32)>,
+}
+
+/// Types of actions that require co-owner voting approval.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    Transfer = 0,
+    Deprecate = 1,
+}
+
+/// A proposal for a co-owner action requiring voting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposal {
+    pub proposal_id: u64,
+    pub asset_id: u64,
+    pub action_type: ActionType,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub new_owner: Option<Address>,
+    pub votes: Vec<(Address, bool)>,
+    pub executed: bool,
 }
 
 /// A single entry in the metadata change history for an asset.
@@ -222,6 +247,10 @@ pub enum DataKey {
     AssetsByCategory(Bytes),
     /// Maps an owner address to the list of asset IDs they own.
     AssetsByOwner(Address),
+    /// Maps (asset_id, proposal_id) to an ActionProposal for co-owner voting.
+    ActionProposal(u64, u64),
+    /// Stores the next proposal ID counter for an asset.
+    ActionProposalCounter(u64),
 }
 
 /// Filter criteria for [`AssetRegistry::search_assets`].
@@ -820,6 +849,7 @@ impl AssetRegistry {
             lender: None,
             loan_id: None,
             deprecated_at: None,
+            co_owners: Vec::new(&env),
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         extend_persistent_ttl(&env, &asset_key(id));
@@ -937,6 +967,7 @@ impl AssetRegistry {
                 lender: None,
                 loan_id: None,
                 deprecated_at: None,
+                co_owners: Vec::new(&env),
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -3110,6 +3141,241 @@ impl AssetRegistry {
             (symbol_short!("MAINT_END"), asset_id),
             (caller, env.ledger().timestamp()),
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Co-ownership and Weighted Voting Functions
+    // ---------------------------------------------------------------------------
+
+    /// Propose an action (transfer or deprecation) for co-owner voting.
+    ///
+    /// Creates a new voting proposal that requires quorum approval from all co-owners.
+    /// Only callable by the primary owner or admin.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `action_type` - The type of action (Transfer or Deprecate)
+    /// * `new_owner` - Required for Transfer actions, None for Deprecate actions
+    ///
+    /// # Returns
+    /// The ID of the created proposal
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::NoCoOwners`] if the asset has no co-owners
+    pub fn propose_action(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        action_type: ActionType,
+        new_owner: Option<Address>,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::NoCoOwners);
+        }
+
+        // Only primary owner or admin can propose
+        let admin = Self::get_admin(env.clone());
+        if caller != asset.owner && caller != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Get next proposal ID
+        let counter_key = DataKey::ActionProposalCounter(asset_id);
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0u64);
+
+        let next_id = proposal_id.saturating_add(1);
+        env.storage().persistent().set(&counter_key, &next_id);
+
+        // Create new proposal
+        let proposal = ActionProposal {
+            proposal_id,
+            asset_id,
+            action_type,
+            proposed_by: caller.clone(),
+            proposed_at: env.ledger().timestamp(),
+            new_owner,
+            votes: Vec::new(&env),
+            executed: false,
+        };
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (symbol_short!("ACT_PROP"), asset_id),
+            (proposal_id, action_type, env.ledger().timestamp()),
+        );
+
+        proposal_id
+    }
+
+    /// Vote on a proposed action for co-ownership transfer or deprecation.
+    ///
+    /// Calculates quorum based on total vote weight of all co-owners. A proposal
+    /// requires >50% of total vote weight to execute.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to vote on
+    /// * `approve` - Whether to approve (true) or reject (false) the action
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::NotCoOwner`] if caller is not a co-owner
+    pub fn vote_on_action(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        proposal_id: u64,
+        approve: bool,
+    ) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Verify caller is a co-owner
+        let mut is_co_owner = false;
+        for (owner, _weight) in asset.co_owners.iter() {
+            if owner == &caller {
+                is_co_owner = true;
+                break;
+            }
+        }
+
+        if !is_co_owner {
+            panic_with_error!(&env, ContractError::NotCoOwner);
+        }
+
+        // Add or update vote
+        let mut already_voted = false;
+        for i in 0..proposal.votes.len() {
+            let (voter, _) = proposal.votes.get(i).unwrap();
+            if voter == &caller {
+                proposal.votes.set(i, (caller.clone(), approve));
+                already_voted = true;
+                break;
+            }
+        }
+
+        if !already_voted {
+            proposal.votes.push_back((caller.clone(), approve));
+        }
+
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (symbol_short!("VOTE"), asset_id),
+            (proposal_id, caller, approve),
+        );
+    }
+
+    /// Execute a proposal if quorum has been reached.
+    ///
+    /// Calculates total votes and checks if approval votes exceed 50% of total
+    /// co-owner weight. If quorum is met, executes the proposed action.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to execute
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::InsufficientQuorum`] if vote weight does not meet quorum
+    pub fn execute_action(env: Env, caller: Address, asset_id: u64, proposal_id: u64) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Calculate vote weights
+        let mut total_weight = 0u32;
+        let mut approval_weight = 0u32;
+
+        for (owner, weight) in asset.co_owners.iter() {
+            total_weight = total_weight.saturating_add(weight);
+
+            for (voter, vote) in proposal.votes.iter() {
+                if voter == &owner && vote {
+                    approval_weight = approval_weight.saturating_add(weight);
+                }
+            }
+        }
+
+        // Check quorum: > 50% of total weight
+        if approval_weight.saturating_mul(2) <= total_weight {
+            panic_with_error!(&env, ContractError::InsufficientQuorum);
+        }
+
+        // Execute the action
+        match proposal.action_type {
+            ActionType::Transfer => {
+                if let Some(new_owner) = proposal.new_owner {
+                    // Transfer asset to new owner
+                    asset.owner = new_owner;
+                    env.storage()
+                        .persistent()
+                        .set(&asset_key(asset_id), &asset);
+
+                    env.events().publish(
+                        (symbol_short!("XFER_EXEC"), asset_id),
+                        (caller, env.ledger().timestamp()),
+                    );
+                }
+            }
+            ActionType::Deprecate => {
+                // Deprecate the asset
+                asset.deprecation_status = DeprecationStatus::Deprecated;
+                asset.deprecated_at = Some(env.ledger().timestamp());
+                env.storage()
+                    .persistent()
+                    .set(&asset_key(asset_id), &asset);
+
+                env.events().publish(
+                    (symbol_short!("DEPR_EXEC"), asset_id),
+                    (caller, env.ledger().timestamp()),
+                );
+            }
+        }
+
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
     }
 }
 
