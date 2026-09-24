@@ -285,3 +285,8 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 - [Stellar Development Foundation](https://stellar.org) for Soroban
 - The global engineering community for maintaining the machines that power the world
+
+## Handsoff notes
+
+<!-- handsoff-issue-1295 -->
+- #1295: Refactor: engineer-registry lib.rs is 198KB — split into credential, suspension, and admin modules
