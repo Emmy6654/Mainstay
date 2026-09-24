@@ -57,15 +57,15 @@ pub enum ContractError {
     TransferNotExpired = 27,
     /// A required configuration field was missing for the requested operation
     /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
-    InvalidConfig = 24,
+    InvalidConfig = 35,
     /// No co-owners exist for this asset, action cannot be proposed.
-    NoCoOwners = 26,
+    NoCoOwners = 31,
     /// The proposed action does not have quorum votes to execute.
-    InsufficientQuorum = 27,
+    InsufficientQuorum = 32,
     /// The action proposal was not found.
-    ActionProposalNotFound = 28,
+    ActionProposalNotFound = 33,
     /// Caller is not a co-owner of the asset.
-    NotCoOwner = 29,
+    NotCoOwner = 34,
 }
 
 impl From<SharedContractError> for ContractError {
