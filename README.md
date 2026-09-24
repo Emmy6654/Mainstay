@@ -314,3 +314,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-1265 -->
 - #1265: Security: score reset (reset_collateral_score) has no timelock — admin can manipulate collateral scores instantly
+
+<!-- handsoff-issue-1294 -->
+- #1294: Refactor: split lifecycle/src/lib.rs into focused modules — file exceeds 554KB
