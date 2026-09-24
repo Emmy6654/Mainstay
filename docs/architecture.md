@@ -84,6 +84,39 @@ The orchestration contract. Binds AssetRegistry and EngineerRegistry together to
 
 ---
 
+## Loan Covenants & Breach Detection
+
+Loan covenants are lender-defined conditions attached to a loan that the borrower must continuously satisfy. The Lifecycle contract monitors them and reports compliance.
+
+**Standard covenants:**
+| Covenant | Meaning |
+|----------|---------|
+| `MinCollateralScore(score)` | Collateral score must stay at or above `score` |
+| `MinUptime(bps)` | Asset uptime must stay at or above `bps` basis points |
+| `MaxDowntime(secs)` | Continuous downtime must not exceed `secs` seconds |
+
+**Responsibilities:**
+- `add_loan_covenant(env, loan_id, covenant)` — lender-only; appends a covenant to the loan's covenant set
+- `check_covenant_compliance(env, loan_id) -> ComplianceStatus` — evaluates every covenant against current asset state
+- Emit a breach notification event whenever a covenant is violated
+- Enforce a per-covenant grace period: a violation only escalates to `Breached` once the grace window elapses
+
+**Compliance status:**
+| Status | Meaning |
+|--------|---------|
+| `Compliant` | All covenants satisfied |
+| `GracePeriod` | A covenant is violated but still within its grace window |
+| `Breached` | A covenant is violated and its grace window has elapsed |
+
+**Key storage:**
+| Key | Type | Description |
+|-----|------|-------------|
+| `(COV, loan_id)` | `Vec<Covenant>` | Covenants attached to a loan |
+| `(COV_GRACE, loan_id)` | `u64` | Grace period (seconds) for the loan's covenants |
+| `(COV_SINCE, loan_id, idx)` | `u64` | Timestamp a covenant first went into violation |
+
+---
+
 ## Cross-Contract Call Flow
 
 The Lifecycle contract calls into the other two contracts on every maintenance submission. Neither AssetRegistry nor EngineerRegistry calls any other contract.
