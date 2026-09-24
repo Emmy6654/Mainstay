@@ -58,6 +58,20 @@ pub enum ContractError {
     /// A required configuration field was missing for the requested operation
     /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
     InvalidConfig = 24,
+    // Issue #1629: Usage tracking errors
+    UnauthorizedEngineer = 31,
+    UsageAnalyticsNotFound = 32,
+    // Issue #1630: Warranty errors
+    UnauthorizedWarrantyOwner = 33,
+    WarrantyNotFound = 34,
+    WarrantyExpired = 35,
+    WarrantyClaimed = 36,
+    // Issue #1631: Compliance errors
+    UnauthorizedAdmin2 = 37,
+    CertificateNotFound = 38,
+    // Issue #1632: Maintenance window errors
+    InvalidMaintenanceWindow = 39,
+    MaintenanceNotAllowed = 40,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -226,6 +240,90 @@ pub struct SearchPage {
     pub total: u32,
 }
 
+/// Issue #1629: Asset usage tracking and analytics data
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageAnalytics {
+    pub asset_id: u64,
+    pub total_usage_hours: u64,
+    pub usage_percentage: u32,
+    pub last_usage_update: u64,
+    pub maintenance_threshold_hours: u64,
+}
+
+/// Issue #1629: A single usage record for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageRecord {
+    pub hours_used: u64,
+    pub recorded_at: u64,
+}
+
+/// Issue #1630: Asset warranty information
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Warranty {
+    pub warranty_id: u64,
+    pub start_date: u64,
+    pub expiry_date: u64,
+    pub coverage_type: String,
+    pub provider: String,
+    pub is_active: bool,
+}
+
+/// Issue #1630: Warranty claim with history tracking
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarrantyClaim {
+    pub claim_id: u64,
+    pub warranty_id: u64,
+    pub claim_reason: String,
+    pub claimed_at: u64,
+    pub claim_status: ClaimStatus,
+}
+
+/// Issue #1630: Warranty claim status
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClaimStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+    Settled = 3,
+}
+
+/// Issue #1631: Asset compliance certification
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceCert {
+    pub cert_id: u64,
+    pub cert_type: String,
+    pub issuer: String,
+    pub expiry_date: u64,
+    pub standard: String,
+    pub issue_date: u64,
+}
+
+/// Issue #1631: Compliance status for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceStatus {
+    pub asset_id: u64,
+    pub is_compliant: bool,
+    pub expired_count: u32,
+    pub active_count: u32,
+    pub last_verified_at: u64,
+}
+
+/// Issue #1632: Maintenance window for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceWindow {
+    pub day_of_week: u32,
+    pub start_hour: u32,
+    pub end_hour: u32,
+}
+
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
@@ -258,6 +356,50 @@ fn asset_key(id: u64) -> (Symbol, u64) {
 
 fn metadata_history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("META_HIS"), asset_id)
+}
+
+// Issue #1629: Storage keys for usage tracking
+fn usage_analytics_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_ANA"), asset_id)
+}
+
+fn usage_records_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_REC"), asset_id)
+}
+
+// Issue #1630: Storage keys for warranty tracking
+fn warranties_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR"), asset_id)
+}
+
+fn warranty_claims_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR_CL"), asset_id)
+}
+
+fn warranty_counter_key() -> Symbol {
+    symbol_short!("WARR_CTR")
+}
+
+fn claim_counter_key() -> Symbol {
+    symbol_short!("CLM_CTR")
+}
+
+// Issue #1631: Storage keys for compliance tracking
+fn compliance_certs_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_C"), asset_id)
+}
+
+fn compliance_status_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_S"), asset_id)
+}
+
+fn cert_counter_key() -> Symbol {
+    symbol_short!("CERT_CTR")
+}
+
+// Issue #1632: Storage keys for maintenance windows
+fn maintenance_windows_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MAINT_W"), asset_id)
 }
 
 fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
@@ -2831,6 +2973,417 @@ impl AssetRegistry {
             (symbol_short!("MAINT_END"), asset_id),
             (caller, env.ledger().timestamp()),
         );
+    }
+
+    // ========== Issue #1629: Asset Utilization Tracking and Analytics ==========
+
+    /// Record asset usage. Engineer-only operation.
+    pub fn record_usage(env: Env, caller: Address, asset_id: u64, hours_used: u64) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Get or initialize usage analytics
+        let usage_key = usage_analytics_key(asset_id);
+        let mut analytics: UsageAnalytics = env
+            .storage()
+            .persistent()
+            .get(&usage_key)
+            .unwrap_or_else(|| UsageAnalytics {
+                asset_id,
+                total_usage_hours: 0,
+                usage_percentage: 0,
+                last_usage_update: env.ledger().timestamp(),
+                maintenance_threshold_hours: 8760, // default 1 year of continuous operation
+            });
+
+        // Update usage hours
+        analytics.total_usage_hours = analytics.total_usage_hours.saturating_add(hours_used);
+        analytics.last_usage_update = env.ledger().timestamp();
+
+        // Calculate usage percentage (assume 8760 hours per year of operation time)
+        let years_since_registration = (env.ledger().timestamp().saturating_sub(asset.registered_at)) / (365 * 24 * 60 * 60);
+        let expected_hours = years_since_registration.saturating_mul(8760).max(1);
+        analytics.usage_percentage = ((analytics.total_usage_hours as u128 * 100) / expected_hours as u128).min(100) as u32;
+
+        env.storage().persistent().set(&usage_key, &analytics);
+        extend_persistent_ttl(&env, &usage_key);
+
+        env.events().publish(
+            (symbol_short!("USG_REC"), asset_id),
+            (caller, hours_used, env.ledger().timestamp()),
+        );
+    }
+
+    /// Get usage analytics for an asset.
+    pub fn get_usage_analytics(env: Env, asset_id: u64) -> Option<UsageAnalytics> {
+        let usage_key = usage_analytics_key(asset_id);
+        let analytics = env
+            .storage()
+            .persistent()
+            .get(&usage_key);
+        if let Some(mut analytics) = analytics {
+            extend_persistent_ttl(&env, &usage_key);
+            Some(analytics)
+        } else {
+            None
+        }
+    }
+
+    // ========== Issue #1630: Asset Warranty and Extended Coverage Tracking ==========
+
+    /// Register a warranty for an asset. Owner-only operation.
+    pub fn register_warranty(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        start_date: u64,
+        expiry_date: u64,
+        coverage_type: String,
+        provider: String,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if caller != asset.owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        if expiry_date <= start_date {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        // Get warranty counter
+        let counter_key = warranty_counter_key();
+        let warranty_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0);
+        let new_id = warranty_id.saturating_add(1);
+
+        let warranty = Warranty {
+            warranty_id: new_id,
+            start_date,
+            expiry_date,
+            coverage_type,
+            provider,
+            is_active: true,
+        };
+
+        // Store warranty
+        let warranties_key = warranties_key(asset_id);
+        let mut warranties: Vec<Warranty> = env
+            .storage()
+            .persistent()
+            .get(&warranties_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        warranties.push_back(warranty);
+
+        env.storage().persistent().set(&warranties_key, &warranties);
+        env.storage().persistent().set(&counter_key, &new_id);
+        extend_persistent_ttl(&env, &warranties_key);
+        extend_persistent_ttl(&env, &counter_key);
+
+        env.events().publish(
+            (symbol_short!("WARR_REG"), asset_id),
+            (caller, new_id, env.ledger().timestamp()),
+        );
+
+        new_id
+    }
+
+    /// Get active warranties for an asset.
+    pub fn get_active_warranties(env: Env, asset_id: u64) -> Vec<Warranty> {
+        let warranties_key = warranties_key(asset_id);
+        let warranties: Vec<Warranty> = env
+            .storage()
+            .persistent()
+            .get(&warranties_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        extend_persistent_ttl(&env, &warranties_key);
+
+        let current_time = env.ledger().timestamp();
+        let mut active = Vec::new(&env);
+        for w in warranties.iter() {
+            if w.is_active && w.expiry_date > current_time {
+                active.push_back(w);
+            }
+        }
+        active
+    }
+
+    /// Claim a warranty. Owner-only operation.
+    pub fn claim_warranty(env: Env, caller: Address, asset_id: u64, warranty_id: u64, claim_reason: String) -> u64 {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if caller != asset.owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Verify warranty exists and is active
+        let warranties_key = warranties_key(asset_id);
+        let warranties: Vec<Warranty> = env
+            .storage()
+            .persistent()
+            .get(&warranties_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut warranty_found = false;
+        for w in warranties.iter() {
+            if w.warranty_id == warranty_id && w.is_active && w.expiry_date > env.ledger().timestamp() {
+                warranty_found = true;
+                break;
+            }
+        }
+
+        if !warranty_found {
+            panic_with_error!(&env, ContractError::WarrantyNotFound);
+        }
+
+        // Get claim counter
+        let claim_counter_key = claim_counter_key();
+        let claim_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&claim_counter_key)
+            .unwrap_or(0);
+        let new_claim_id = claim_id.saturating_add(1);
+
+        let claim = WarrantyClaim {
+            claim_id: new_claim_id,
+            warranty_id,
+            claim_reason,
+            claimed_at: env.ledger().timestamp(),
+            claim_status: ClaimStatus::Pending,
+        };
+
+        // Store claim
+        let claims_key = warranty_claims_key(asset_id);
+        let mut claims: Vec<WarrantyClaim> = env
+            .storage()
+            .persistent()
+            .get(&claims_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        claims.push_back(claim);
+
+        env.storage().persistent().set(&claims_key, &claims);
+        env.storage().persistent().set(&claim_counter_key, &new_claim_id);
+        extend_persistent_ttl(&env, &claims_key);
+        extend_persistent_ttl(&env, &claim_counter_key);
+
+        env.events().publish(
+            (symbol_short!("WARR_CLM"), asset_id),
+            (caller, warranty_id, new_claim_id, env.ledger().timestamp()),
+        );
+
+        new_claim_id
+    }
+
+    // ========== Issue #1631: Asset Compliance Certification Tracking ==========
+
+    /// Add a compliance certificate. Admin-only operation.
+    pub fn add_compliance_cert(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        cert_type: String,
+        issuer: String,
+        expiry_date: u64,
+        standard: String,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let _asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if expiry_date <= env.ledger().timestamp() {
+            panic_with_error!(&env, ContractError::WarrantyExpired);
+        }
+
+        // Get cert counter
+        let counter_key = cert_counter_key();
+        let cert_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0);
+        let new_id = cert_id.saturating_add(1);
+
+        let cert = ComplianceCert {
+            cert_id: new_id,
+            cert_type,
+            issuer,
+            expiry_date,
+            standard,
+            issue_date: env.ledger().timestamp(),
+        };
+
+        // Store certificate
+        let certs_key = compliance_certs_key(asset_id);
+        let mut certs: Vec<ComplianceCert> = env
+            .storage()
+            .persistent()
+            .get(&certs_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        certs.push_back(cert);
+
+        env.storage().persistent().set(&certs_key, &certs);
+        env.storage().persistent().set(&counter_key, &new_id);
+        extend_persistent_ttl(&env, &certs_key);
+        extend_persistent_ttl(&env, &counter_key);
+
+        env.events().publish(
+            (symbol_short!("COMP_ADD"), asset_id),
+            (admin, new_id, env.ledger().timestamp()),
+        );
+
+        new_id
+    }
+
+    /// Verify asset compliance status.
+    pub fn verify_asset_compliance(env: Env, asset_id: u64) -> ComplianceStatus {
+        let _asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let certs_key = compliance_certs_key(asset_id);
+        let certs: Vec<ComplianceCert> = env
+            .storage()
+            .persistent()
+            .get(&certs_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        extend_persistent_ttl(&env, &certs_key);
+
+        let current_time = env.ledger().timestamp();
+        let mut expired_count = 0u32;
+        let mut active_count = 0u32;
+
+        for cert in certs.iter() {
+            if cert.expiry_date <= current_time {
+                expired_count = expired_count.saturating_add(1);
+            } else {
+                active_count = active_count.saturating_add(1);
+            }
+        }
+
+        let is_compliant = expired_count == 0 && active_count > 0;
+
+        let status_key = compliance_status_key(asset_id);
+        let status = ComplianceStatus {
+            asset_id,
+            is_compliant,
+            expired_count,
+            active_count,
+            last_verified_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&status_key, &status);
+        extend_persistent_ttl(&env, &status_key);
+
+        status
+    }
+
+    // ========== Issue #1632: Asset Maintenance Window Scheduling ==========
+
+    /// Set maintenance windows for an asset. Owner-only operation.
+    pub fn set_maintenance_windows(env: Env, caller: Address, asset_id: u64, windows: Vec<MaintenanceWindow>) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if caller != asset.owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Validate windows
+        for window in windows.iter() {
+            if window.day_of_week >= 7 || window.start_hour >= 24 || window.end_hour >= 24 || window.start_hour >= window.end_hour {
+                panic_with_error!(&env, ContractError::InvalidMaintenanceWindow);
+            }
+        }
+
+        let windows_key = maintenance_windows_key(asset_id);
+        env.storage().persistent().set(&windows_key, &windows);
+        extend_persistent_ttl(&env, &windows_key);
+
+        env.events().publish(
+            (symbol_short!("MAINT_SET"), asset_id),
+            (caller, env.ledger().timestamp()),
+        );
+    }
+
+    /// Check if maintenance is allowed now for an asset.
+    pub fn is_maintenance_allowed_now(env: Env, asset_id: u64) -> bool {
+        let _asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let windows_key = maintenance_windows_key(asset_id);
+        let windows: Vec<MaintenanceWindow> = env
+            .storage()
+            .persistent()
+            .get(&windows_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        extend_persistent_ttl(&env, &windows_key);
+
+        // If no windows defined, maintenance is always allowed
+        if windows.is_empty() {
+            return true;
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        let seconds_per_day = 86400u64;
+        let seconds_per_hour = 3600u64;
+
+        // Calculate current day of week and hour (simplified UTC calculation)
+        let days_since_epoch = current_timestamp / seconds_per_day;
+        let day_of_week = (days_since_epoch + 4) % 7; // Jan 1, 1970 was Thursday
+        let seconds_today = current_timestamp % seconds_per_day;
+        let hour_of_day = seconds_today / seconds_per_hour;
+
+        // Check if current time falls within any maintenance window
+        for window in windows.iter() {
+            if window.day_of_week == day_of_week as u32 && window.start_hour <= hour_of_day as u32 && hour_of_day as u32 < window.end_hour {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
