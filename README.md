@@ -311,3 +311,6 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-1652 -->
 - #1652: Implement Loan Refinancing with Rate Lock
+
+<!-- handsoff-issue-1653 -->
+- #1653: Implement Cross-Collateral Loans
