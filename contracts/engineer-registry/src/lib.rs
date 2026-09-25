@@ -41,6 +41,11 @@ pub enum ContractError {
     InvalidSpecialization = 24,
     SpecializationAlreadyExists = 25,
     UnauthorizedRevoker = 26,
+    ServiceAreaRequired = 27,
+    InvalidApprenticeship = 28,
+    ApprenticeshipNotComplete = 29,
+    ConflictOfInterest = 30,
+    ConflictOverrideRequired = 31,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -74,6 +79,34 @@ pub struct Engineer {
     /// Unix timestamp of the engineer's last activity (submission or update).
     /// Used to apply reputation decay when fetching the score.
     pub last_active_at: u64,
+    pub service_regions: Vec<Region>,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Region {
+    NorthAmerica = 0,
+    LatinAmerica = 1,
+    Europe = 2,
+    MiddleEastAfrica = 3,
+    AsiaPacific = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuingEducation {
+    pub hours: u32,
+    pub completed_at: u64,
+    pub topic: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Apprenticeship {
+    pub mentor: Address,
+    pub hours_required: u32,
+    pub hours_completed: u32,
+    pub approved: bool,
 }
 
 #[contracttype]
@@ -141,6 +174,11 @@ const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
+const ENGINEER_LIST: Symbol = symbol_short!("ENG_LIST");
+const CE_KEY: Symbol = symbol_short!("CE");
+const APP_KEY: Symbol = symbol_short!("APP");
+const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
+const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
 /// Default reputation decay interval: 90 days in seconds (#1315)
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
@@ -390,6 +428,7 @@ impl EngineerRegistry {
             notes,
             specializations: Vec::new(&env),
             last_active_at: now,
+            service_regions: Vec::new(&env),
         };
         env.storage()
             .persistent()
@@ -409,6 +448,16 @@ impl EngineerRegistry {
             .persistent()
             .set(&issuer_engineers_key(&issuer), &list);
         extend_persistent_ttl(&env, &issuer_engineers_key(&issuer));
+        let mut engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or(Vec::new(&env));
+        if !engineers.contains(engineer.clone()) {
+            engineers.push_back(engineer.clone());
+            env.storage().persistent().set(&ENGINEER_LIST, &engineers);
+            extend_persistent_ttl(&env, &ENGINEER_LIST);
+        }
 
         // Increment engineer count
         let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
@@ -1717,6 +1766,40 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
             .specializations
+    }
+
+    pub fn set_engineer_service_area(env: Env, engineer: Address, regions: Vec<Region>) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.service_regions = regions;
+        env.storage().persistent().set(&engineer_key(&engineer), &record);
+        extend_persistent_ttl(&env, &engineer_key(&engineer));
+    }
+
+    pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
+        let mut result = Vec::new(&env);
+        let engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or(Vec::new(&env));
+        for engineer in engineers.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, Engineer>(&engineer_key(&engineer))
+            {
+                if record.active && record.service_regions.contains(region) {
+                    result.push_back(engineer);
+                }
+            }
+        }
+        result
     }
 }
 
