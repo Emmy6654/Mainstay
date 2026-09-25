@@ -2028,6 +2028,23 @@ impl EngineerRegistry {
         let key = (CONFLICT_OVERRIDE_KEY, engineer.clone(), asset_id);
         env.storage().persistent().set(&key, &true);
         extend_persistent_ttl(&env, &key);
+        let history_key = (CONFLICT_HISTORY_KEY, engineer.clone());
+        if let Some(mut history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<ConflictRecord>>(&history_key)
+        {
+            for index in 0..history.len() {
+                if let Some(mut record) = history.get(index) {
+                    if record.asset_id == asset_id {
+                        record.overridden = true;
+                        history.set(index, record);
+                    }
+                }
+            }
+            env.storage().persistent().set(&history_key, &history);
+            extend_persistent_ttl(&env, &history_key);
+        }
         env.events().publish(
             (symbol_short!("COI_OVR"), engineer),
             (asset_id, env.ledger().timestamp()),
@@ -4247,6 +4264,30 @@ mod tests {
             client.try_get_engineer_tier(&apprentice).unwrap(),
             EngineerTier::Full
         );
+    }
+
+    #[test]
+    fn conflict_history_invariant_tracks_override_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let engineer = Address::generate(&env);
+        let interests = soroban_sdk::vec![&env, 41u64, 42u64];
+
+        client.register_engineer_interests(&engineer, &interests);
+        assert!(client.check_conflict_of_interest(&engineer, &41));
+        assert!(client.check_conflict_of_interest(&engineer, &42));
+        assert!(!client.check_conflict_of_interest(&engineer, &43));
+
+        client.approve_conflict_override(&engineer, &41);
+
+        assert!(!client.check_conflict_of_interest(&engineer, &41));
+        assert!(client.check_conflict_of_interest(&engineer, &42));
+        let history = client.get_conflict_history(&engineer);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().asset_id, 41);
+        assert!(history.get(0).unwrap().overridden);
+        assert!(!history.get(1).unwrap().overridden);
     }
 
     #[test]
