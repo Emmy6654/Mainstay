@@ -11,7 +11,7 @@ pub(crate) mod admin;
 // `super::history_key(...)` etc. in scoring.rs keep working unchanged.
 pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
-    health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
+    environmental_impact_key, health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, EnvironmentalImpact, EsgReport, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -3731,6 +3731,80 @@ impl Lifecycle {
             }
         }
         result
+    }
+
+    /// Attach measured environmental impact to an existing maintenance record.
+    ///
+    /// Impact is stored separately from the append-only record so existing
+    /// deployments can add ESG data without rewriting historical records.
+    pub fn record_environmental_impact(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+        impact: EnvironmentalImpact,
+        engineer: Address,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory));
+        let record = history
+            .get(record_index)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds));
+        if record.engineer != engineer {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        }
+        let key = environmental_impact_key(asset_id, record_index);
+        env.storage().persistent().set(&key, &impact);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("ESG_IMP"), asset_id),
+            (record_index, impact),
+        );
+    }
+
+    /// Return environmental impact measurements for a maintenance record.
+    pub fn get_environmental_impact(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+    ) -> Option<EnvironmentalImpact> {
+        env.storage()
+            .persistent()
+            .get(&environmental_impact_key(asset_id, record_index))
+    }
+
+    /// Aggregate measured maintenance impacts for ESG reporting.
+    pub fn get_esg_report(env: Env, asset_id: u64) -> EsgReport {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut report = EsgReport {
+            total_energy_wh: 0,
+            total_carbon_grams: 0,
+            total_waste_grams: 0,
+            measured_records: 0,
+        };
+        for index in 0..history.len() {
+            if let Some(impact) = env
+                .storage()
+                .persistent()
+                .get::<_, EnvironmentalImpact>(&environmental_impact_key(asset_id, index))
+            {
+                report.total_energy_wh = report.total_energy_wh.saturating_add(impact.energy_wh);
+                report.total_carbon_grams =
+                    report.total_carbon_grams.saturating_add(impact.carbon_grams);
+                report.total_waste_grams =
+                    report.total_waste_grams.saturating_add(impact.waste_grams);
+                report.measured_records = report.measured_records.saturating_add(1);
+            }
+        }
+        report
     }
 
     /// Returns the average maintenance cost for a specific task type on an asset.

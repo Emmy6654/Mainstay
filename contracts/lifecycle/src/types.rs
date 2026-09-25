@@ -61,6 +61,28 @@ pub struct MaintenanceRecord {
     pub reconstructed: bool,
 }
 
+/// Environmental impact measurements associated with a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentalImpact {
+    /// Energy consumed during the service, in watt-hours.
+    pub energy_wh: u64,
+    /// Greenhouse-gas emissions, in grams of CO2 equivalent.
+    pub carbon_grams: u64,
+    /// Waste generated, in grams.
+    pub waste_grams: u64,
+}
+
+/// Aggregated environmental metrics for ESG reporting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EsgReport {
+    pub total_energy_wh: u64,
+    pub total_carbon_grams: u64,
+    pub total_waste_grams: u64,
+    pub measured_records: u32,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -16,6 +16,11 @@ pub(crate) fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
 
+/// Environmental impact measurements keyed by asset and history index.
+pub(crate) fn environmental_impact_key(asset_id: u64, record_index: u32) -> (Symbol, u64, u32) {
+    (symbol_short!("ENV_IMP"), asset_id, record_index)
+}
+
 /// Current collateral score for an asset: `u32`.
 pub(crate) fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
