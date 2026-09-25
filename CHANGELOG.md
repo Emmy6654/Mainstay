@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added maintenance environmental impact measurements and aggregate ESG reporting.
 - Added on-chain update subscriptions for real-time webhook relay integrations.
+- Added administrator-configurable per-user maintenance submission limits.
 
 ### Added
 - `.github/CODEOWNERS`: required-reviewer rules gate all PRs touching `contracts/`, CI workflows, `SECURITY.md`, and the threat-model doc (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))

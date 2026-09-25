@@ -87,6 +87,11 @@ pub(crate) fn submission_window_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("SUB_WIN"), engineer.clone())
 }
 
+/// Optional per-user override for the rolling-hour submission limit.
+pub(crate) fn user_submission_limit_key(user: &Address) -> (Symbol, Address) {
+    (symbol_short!("USR_RATE"), user.clone())
+}
+
 /// Timelock proposal for revoking an engineer's auth on an asset: `TimelockProposal`.
 pub(crate) fn revoke_eng_timelock_key(
     asset_id: u64,

@@ -14,7 +14,7 @@ pub(crate) use storage::{
     environmental_impact_key, health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     update_subscribers_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    transfer_hist_key, submission_window_key, user_submission_limit_key, retirement_state_key, retirement_certificate_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -291,7 +291,12 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
 /// *before* any record is written, so a single large batch cannot bypass the
 /// cap the way `count` individual calls would be blocked.
 fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count: u32) {
-    if config.max_submissions_per_hour == 0 {
+    let limit: u32 = env
+        .storage()
+        .persistent()
+        .get(&user_submission_limit_key(engineer))
+        .unwrap_or(config.max_submissions_per_hour);
+    if limit == 0 {
         return;
     }
 
@@ -309,10 +314,10 @@ fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count
     let new_count = base_count
         .checked_add(count)
         .unwrap_or(u32::MAX);
-    if new_count > config.max_submissions_per_hour {
+    if new_count > limit {
         env.events().publish(
             (symbol_short!("RATE_LIM"), engineer.clone()),
-            (base_count, count, config.max_submissions_per_hour),
+            (base_count, count, limit),
         );
         panic_with_error!(env, ContractError::RateLimitExceeded);
     }
@@ -5397,6 +5402,43 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        /// Set a per-user rolling-hour submission limit.
+        ///
+        /// This override is evaluated before the contract-wide default. Passing
+        /// `0` removes the override and restores the global limit.
+        pub fn update_user_submission_limit(
+            env: Env,
+            admin: Address,
+            user: Address,
+            new_max: u32,
+        ) {
+            ensure_not_paused(&env);
+            admin.require_auth();
+            let config: Config = env
+                .storage()
+                .persistent()
+                .get(&CONFIG)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+            if config.admin != admin {
+                panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+            }
+            let key = user_submission_limit_key(&user);
+            if new_max == 0 {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &new_max);
+                extend_persistent_ttl(&env, &key);
+            }
+            env.events().publish(
+                (symbol_short!("USR_RATE"), user.clone()),
+                (new_max, env.ledger().timestamp()),
+            );
+            env.events().publish(
+                (symbol_short!("ADM_AUD"), symbol_short!("USR_RATE")),
+                (admin, user, new_max),
+            );
+        }
+
         config.max_submissions_per_hour = new_max;
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -5436,7 +5478,12 @@ impl Lifecycle {
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
-        if config.max_submissions_per_hour == 0 {
+        let limit: u32 = env
+            .storage()
+            .persistent()
+            .get(&user_submission_limit_key(&engineer))
+            .unwrap_or(config.max_submissions_per_hour);
+        if limit == 0 {
             return true;
         }
 
@@ -5450,7 +5497,7 @@ impl Lifecycle {
         if now.saturating_sub(window_start) >= SUBMISSION_RATE_WINDOW_SECS {
             return true;
         }
-        count < config.max_submissions_per_hour
+        count < limit
     }
 
     /// Propose a WASM upgrade for the lifecycle contract.
