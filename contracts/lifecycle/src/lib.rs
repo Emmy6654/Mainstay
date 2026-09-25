@@ -27,7 +27,8 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, ComplianceReport, Config, DataKey, HealthSnapshot, IndustryBenchmark,
+    MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -3763,6 +3764,45 @@ impl Lifecycle {
                     total = total.saturating_add(cost);
                     count += 1;
                 }
+            }
+
+            /// Calculate the maintenance program's return on investment.
+            ///
+            /// `avoided_loss` is the estimated loss prevented by maintaining the asset,
+            /// expressed in stroops. The caller supplies this business valuation while
+            /// the contract supplies the verifiable maintenance cost and count.
+            pub fn calculate_maintenance_roi(
+                env: Env,
+                asset_id: u64,
+                avoided_loss: u64,
+            ) -> MaintenanceRoi {
+                let maintenance_cost = Self::get_total_maintenance_cost(env.clone(), asset_id);
+                let history: Vec<MaintenanceRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&history_key(asset_id))
+                    .unwrap_or_else(|| Vec::new(&env));
+                let roi_basis_points = if maintenance_cost == 0 {
+                    if avoided_loss == 0 { 0 } else { i64::MAX }
+                } else {
+                    let net = (avoided_loss as i128) - (maintenance_cost as i128);
+                    ((net * 10_000) / maintenance_cost as i128)
+                        .max(i64::MIN as i128)
+                        .min(i64::MAX as i128) as i64
+                };
+
+                MaintenanceRoi {
+                    asset_id,
+                    maintenance_cost,
+                    avoided_loss,
+                    roi_basis_points,
+                    maintenance_count: history.len() as u32,
+                }
+            }
+
+            /// View alias for [`calculate_maintenance_roi`].
+            pub fn get_maintenance_roi(env: Env, asset_id: u64, avoided_loss: u64) -> MaintenanceRoi {
+                Self::calculate_maintenance_roi(env, asset_id, avoided_loss)
             }
         }
         if count == 0 {
