@@ -62,6 +62,12 @@ variable "network_passphrase" {
   default     = "Public Global Stellar Network ; September 2015"
 }
 
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
+}
+
 # ── SQS queues for cross-region cache invalidation ──────────
 resource "aws_sqs_queue" "cache_invalidation" {
   for_each = var.regions

@@ -146,6 +146,7 @@ resource "aws_launch_template" "api" {
     region       = var.region
     rpc_url      = var.rpc_url
     network      = var.network_passphrase
+    allowed_origins = var.allowed_origins
   }))
 
   vpc_security_group_ids = [aws_security_group.api.id]

@@ -39,6 +39,12 @@ variable "network_passphrase" {
   type        = string
 }
 
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"

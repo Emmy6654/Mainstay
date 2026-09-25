@@ -192,6 +192,7 @@ module "api_server_us_east_1" {
   acm_certificate_arn = var.acm_certificate_arns["us-east-1"]
   rpc_url             = var.rpc_urls["us-east-1"]
   network_passphrase  = var.network_passphrase
+  allowed_origins     = var.allowed_origins
 
   providers = {
     aws = aws.us_east_1
@@ -209,6 +210,7 @@ module "api_server_eu_west_1" {
   acm_certificate_arn = var.acm_certificate_arns["eu-west-1"]
   rpc_url             = var.rpc_urls["eu-west-1"]
   network_passphrase  = var.network_passphrase
+  allowed_origins     = var.allowed_origins
 
   providers = {
     aws = aws.eu_west_1
@@ -226,6 +228,7 @@ module "api_server_ap_southeast_1" {
   acm_certificate_arn = var.acm_certificate_arns["ap-southeast-1"]
   rpc_url             = var.rpc_urls["ap-southeast-1"]
   network_passphrase  = var.network_passphrase
+  allowed_origins     = var.allowed_origins
 
   providers = {
     aws = aws.ap_southeast_1
