@@ -80,6 +80,14 @@ pub struct Engineer {
     /// Used to apply reputation decay when fetching the score.
     pub last_active_at: u64,
     pub service_regions: Vec<Region>,
+    pub tier: EngineerTier,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineerTier {
+    Apprentice = 0,
+    Full = 1,
 }
 
 #[contracttype]
@@ -430,6 +438,7 @@ impl EngineerRegistry {
             specializations: Vec::new(&env),
             last_active_at: now,
             service_regions: Vec::new(&env),
+            tier: EngineerTier::Full,
         };
         env.storage()
             .persistent()
@@ -1894,6 +1903,85 @@ impl EngineerRegistry {
             }
         }
         true
+    }
+
+    pub fn start_apprenticeship(
+        env: Env,
+        apprentice: Address,
+        mentor: Address,
+        hours_required: u32,
+    ) {
+        ensure_not_paused(&env);
+        mentor.require_auth();
+        if hours_required == 0 {
+            panic_with_error!(&env, ContractError::InvalidApprenticeship);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&apprentice))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.tier = EngineerTier::Apprentice;
+        env.storage().persistent().set(&engineer_key(&apprentice), &record);
+        extend_persistent_ttl(&env, &engineer_key(&apprentice));
+        let key = (APP_KEY, apprentice);
+        env.storage().persistent().set(
+            &key,
+            &Apprenticeship {
+                mentor,
+                hours_required,
+                hours_completed: 0,
+                approved: false,
+            },
+        );
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
+        let key = (APP_KEY, apprentice);
+        let mut apprenticeship: Apprenticeship = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        apprenticeship.mentor.require_auth();
+        apprenticeship.hours_completed = apprenticeship
+            .hours_completed
+            .saturating_add(hours)
+            .min(apprenticeship.hours_required);
+        env.storage().persistent().set(&key, &apprenticeship);
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn complete_apprenticeship(env: Env, apprentice: Address) {
+        ensure_not_paused(&env);
+        let key = (APP_KEY, apprentice.clone());
+        let apprenticeship: Apprenticeship = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        apprenticeship.mentor.require_auth();
+        if apprenticeship.hours_completed < apprenticeship.hours_required {
+            panic_with_error!(&env, ContractError::ApprenticeshipNotComplete);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&apprentice))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.tier = EngineerTier::Full;
+        env.storage().persistent().set(&engineer_key(&apprentice), &record);
+        env.storage().persistent().remove(&key);
+        extend_persistent_ttl(&env, &engineer_key(&apprentice));
+    }
+
+    pub fn get_engineer_tier(env: Env, engineer: Address) -> EngineerTier {
+        env.storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
+            .tier
     }
 }
 
