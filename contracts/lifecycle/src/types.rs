@@ -507,6 +507,7 @@ pub enum DataKey {
     Disputes(u64),
     MaintenanceAudit(u64),
     MaintenanceAttestations(u64),
+    AttestorAuth(u64, Address),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).
