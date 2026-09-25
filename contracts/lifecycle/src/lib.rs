@@ -14,7 +14,7 @@ pub(crate) use storage::{
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
-    coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
+    coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key, safety_incidents_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
@@ -29,6 +29,7 @@ use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_
 use crate::types::{
     AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    IncidentSeverity, SafetyIncident,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -104,6 +105,7 @@ const DEFAULT_COORDINATED_TASK_TIMEOUT: u64 = 2_592_000;
 const MAX_COORDINATED_TASK_ID: u64 = u64::MAX;
 /// Next coordinated task ID storage key.
 const NEXT_COORD_TASK_ID_KEY: Symbol = symbol_short!("NXTTID");
+const NEXT_INCIDENT_ID_KEY: Symbol = symbol_short!("NXTINC");
 
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
@@ -130,6 +132,8 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 pub const MAX_BATCH_SIZE: u32 = 50;
 /// Hard cap on engineers accepted by one bulk authorization-revocation call.
 pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
+/// Maximum number of safety incidents retained per asset.
+const DEFAULT_MAX_INCIDENTS: u32 = 200;
 /// Hard cap on the number of addresses in the admin multisig set.
 ///
 /// `require_quorum` performs an O(n) scan of the admins list on every
@@ -5223,6 +5227,104 @@ impl Lifecycle {
             .persistent()
             .get(&symbol_short!("FEE_BAL"))
             .unwrap_or(0u64)
+    }
+
+    /// Record a safety incident for an asset.
+    ///
+    /// Any authenticated participant may report an incident. Reports are
+    /// append-only until an administrator marks them resolved, preserving the
+    /// audit trail needed for trend and risk analysis.
+    pub fn report_safety_incident(
+        env: Env,
+        reporter: Address,
+        asset_id: u64,
+        severity: IncidentSeverity,
+        description: String,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        reporter.require_auth();
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if description.len() > config.max_notes_length {
+            panic_with_error!(&env, ContractError::IncidentDescriptionTooLong);
+        }
+
+        let incident_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&NEXT_INCIDENT_ID_KEY)
+            .unwrap_or(0);
+        let next_id = incident_id.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&NEXT_INCIDENT_ID_KEY, &next_id);
+        extend_persistent_ttl(&env, &NEXT_INCIDENT_ID_KEY);
+
+        let key = safety_incidents_key(asset_id);
+        let mut incidents: Vec<SafetyIncident> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if incidents.len() >= DEFAULT_MAX_INCIDENTS {
+            incidents.remove(0);
+        }
+        incidents.push_back(SafetyIncident {
+            incident_id,
+            asset_id,
+            reporter: reporter.clone(),
+            severity,
+            description,
+            reported_at: env.ledger().timestamp(),
+            resolved_at: None,
+            resolved_by: None,
+        });
+        env.storage().persistent().set(&key, &incidents);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("INCIDENT"), asset_id),
+            (incident_id, severity, reporter),
+        );
+        incident_id
+    }
+
+    /// Resolve a previously reported safety incident.
+    pub fn resolve_safety_incident(env: Env, admin: Address, asset_id: u64, incident_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        let key = safety_incidents_key(asset_id);
+        let mut incidents: Vec<SafetyIncident> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IncidentNotFound));
+        for i in 0..incidents.len() {
+            let mut incident = incidents.get(i).unwrap();
+            if incident.incident_id == incident_id {
+                if incident.resolved_at.is_none() {
+                    incident.resolved_at = Some(env.ledger().timestamp());
+                    incident.resolved_by = Some(admin.clone());
+                    incidents.set(i, incident);
+                    env.storage().persistent().set(&key, &incidents);
+                    extend_persistent_ttl(&env, &key);
+                }
+                return;
+            }
+        }
+        panic_with_error!(&env, ContractError::IncidentNotFound);
+    }
+
+    /// Return all retained safety incidents for an asset.
+    pub fn get_safety_incidents(env: Env, asset_id: u64) -> Vec<SafetyIncident> {
+        env.storage()
+            .persistent()
+            .get(&safety_incidents_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Get the current configuration of the lifecycle contract.

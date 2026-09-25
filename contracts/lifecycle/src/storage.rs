@@ -16,6 +16,11 @@ pub(crate) fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
 
+/// Safety incidents reported for an asset: `Vec<SafetyIncident>`.
+pub(crate) fn safety_incidents_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("INCIDENT"), asset_id)
+}
+
 /// Current collateral score for an asset: `u32`.
 pub(crate) fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)

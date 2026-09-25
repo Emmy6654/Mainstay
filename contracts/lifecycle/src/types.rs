@@ -61,6 +61,30 @@ pub struct MaintenanceRecord {
     pub reconstructed: bool,
 }
 
+/// Severity assigned to a reported safety incident.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncidentSeverity {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Critical = 3,
+}
+
+/// An immutable report of a safety incident involving an asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetyIncident {
+    pub incident_id: u64,
+    pub asset_id: u64,
+    pub reporter: Address,
+    pub severity: IncidentSeverity,
+    pub description: String,
+    pub reported_at: u64,
+    pub resolved_at: Option<u64>,
+    pub resolved_by: Option<Address>,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
