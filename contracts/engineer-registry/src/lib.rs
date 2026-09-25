@@ -4174,12 +4174,12 @@ mod tests {
                 Region::MiddleEastAfrica,
                 Region::AsiaPacific,
             ];
-            let configured = regions
-                .iter()
-                .enumerate()
-                .filter_map(|(index, region)| selected[index].then_some(*region))
-                .collect::<soroban_sdk::Vec<_>>();
-            let configured = soroban_sdk::Vec::from_slice(&env, &configured);
+            let mut configured = soroban_sdk::Vec::new(&env);
+            for (index, region) in regions.iter().enumerate() {
+                if selected[index] {
+                    configured.push_back(*region);
+                }
+            }
 
             client.set_engineer_service_area(&engineer, &configured);
 
