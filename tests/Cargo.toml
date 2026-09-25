@@ -235,3 +235,7 @@ path = "test_security_regressions.rs"
 [[test]]
 name = "test_concurrent_operations"
 path = "test_concurrent_operations.rs"
+
+[[test]]
+name = "test_storage_growth"
+path = "test_storage_growth.rs"
