@@ -70,6 +70,8 @@ pub enum ContractError {
     PoolNotFound = 35,
     /// Cannot create collateral pool for single asset (issue #1318).
     InvalidPoolSize = 36,
+    /// Encrypted asset fields were empty or exceeded the supported size.
+    InvalidEncryptedData = 37,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -166,6 +168,17 @@ pub struct AssetInput {
     pub asset_type: Symbol,
     pub metadata: String,
     pub serial_number: String,
+}
+
+/// Client-side encrypted fields for sensitive asset data.
+///
+/// The registry stores ciphertext only. Encryption and key management remain
+/// outside the contract so each owner can use their organisation's KMS.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedAssetFields {
+    pub serial_number: Bytes,
+    pub location: Bytes,
 }
 
 /// Paginated result for `get_assets_by_type_paginated`.
@@ -569,6 +582,10 @@ fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) 
     let sn_bytes = serial.clone().to_xdr(env);
     let hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
     serial_dedup_key(&hash)
+}
+
+fn encrypted_asset_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("ENC_ASSET"), asset_id)
 }
 
 /// Owner index key: owner → Vec<u64> of asset IDs.
@@ -1017,6 +1034,87 @@ impl AssetRegistry {
         id
     }
 
+    /// Register an asset without putting sensitive serial or location data on-chain.
+    ///
+    /// `serial_number_hash` must be the SHA-256 digest of the canonical serial
+    /// number. The digest preserves global deduplication without exposing the
+    /// serial. `encrypted_*` values must be produced client-side using an
+    /// authenticated encryption scheme and can only be decrypted by authorised
+    /// off-chain consumers.
+    pub fn register_asset_encrypted(
+        env: Env,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number_hash: BytesN<32>,
+        encrypted_serial_number: Bytes,
+        encrypted_location: Bytes,
+        owner: Address,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        owner.require_auth();
+        require_string_length(&metadata, "metadata", 256);
+        if encrypted_serial_number.is_empty() || encrypted_serial_number.len() > 4096
+            || encrypted_location.is_empty() || encrypted_location.len() > 4096
+        {
+            panic_with_error!(&env, ContractError::InvalidEncryptedData);
+        }
+        validate_asset_type_symbol(&env, &asset_type);
+        if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        let serial_key = serial_dedup_key(&serial_number_hash);
+        if env.storage().persistent().has(&serial_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+        let meta_hash: BytesN<32> = env.crypto().sha256(&metadata.clone().to_xdr(&env)).into();
+        let metadata_key = dedup_key(&owner, &asset_type, &meta_hash);
+        if env.storage().persistent().has(&metadata_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        let id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) + 1;
+        let asset = Asset {
+            asset_id: id,
+            asset_type: asset_type.clone(),
+            metadata,
+            serial_number: String::from_str(&env, "[encrypted]"),
+            owner: owner.clone(),
+            registered_at: env.ledger().timestamp(),
+            metadata_updated_at: env.ledger().timestamp(),
+            metadata_version: 0,
+            deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
+        };
+        let encrypted_key = encrypted_asset_key(id);
+        let encrypted = EncryptedAssetFields {
+            serial_number: encrypted_serial_number,
+            location: encrypted_location,
+        };
+        env.storage().persistent().set(&asset_key(id), &asset);
+        env.storage().persistent().set(&encrypted_key, &encrypted);
+        env.storage().persistent().set(&ASSET_COUNT, &id);
+        env.storage().persistent().set(&metadata_key, &id);
+        env.storage().persistent().set(&serial_key, &id);
+        extend_persistent_ttl(&env, &asset_key(id));
+        extend_persistent_ttl(&env, &encrypted_key);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+        extend_persistent_ttl(&env, &metadata_key);
+        extend_persistent_ttl(&env, &serial_key);
+        owner_index_add(&env, &owner, id);
+        type_count_inc(&env, &asset_type);
+        type_assets_add(&env, &asset_type, id);
+        env.events().publish(
+            (symbol_short!("reg_asset"),),
+            (id, owner, env.ledger().timestamp()),
+        );
+        id
+    }
+
     /// Register multiple assets in a single transaction.
     ///
     /// # Arguments
@@ -1183,6 +1281,18 @@ impl AssetRegistry {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         asset
+    }
+
+    /// Return encrypted serial and location fields for an asset.
+    pub fn get_encrypted_asset_fields(env: Env, asset_id: u64) -> EncryptedAssetFields {
+        let key = encrypted_asset_key(asset_id);
+        let fields: EncryptedAssetFields = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        extend_persistent_ttl(&env, &key);
+        fields
     }
 
     /// Look up an asset by its physical serial number.
