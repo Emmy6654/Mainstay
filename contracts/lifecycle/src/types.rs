@@ -84,6 +84,16 @@ pub struct MaintenanceAttestation {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceSignature {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub signer: Address,
+    pub public_key: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -424,6 +434,7 @@ pub enum DataKey {
     MaintenanceAudit(u64),
     MaintenanceAttestations(u64),
     AttestorAuth(u64, Address),
+    MaintenanceSignatures(u64),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).
