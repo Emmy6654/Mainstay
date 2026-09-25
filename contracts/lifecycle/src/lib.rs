@@ -4377,6 +4377,73 @@ impl Lifecycle {
         }
     }
 
+    /// Generate an auditable compliance report for an asset.
+    ///
+    /// The supplied proof is checked against the registered standard. Since
+    /// maintenance records are immutable and do not contain private
+    /// documentation, a valid proof attests to the complete visible history;
+    /// an invalid proof marks every record as non-compliant.
+    pub fn generate_compliance_report(
+        env: Env,
+        asset_id: u64,
+        compliance_proof_hash: Bytes,
+    ) -> ComplianceReport {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let standard_registered = if let Some(asset) =
+            asset_registry::AssetRegistryClient::new(&env, &get_asset_registry_addr(&env))
+                .try_get_asset(&asset_id)
+                .ok()
+        {
+            env.storage()
+                .persistent()
+                .has(&standard_key(&asset.asset_type))
+        } else {
+            false
+        };
+        let compliant = if standard_registered
+            && Self::validate_maintenance_compliance(
+                env.clone(),
+                asset_id,
+                symbol_short!("REPORT"),
+                compliance_proof_hash,
+            )
+        {
+            history.len() as u32
+        } else {
+            0
+        };
+        let total = history.len() as u32;
+
+        ComplianceReport {
+            asset_id,
+            standard_registered,
+            total_maintenance_records: total,
+            compliant_records: compliant,
+            non_compliant_records: total.saturating_sub(compliant),
+            compliance_percentage: if total == 0 {
+                0
+            } else {
+                (compliant * 100) / total
+            },
+            total_cost: Self::get_total_maintenance_cost(&env, asset_id),
+            chain_integrity: Self::verify_maintenance_chain_integrity(&env, asset_id),
+            generated_at: env.ledger().timestamp(),
+        }
+    }
+
+    /// View alias for [`generate_compliance_report`].
+    pub fn get_compliance_report(
+        env: Env,
+        asset_id: u64,
+        compliance_proof_hash: Bytes,
+    ) -> ComplianceReport {
+        Self::generate_compliance_report(env, asset_id, compliance_proof_hash)
+    }
+
     /// Return the registered maintenance compliance standard for an asset type.
     ///
     /// Returns the raw standard bytes if registered, or empty `Bytes` if none.
