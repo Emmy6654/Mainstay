@@ -67,6 +67,15 @@ pub struct CostReconciliation {
     pub verified_at: u64,
 }
 
+/// A maintenance work-order group identifier is stored separately from records
+/// so existing record hashes and clients remain backward compatible.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskGroup {
+    pub group_id: Bytes,
+    pub record_timestamps: Vec<u64>,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

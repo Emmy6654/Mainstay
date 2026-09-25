@@ -26,7 +26,7 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, CostReconciliation, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    ScoreEntry, TaskGroup, TimelockProposal, TransferRecord, WeightProposal,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -3272,6 +3272,84 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .get(&DataKey::CostReconciliation(asset_id, record_timestamp))
+    }
+
+    /// Link existing maintenance records to an external work order or task.
+    ///
+    /// Only the lifecycle admin may create a group. The group identifier is
+    /// typically a hash of the off-chain work-order data.
+    pub fn link_maintenance_records(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        group_id: Bytes,
+        record_timestamps: Vec<u64>,
+    ) {
+        require_admin(&env, &admin);
+        if group_id.is_empty() || record_timestamps.is_empty() {
+            panic_with_error!(&env, ContractError::InvalidTaskGroup);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut selected = Vec::new(&env);
+        for timestamp in record_timestamps.iter() {
+            let mut found = false;
+            for record in history.iter() {
+                if record.timestamp == timestamp && record.task_type != symbol_short!("XFER") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found || selected.contains(timestamp) {
+                panic_with_error!(&env, ContractError::InvalidTaskGroup);
+            }
+            selected.push_back(timestamp);
+        }
+        let key = DataKey::TaskGroup(asset_id, group_id.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::InvalidTaskGroup);
+        }
+        env.storage().persistent().set(&key, &TaskGroup {
+            group_id,
+            record_timestamps: selected,
+        });
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("TASK_GRP"), asset_id),
+            record_timestamps.len(),
+        );
+    }
+
+    /// Return the maintenance records linked to an external task group.
+    pub fn get_task_group(
+        env: Env,
+        asset_id: u64,
+        group_id: Bytes,
+    ) -> Vec<MaintenanceRecord> {
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get::<_, TaskGroup>(&DataKey::TaskGroup(asset_id, group_id))
+            .map(|group| group.record_timestamps)
+            .unwrap_or_else(|| Vec::new(&env));
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result = Vec::new(&env);
+        for timestamp in timestamps.iter() {
+            for record in history.iter() {
+                if record.timestamp == timestamp {
+                    result.push_back(record);
+                    break;
+                }
+            }
+        }
+        result
     }
 
     /// View alias for [`get_last_service`].
