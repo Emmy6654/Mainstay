@@ -38,9 +38,14 @@ pub enum ContractError {
     InvalidGracePeriod = 22,
     /// Engineer's specializations do not cover the required task type.
     SpecializationNotCovered = 23,
-    InvalidSpecialization = 22,
-    SpecializationAlreadyExists = 23,
-    UnauthorizedRevoker = 22,
+    InvalidSpecialization = 24,
+    SpecializationAlreadyExists = 25,
+    UnauthorizedRevoker = 26,
+    ServiceAreaRequired = 27,
+    InvalidApprenticeship = 28,
+    ApprenticeshipNotComplete = 29,
+    ConflictOfInterest = 30,
+    ConflictOverrideRequired = 31,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -71,6 +76,53 @@ pub struct Engineer {
     pub reputation_score: u32,
     pub notes: Option<soroban_sdk::String>,
     pub specializations: Vec<Symbol>,
+    /// Unix timestamp of the engineer's last activity (submission or update).
+    /// Used to apply reputation decay when fetching the score.
+    pub last_active_at: u64,
+    pub service_regions: Vec<Region>,
+    pub tier: EngineerTier,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineerTier {
+    Apprentice = 0,
+    Full = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Region {
+    NorthAmerica = 0,
+    LatinAmerica = 1,
+    Europe = 2,
+    MiddleEastAfrica = 3,
+    AsiaPacific = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuingEducation {
+    pub hours: u32,
+    pub completed_at: u64,
+    pub topic: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Apprenticeship {
+    pub mentor: Address,
+    pub hours_required: u32,
+    pub hours_completed: u32,
+    pub approved: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictRecord {
+    pub asset_id: u64,
+    pub overridden: bool,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -133,16 +185,51 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 #[allow(dead_code)]
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
-/// Alias used by get_grace_period fallback.
+/// Default grace period constant used by `get_grace_period` fallback and the public API.
 const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
-/// Alias for the default grace period constant; used by the public API.
-const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
+const ENGINEER_LIST: Symbol = symbol_short!("ENG_LIST");
+const CE_KEY: Symbol = symbol_short!("CE");
+const APP_KEY: Symbol = symbol_short!("APP");
+const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
+const CONFLICT_HISTORY_KEY: Symbol = symbol_short!("COI_HIST");
+const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
+const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
+/// Default reputation decay interval: 90 days in seconds (#1315)
+const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
+/// Default decay rate: 5% per interval (#1315)
+const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
+}
+
+/// Calculate decayed reputation based on time since last activity.
+/// Returns the reputation score after applying decay if the inactive period exceeds the threshold.
+/// Decay is applied at DEFAULT_DECAY_RATE_BPS per DEFAULT_DECAY_INTERVAL_SECS.
+fn apply_reputation_decay(engineer: &Engineer, now: u64) -> u32 {
+    let time_inactive = now.saturating_sub(engineer.last_active_at);
+    if time_inactive < DEFAULT_DECAY_INTERVAL_SECS {
+        // No decay yet
+        return engineer.reputation_score;
+    }
+
+    // Calculate number of intervals elapsed
+    let intervals_elapsed = time_inactive / DEFAULT_DECAY_INTERVAL_SECS;
+
+    // Apply decay: score *= (1 - decay_rate)^intervals_elapsed
+    // For efficiency, approximate with linear decay: score * (1 - decay_rate * intervals_elapsed)
+    // But cap at minimum 0 to avoid underflow
+    let decay_factor_bps = DEFAULT_DECAY_RATE_BPS as u64 * intervals_elapsed;
+    if decay_factor_bps >= 10_000 {
+        // Complete decay
+        0u32
+    } else {
+        let remaining_bps = 10_000u64 - decay_factor_bps;
+        ((engineer.reputation_score as u64 * remaining_bps / 10_000u64) as u32)
+    }
 }
 
 fn ensure_not_paused(env: &Env) {
@@ -358,6 +445,9 @@ impl EngineerRegistry {
             reputation_score: 0,
             notes,
             specializations: Vec::new(&env),
+            last_active_at: now,
+            service_regions: Vec::new(&env),
+            tier: EngineerTier::Full,
         };
         env.storage()
             .persistent()
@@ -377,6 +467,16 @@ impl EngineerRegistry {
             .persistent()
             .set(&issuer_engineers_key(&issuer), &list);
         extend_persistent_ttl(&env, &issuer_engineers_key(&issuer));
+        let mut engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or(Vec::new(&env));
+        if !engineers.contains(engineer.clone()) {
+            engineers.push_back(engineer.clone());
+            env.storage().persistent().set(&ENGINEER_LIST, &engineers);
+            extend_persistent_ttl(&env, &ENGINEER_LIST);
+        }
 
         // Increment engineer count
         let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
@@ -438,6 +538,8 @@ impl EngineerRegistry {
                 if !e.active {
                     CredentialStatus::Revoked
                 } else if is_suspended(&e, env.ledger().timestamp()) {
+                    CredentialStatus::Suspended
+                } else if !Self::verify_engineer_ce_compliance(env.clone(), engineer.clone()) {
                     CredentialStatus::Suspended
                 } else if !env.storage().instance().has(&trusted_key(&e.issuer)) {
                     // The issuer that credentialed this engineer is no longer trusted.
@@ -675,6 +777,8 @@ impl EngineerRegistry {
                 if !e.active {
                     EngineerStatus::Revoked
                 } else if is_suspended(&e, env.ledger().timestamp()) {
+                    EngineerStatus::Suspended
+                } else if !Self::verify_engineer_ce_compliance(env.clone(), engineer.clone()) {
                     EngineerStatus::Suspended
                 } else if env.ledger().timestamp() >= e.expires_at {
                     EngineerStatus::Expired
@@ -1490,6 +1594,7 @@ impl EngineerRegistry {
             .saturating_add(delta as i64)
             .clamp(0, 1000) as u32;
         record.reputation_score = new_rep;
+        record.last_active_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -1518,7 +1623,10 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
-            .map(|e| e.reputation_score)
+            .map(|e| {
+                let now = env.ledger().timestamp();
+                apply_reputation_decay(&e, now)
+            })
             .unwrap_or(0)
     }
 
@@ -1681,6 +1789,270 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
             .specializations
+    }
+
+    pub fn set_engineer_service_area(env: Env, engineer: Address, regions: Vec<Region>) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.service_regions = regions;
+        env.storage().persistent().set(&engineer_key(&engineer), &record);
+        extend_persistent_ttl(&env, &engineer_key(&engineer));
+    }
+
+    pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
+        let mut result = Vec::new(&env);
+        let engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or(Vec::new(&env));
+        for engineer in engineers.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, Engineer>(&engineer_key(&engineer))
+            {
+                if record.active && record.service_regions.contains(region) {
+                    result.push_back(engineer);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn set_ce_requirement(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        hours: u32,
+        frequency_secs: u64,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if hours == 0 || frequency_secs == 0 {
+            panic_with_error!(&env, ContractError::InvalidValidityPeriod);
+        }
+        env.storage()
+            .persistent()
+            .set(&(CE_REQUIREMENT_KEY, specialization), &(hours, frequency_secs));
+        extend_persistent_ttl(&env, &(CE_REQUIREMENT_KEY, specialization));
+    }
+
+    pub fn register_ce_completion(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        completion: ContinuingEducation,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .is_none()
+        {
+            panic_with_error!(&env, ContractError::EngineerNotFound);
+        }
+        let key = (CE_KEY, engineer);
+        let mut records: Vec<ContinuingEducation> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        records.push_back(completion);
+        env.storage().persistent().set(&key, &records);
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn verify_engineer_ce_compliance(env: Env, engineer: Address) -> bool {
+        let record: Engineer = match env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+        {
+            Some(record) => record,
+            None => return false,
+        };
+        let now = env.ledger().timestamp();
+        let completions: Vec<ContinuingEducation> = env
+            .storage()
+            .persistent()
+            .get(&(CE_KEY, engineer))
+            .unwrap_or(Vec::new(&env));
+        for specialization in record.specializations.iter() {
+            let (required_hours, frequency): (u32, u64) = match env
+                .storage()
+                .persistent()
+                .get(&(CE_REQUIREMENT_KEY, specialization.clone()))
+            {
+                Some(value) => value,
+                None => continue,
+            };
+            let cutoff = now.saturating_sub(frequency);
+            let mut hours = 0u32;
+            for completion in completions.iter() {
+                if completion.topic == specialization && completion.completed_at >= cutoff {
+                    hours = hours.saturating_add(completion.hours);
+                }
+            }
+            if hours < required_hours {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn start_apprenticeship(
+        env: Env,
+        apprentice: Address,
+        mentor: Address,
+        hours_required: u32,
+    ) {
+        ensure_not_paused(&env);
+        mentor.require_auth();
+        if hours_required == 0 {
+            panic_with_error!(&env, ContractError::InvalidApprenticeship);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&apprentice))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.tier = EngineerTier::Apprentice;
+        env.storage().persistent().set(&engineer_key(&apprentice), &record);
+        extend_persistent_ttl(&env, &engineer_key(&apprentice));
+        let key = (APP_KEY, apprentice);
+        env.storage().persistent().set(
+            &key,
+            &Apprenticeship {
+                mentor,
+                hours_required,
+                hours_completed: 0,
+                approved: false,
+            },
+        );
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
+        let key = (APP_KEY, apprentice);
+        let mut apprenticeship: Apprenticeship = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        apprenticeship.mentor.require_auth();
+        apprenticeship.hours_completed = apprenticeship
+            .hours_completed
+            .saturating_add(hours)
+            .min(apprenticeship.hours_required);
+        env.storage().persistent().set(&key, &apprenticeship);
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn complete_apprenticeship(env: Env, apprentice: Address) {
+        ensure_not_paused(&env);
+        let key = (APP_KEY, apprentice.clone());
+        let apprenticeship: Apprenticeship = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        apprenticeship.mentor.require_auth();
+        if apprenticeship.hours_completed < apprenticeship.hours_required {
+            panic_with_error!(&env, ContractError::ApprenticeshipNotComplete);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&apprentice))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.tier = EngineerTier::Full;
+        env.storage().persistent().set(&engineer_key(&apprentice), &record);
+        env.storage().persistent().remove(&key);
+        extend_persistent_ttl(&env, &engineer_key(&apprentice));
+    }
+
+    pub fn get_engineer_tier(env: Env, engineer: Address) -> EngineerTier {
+        env.storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
+            .tier
+    }
+
+    pub fn register_engineer_interests(
+        env: Env,
+        engineer: Address,
+        asset_ids: Vec<u64>,
+    ) {
+        ensure_not_paused(&env);
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+        let key = (INTEREST_KEY, engineer.clone());
+        env.storage().persistent().set(&key, &asset_ids);
+        extend_persistent_ttl(&env, &key);
+        let history_key = (CONFLICT_HISTORY_KEY, engineer);
+        let mut history: Vec<ConflictRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        for asset_id in asset_ids.iter() {
+            history.push_back(ConflictRecord {
+                asset_id,
+                overridden: false,
+                timestamp: env.ledger().timestamp(),
+            });
+        }
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+    }
+
+    pub fn approve_conflict_override(env: Env, engineer: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+        let key = (CONFLICT_OVERRIDE_KEY, engineer.clone(), asset_id);
+        env.storage().persistent().set(&key, &true);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("COI_OVR"), engineer),
+            (asset_id, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn check_conflict_of_interest(env: Env, engineer: Address, asset_id: u64) -> bool {
+        let interests: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&(INTEREST_KEY, engineer.clone()))
+            .unwrap_or(Vec::new(&env));
+        interests.contains(asset_id)
+            && !env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&(CONFLICT_OVERRIDE_KEY, engineer, asset_id))
+                .unwrap_or(false)
+    }
+
+    pub fn get_conflict_history(env: Env, engineer: Address) -> Vec<ConflictRecord> {
+        env.storage()
+            .persistent()
+            .get(&(CONFLICT_HISTORY_KEY, engineer))
+            .unwrap_or(Vec::new(&env))
     }
 }
 
@@ -5489,5 +5861,114 @@ mod tests {
         assert_eq!(emitted_type, symbol_short!("SAFETY"));
         assert_eq!(emitted_date, ts);
         assert_eq!(emitted_hash, cert_hash);
+    }
+
+    #[test]
+    fn test_specialization_hierarchy_and_matching() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let hvac = symbol_short!("HVAC");
+        let heating = symbol_short!("HEATING");
+        let cooling = symbol_short!("COOLING");
+        client.add_specialization_hierarchy(&hvac, &heating);
+        client.add_specialization_hierarchy(&hvac, &cooling);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.set_engineer_specialization(&engineer, &heating);
+
+        let applicable = client.get_applicable_engineers(&hvac);
+        assert!(applicable.contains(&engineer));
+
+        let cooling_only = client.get_applicable_engineers(&cooling);
+        assert!(!cooling_only.contains(&engineer));
+    }
+
+    #[test]
+    fn test_submit_and_get_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &4,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 4);
+        assert_eq!(count, 1);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 1);
+    }
+
+    #[test]
+    fn test_dispute_review_excludes_from_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+        client.authorize_reviewer(&reviewer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &5,
+            &feedback,
+            &ReviewVisibility::PeersOnly,
+        );
+        client.dispute_review(&engineer, &reviewer);
+
+        let (average, count) = client.get_engineer_rating(&engineer);
+        assert_eq!(average, 0);
+        assert_eq!(count, 0);
+        assert_eq!(client.get_reviewer_reputation(&reviewer), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "reviewer not authorized")]
+    fn test_unauthorized_reviewer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer, &hash, &issuer);
+
+        let feedback = Bytes::from_array(&env, &[1u8, 2u8]);
+        client.submit_engineer_review(
+            &reviewer,
+            &engineer,
+            &3,
+            &feedback,
+            &ReviewVisibility::Public,
+        );
     }
 }

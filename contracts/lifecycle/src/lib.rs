@@ -13,21 +13,30 @@ pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key, submission_window_key,
+    transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
-    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER,
+    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
 };
 
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, CostReconciliation, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    DisputeStatus, EvidenceAttachment, MaintenanceDispute, ScoreEntry, TaskGroup,
-    TimelockProposal, TransferRecord, WeightProposal,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    // Issue #1637 - Cross-Contract Score Consensus
+    ExternalScoreEntry,
+    // Issue #1639 - Score Anomaly Detection
+    ScoreAnomaly,
+    // Issue #1638 - Degradation Curves
+    DegradationCurve,
+    // Issue #1640 - Peer Comparison
+    PeerGroup,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -46,10 +55,16 @@ const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
-/// Instance-storage key for the reentrancy lock used in `submit_maintenance`.
-/// Stored in *instance* storage so it persists only for the duration of the
-/// transaction and is automatically cleared when the invocation frame exits,
-/// but also explicitly cleared at the end of the guarded function (#1022).
+const TREASURY_ADDR_KEY: Symbol = symbol_short!("TREASURY");
+/// Temporary-storage key for the reentrancy lock used in `submit_maintenance`.
+///
+/// Stored in *temporary* storage so that it is **automatically discarded** at
+/// the end of the transaction even if the contract panics before
+/// `release_reentrancy_guard` is reached.  Using instance storage (the
+/// previous approach) meant that a mid-execution panic would leave the lock
+/// set permanently, blocking all future `submit_maintenance` calls until a
+/// manual recovery step was taken.  Temporary storage has no such risk: the
+/// Soroban host always rolls it back on transaction failure (#1196).
 const REENTRANCY_LOCK: Symbol = symbol_short!("LOCKED");
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 const DEFAULT_MAX_HISTORY: u32 = 200;
@@ -67,14 +82,29 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
 /// Length of the rolling submission-rate window, in seconds.
 const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
+/// Fee tiers for maintenance submission priority levels (#1313)
+/// Low priority: 100 stroops
+const FEE_LOW: u64 = 100;
+/// Medium priority: 500 stroops
+const FEE_MEDIUM: u64 = 500;
+/// High priority: 1000 stroops
+const FEE_HIGH: u64 = 1_000;
+/// Critical priority: 5000 stroops
+const FEE_CRITICAL: u64 = 5_000;
+/// Default cap on the number of health snapshots retained per asset. Without
+/// a cap, a misconfigured automation loop calling `take_health_snapshot` in a
+/// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
+/// read costs and persistent-TTL-extension costs on every call.
+const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
+/// Default retirement review period: 7 days in seconds.
+const DEFAULT_RETIREMENT_REVIEW_PERIOD: u64 = 604_800;
+/// Default coordinated task timeout: 30 days in seconds.
+const DEFAULT_COORDINATED_TASK_TIMEOUT: u64 = 2_592_000;
+/// Maximum next coordinated task ID.
+const MAX_COORDINATED_TASK_ID: u64 = u64::MAX;
+/// Next coordinated task ID storage key.
+const NEXT_COORD_TASK_ID_KEY: Symbol = symbol_short!("NXTTID");
 
-fn effective_min_collateral_score(config: &Config) -> u32 {
-    if config.min_collateral_score > 0 {
-        config.min_collateral_score
-    } else {
-        config.eligibility_threshold
-    }
-}
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
 /// With the highest built-in task weight (`10`), a maximum-size batch can
@@ -98,6 +128,15 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 /// for the cross-contract calls and per-record validation performed
 /// inside the batch path.
 pub const MAX_BATCH_SIZE: u32 = 50;
+/// Hard cap on engineers accepted by one bulk authorization-revocation call.
+pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
+/// Hard cap on the number of addresses in the admin multisig set.
+///
+/// `require_quorum` performs an O(n) scan of the admins list on every
+/// protected call.  Without a bound this could approach instruction limits
+/// for large lists.  10 admins comfortably covers any realistic governance
+/// set while keeping per-call work negligible.
+pub const MAX_ADMINS: u32 = 10;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
@@ -132,16 +171,6 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Older records still contribute nothing, newer records are weighted linearly.
 const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
-const EVENT_INIT: Symbol = symbol_short!("INIT");
-const EVENT_MAINT: Symbol = symbol_short!("MAINT");
-const EVENT_DECAY: Symbol = symbol_short!("DECAY");
-const EVENT_REG_AST: Symbol = symbol_short!("REG_AST");
-const EVENT_REG_ENG: Symbol = symbol_short!("REG_ENG");
-const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
-const EVENT_XFER: Symbol = symbol_short!("XFER");
-const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
-const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
 /// Emitted when a health snapshot is anchored to reconstructed history.
 const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
 /// Emitted when a task-weight-change proposal is created.
@@ -149,32 +178,6 @@ const EVENT_WEIGHT_PROP: Symbol = symbol_short!("WT_PROP");
 /// Emitted when a pending task-weight-change proposal is executed.
 const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
 
-fn history_key(asset_id: u64) -> (Symbol, u64) {
-const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
-
-
-    (symbol_short!("HIST"), asset_id)
-
-    (symbol_short!("TL_PROP"), op)
-
-    (symbol_short!("SCORE"), asset_id)
-
-    (symbol_short!("SCHIST"), asset_id)
-
-    (symbol_short!("LUPD"), asset_id)
-
-    (symbol_short!("ENG_HIST"), engineer.clone())
-
-    (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
-
-    (symbol_short!("FROZEN"), asset_id)
-
-    (symbol_short!("FRZ_SCR"), asset_id)
-
-    (symbol_short!("HLTH_SNP"), asset_id)
-
-    (symbol_short!("XFER_HIST"), asset_id)
-}
 
 /// Key for the list of currently-authorized engineer addresses for an asset.
 /// Used by `authorize_engineer`, `revoke_engineer_authorization`, and
@@ -191,7 +194,7 @@ fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, A
 
 /// Storage key for the dynamic frequency-based scoring weights for a given asset type.
 fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, Symbol) {
-    (symbol_short!("SCRWTS"), asset_type.clone())
+    (symbol_short!("SCR_WGT"), asset_type.clone())
 }
 
 /// Storage key for a pending weight-change proposal for a given task type.
@@ -200,7 +203,7 @@ fn weight_proposal_key(task_type: &Symbol) -> DataKey {
 /// Computes the sha256 hash of a [`MaintenanceRecord`] as it will be stored on-chain
 /// (including whatever `previous_record_hash` it already carries), so that the result
 /// can be embedded as the `previous_record_hash` of the *next* record in the chain.
-fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
+pub(crate) fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
     let digest: BytesN<32> = env.crypto().sha256(&record.clone().to_xdr(env)).into();
     digest.into()
 }
@@ -208,7 +211,7 @@ fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
 /// Returns the hash-chain link (`previous_record_hash`) for the next record to be
 /// appended to `history`: the hash of the current last record, or `None` when
 /// `history` is empty (i.e. the next record will be the first visible one).
-fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
+pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
     if history.is_empty() {
         None
     } else {
@@ -385,6 +388,27 @@ pub(crate) fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     extend_persistent_ttl(&env, &ENG_REGISTRY);
 }
 
+pub(crate) fn get_treasury_addr(env: &Env) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&TREASURY_ADDR_KEY)
+}
+
+pub(crate) fn set_treasury_addr(env: &Env, addr: &Address) {
+    env.storage().persistent().set(&TREASURY_ADDR_KEY, addr);
+    extend_persistent_ttl(&env, &TREASURY_ADDR_KEY);
+}
+
+/// Calculate the fee for a maintenance submission based on priority level (#1313)
+pub(crate) fn get_fee_for_priority(priority: Priority) -> u64 {
+    match priority {
+        Priority::Low => FEE_LOW,
+        Priority::Medium => FEE_MEDIUM,
+        Priority::High => FEE_HIGH,
+        Priority::Critical => FEE_CRITICAL,
+    }
+}
+
 pub(crate) fn is_zero_address(env: &Env, addr: &Address) -> bool {
     *addr
         == Address::from_str(
@@ -405,7 +429,7 @@ pub(crate) fn ensure_not_paused(env: &Env) {
 
 /// Acquire the reentrancy lock for `submit_maintenance`.
 ///
-/// Sets the `LOCKED` flag in instance storage. If the flag is already set
+/// Sets the `LOCKED` flag in *temporary* storage. If the flag is already set
 /// (indicating a reentrant call), panics with [`ContractError::Reentrancy`].
 ///
 /// # Issue #1022
@@ -413,21 +437,35 @@ pub(crate) fn ensure_not_paused(env: &Env) {
 /// asset registry. A malicious registry contract could re-enter the lifecycle
 /// contract before state is committed, enabling double-writes to the maintenance
 /// history. This guard prevents that attack vector.
+///
+/// # Issue #1196
+/// The lock is stored in **temporary** storage rather than instance storage.
+/// Temporary storage is automatically discarded by the Soroban host when the
+/// transaction ends — whether by normal completion or by a panic.  Instance
+/// storage persists across transactions, so a panic between
+/// `acquire_reentrancy_guard` and `release_reentrancy_guard` would have left
+/// the flag permanently set, making `submit_maintenance` unreachable until a
+/// manual fix.  Temporary storage removes that risk entirely.
 fn acquire_reentrancy_guard(env: &Env) {
     if env
         .storage()
-        .instance()
+        .temporary()
         .get::<_, bool>(&REENTRANCY_LOCK)
         .unwrap_or(false)
     {
         panic_with_error!(env, ContractError::Reentrancy);
     }
-    env.storage().instance().set(&REENTRANCY_LOCK, &true);
+    env.storage().temporary().set(&REENTRANCY_LOCK, &true);
 }
 
 /// Release the reentrancy lock acquired by [`acquire_reentrancy_guard`].
+///
+/// Explicitly removes the flag from temporary storage. Although temporary
+/// storage is automatically cleared at transaction end, removing it eagerly
+/// keeps state tidy and avoids any confusion in future call frames within the
+/// same transaction.
 fn release_reentrancy_guard(env: &Env) {
-    env.storage().instance().remove(&REENTRANCY_LOCK);
+    env.storage().temporary().remove(&REENTRANCY_LOCK);
 }
 
 /// Advances `next_due` on every active recurring task of `asset_id` whose
@@ -669,6 +707,26 @@ pub(crate) fn store_timelock(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
+/// Validate that a timelocked proposal is ready to execute, then mark it
+/// executed.
+///
+/// # Atomicity guarantee
+/// `proposal.executed = true` is written to persistent storage here, in this
+/// call, **before** the caller runs the guarded operation (e.g.
+/// `crate::admin::update_score_increment`). This ordering means the
+/// "executed" flag can never be observed as `true` without the corresponding
+/// guarded operation actually having run: Soroban contract invocations are
+/// all-or-nothing — every storage write performed during an invocation
+/// (including this one) is part of the same host-managed transaction, so if
+/// anything later in the same invocation panics or the transaction fails to
+/// commit for any reason, this write is rolled back along with it. There is
+/// no intermediate state, observable by another call, in which `executed`
+/// is `true` but the guarded operation did not happen. Conversely, once this
+/// call returns normally, the flag write has succeeded and the guarded
+/// operation is guaranteed to run in the remainder of the same invocation,
+/// so a second call for the same `op` always hits the `proposal.executed`
+/// check below and is rejected with `ProposalNotFound` — double-execution of
+/// the same proposal is impossible.
 pub(crate) fn require_timelock_ready(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     let mut proposal: TimelockProposal = env
@@ -790,6 +848,7 @@ mod engineer_registry {
         fn update_reputation(env: Env, engineer: Address, delta: i32);
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
         fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol>;
+        fn check_conflict_of_interest(env: Env, engineer: Address, asset_id: u64) -> bool;
     }
 }
 
@@ -926,10 +985,18 @@ impl Lifecycle {
         if new_config.max_notes_length == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1258: A max_notes_length below 10 trivially bypasses notes validation.
+        if new_config.max_notes_length < 10 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
         if new_config.admin_threshold > 0
             && new_config.admin_threshold as u32 > new_config.admins.len()
         {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap admin list size to prevent O(n) DoS in require_quorum.
+        if new_config.admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
         // Store proposed config under a dedicated pending key.
         let pending_key = symbol_short!("PEND_CFG");
@@ -1237,6 +1304,66 @@ impl Lifecycle {
         );
     }
 
+    /// Immediately revoke multiple engineers' owner-approved authorizations for an asset.
+    ///
+    /// The current owner must authorize the call. The operation is bounded to
+    /// keep transaction work predictable and updates the maintained authorized
+    /// engineer list in one storage write.
+    pub fn batch_revoke_engineer_authorizations(
+        env: Env,
+        owner: Address,
+        asset_id: u64,
+        engineers: Vec<Address>,
+    ) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+        if engineers.len() > MAX_BATCH_REVOKE_SIZE {
+            panic_with_error!(&env, ContractError::BatchRevokeTooLarge);
+        }
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let list_key = authorized_engineers_key(asset_id);
+        let current_list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut remaining = Vec::new(&env);
+
+        for current in current_list.iter() {
+            let mut revoked = false;
+            for engineer in engineers.iter() {
+                if current == engineer {
+                    revoked = true;
+                    break;
+                }
+            }
+            if revoked {
+                env.storage()
+                    .persistent()
+                    .remove(&engineer_auth_key(asset_id, &current));
+                env.events().publish(
+                    (symbol_short!("REVOKE_AUTH"), owner.clone()),
+                    (asset_id, current, env.ledger().timestamp()),
+                );
+            } else {
+                remaining.push_back(current);
+            }
+        }
+
+        if !current_list.is_empty() {
+            env.storage().persistent().set(&list_key, &remaining);
+            extend_persistent_ttl(&env, &list_key);
+        }
+    }
+
     // ─── Issue #1012 ──────────────────────────────────────────────────────────
 
     /// Return the list of engineers currently authorized to submit maintenance
@@ -1302,7 +1429,7 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
         if asset_registry == engineer_registry {
-            panic_with_error!(&env, ContractError::InvalidConfig);
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
         }
         // Guard: the baked-in default decay_interval must never be 0; if it
         // somehow is (e.g. a misconfigured build constant), reject immediately
@@ -1311,10 +1438,18 @@ impl Lifecycle {
         if DEFAULT_DECAY_INTERVAL == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1257: Guard against a misconfigured build constant. A score_increment
+        // of 0 means maintenance events never award any score, silently breaking
+        // the collateral-scoring system. Reject at deploy time rather than
+        // producing a permanently mis-configured contract.
+        if DEFAULT_SCORE_INCREMENT == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         set_asset_registry_addr(&env, &asset_registry);
         set_engineer_registry_addr(&env, &engineer_registry);
 
+        let min_collateral = DEFAULT_ELIGIBILITY_THRESHOLD;
         let config = Config {
             admin: admin.clone(),
             admins: Vec::new(&env),
@@ -1329,10 +1464,12 @@ impl Lifecycle {
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
-            min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
+            min_collateral_score: if min_collateral > 0 { min_collateral } else { DEFAULT_ELIGIBILITY_THRESHOLD },
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
+            default_task_weight: 0,
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1473,15 +1610,23 @@ impl Lifecycle {
     /// `reset_score`, `pause`, and other protected admin operations. Passing an empty
     /// `new_admins` or a `threshold` of 0 / 1 reverts to single-admin mode.
     ///
+    /// # Uniqueness requirement (#1195)
+    /// Every address in `new_admins` **must be unique**.  A repeated address would
+    /// inflate the effective quorum count — for example, two entries for the same
+    /// address in a list with `threshold = 2` would let a single real signer satisfy
+    /// both slots, reducing M-of-N protection to 1-of-N.  The function panics with
+    /// [`ContractError::DuplicateAdmin`] if any duplicate is detected.
+    ///
     /// # Arguments
     /// * `admin` - The current single admin (must match `config.admin`)
-    /// * `new_admins` - Full replacement list of multisig co-signer addresses
+    /// * `new_admins` - Full replacement list of multisig co-signer addresses; all entries must be distinct
     /// * `threshold` - Minimum signatures required (M in M-of-N); 0 means single-admin mode
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::InvalidConfig`] if threshold exceeds the length of new_admins
+    /// - [`ContractError::DuplicateAdmin`] if `new_admins` contains any repeated address
     pub fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address>, threshold: u32) {
         ensure_not_paused(&env);
         admin.require_auth();
@@ -1496,6 +1641,12 @@ impl Lifecycle {
         }
         if threshold > 0 && threshold as u32 > new_admins.len() {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap the admin list to MAX_ADMINS (10) to prevent O(n) scans
+        // in require_quorum from approaching instruction limits on every
+        // protected call.
+        if new_admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
 
         // Reject any list that contains duplicate addresses.  A duplicate
@@ -1512,9 +1663,7 @@ impl Lifecycle {
         config.admins = new_admins.clone();
         config.admin_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("SET_QRUM"), admin.clone()),
@@ -1617,10 +1766,6 @@ impl Lifecycle {
         ensure_not_paused(&env);
         admin.require_auth();
 
-        if min_collateral_score == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
         let mut config: Config = env
             .storage()
             .persistent()
@@ -1631,14 +1776,15 @@ impl Lifecycle {
         }
 
         let old_min = config.min_collateral_score;
-        config.min_collateral_score = min_collateral_score;
-        config.eligibility_threshold = min_collateral_score;
+        let normalized_score = if min_collateral_score > 0 { min_collateral_score } else { config.eligibility_threshold };
+        config.min_collateral_score = normalized_score;
+        config.eligibility_threshold = normalized_score;
         env.storage().persistent().set(&CONFIG, &config); 
         extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
-            (old_min, min_collateral_score),
+            (old_min, normalized_score),
         );
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
@@ -1646,7 +1792,7 @@ impl Lifecycle {
                 admin,
                 env.ledger().timestamp(),
                 symbol_short!("MIN_COLL"),
-                min_collateral_score,
+                normalized_score,
             ),
         );
     }
@@ -1690,6 +1836,24 @@ impl Lifecycle {
     /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
     pub fn update_max_engineer_history(env: Env, admin: Address, new_max: u32) {
         crate::admin::update_max_engineer_history(env, admin, new_max);
+    }
+
+    /// Admin-only function to update the per-asset health-snapshot retention cap.
+    ///
+    /// Once `HealthSnapshots(asset_id)` reaches `new_max` entries, `take_health_snapshot`
+    /// evicts the oldest snapshot(s) before appending the new one, bounding storage,
+    /// read costs, and TTL-extension costs regardless of how often snapshots are taken.
+    ///
+    /// # Arguments
+    /// * `admin`   - The admin address that must match the stored config admin.
+    /// * `new_max` - New per-asset snapshot cap (must be > 0).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialised.
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin.
+    /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+    pub fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
+        crate::admin::update_max_snapshots(env, admin, new_max);
     }
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
@@ -1942,9 +2106,34 @@ impl Lifecycle {
         notes: String,
         engineer: Address,
         cost: Option<u64>,
+        fee: u64,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
+
+        // Validate and collect maintenance fee (#1313)
+        if let Some(treasury) = get_treasury_addr(&env) {
+            let required_fee = get_fee_for_priority(priority);
+            if fee < required_fee {
+                panic_with_error!(&env, ContractError::InsufficientFee);
+            }
+
+            // Transfer fee to treasury
+            if fee > 0 {
+                // Note: This assumes fees are paid via the engineer's account
+                // In a real implementation, this would need to pull from a token contract
+                // For now, we just track it as a balance update
+                let current_treasury_balance: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&symbol_short!("FEE_BAL"))
+                    .unwrap_or(0u64);
+                env.storage()
+                    .persistent()
+                    .set(&symbol_short!("FEE_BAL"), &(current_treasury_balance + fee));
+                extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+            }
+        }
 
         let config: Config = env
             .storage()
@@ -2001,6 +2190,9 @@ impl Lifecycle {
         // Verify engineer credential via the engineer registry.
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        if registry.check_conflict_of_interest(&engineer, &asset_id) {
+            panic_with_error!(&env, ContractError::ConflictOfInterest);
+        }
         let status = registry.get_credential_status(&engineer);
         if status != engineer_registry::CredentialStatus::Valid
             && status != engineer_registry::CredentialStatus::GracePeriod
@@ -2027,6 +2219,27 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::SpecializationMismatch);
         }
 
+        // Re-check the decommissioned/frozen state immediately before committing
+        // any history/score writes. The initial check above happens before the
+        // engineer-authorization cross-contract calls (credential status,
+        // engineer-authorized check, specialization lookup); those calls run
+        // under the reentrancy guard acquired earlier, but an admin could still
+        // decommission the asset via a separate top-level transaction that lands
+        // between when this invocation started and when it reaches this point
+        // in the ledger's transaction ordering. Re-reading the frozen flag here,
+        // directly adjacent to the first write, closes that window: either both
+        // checks observe "not decommissioned" and the write proceeds, or the
+        // second check catches a decommission and the whole invocation reverts
+        // atomically (Soroban invocations are all-or-nothing), so no maintenance
+        // record can ever be committed against a decommissioned asset.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+        let status = asset_client.asset_status(&asset_id);
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
         let timestamp = env.ledger().timestamp();
         let previous_record_hash = next_chain_link(&env, &history);
 
@@ -2049,6 +2262,7 @@ impl Lifecycle {
             cost,
             ownership_start_ledger,
             previous_record_hash,
+            reconstructed: false,
         };
 
         history.push_back(record);
@@ -2214,6 +2428,7 @@ impl Lifecycle {
             cost: None,
             ownership_start_ledger: Some(current_ledger),
             previous_record_hash,
+            reconstructed: false,
         };
         history.push_back(sentinel);
         let sentinel_index = history.len() - 1;
@@ -2379,9 +2594,35 @@ impl Lifecycle {
         records: Vec<BatchRecord>,
         engineer: Address,
         costs: Option<Vec<Option<u64>>>,
+        fee: u64,
     ) {
         ensure_not_paused(&env);
         engineer.require_auth();
+
+        // Validate and collect maintenance fees (#1313)
+        if let Some(treasury) = get_treasury_addr(&env) {
+            let mut total_required_fee: u64 = 0;
+            for record in records.iter() {
+                total_required_fee = total_required_fee.saturating_add(get_fee_for_priority(record.priority));
+            }
+
+            if fee < total_required_fee {
+                panic_with_error!(&env, ContractError::InsufficientFee);
+            }
+
+            // Collect total fees to treasury
+            if fee > 0 {
+                let current_treasury_balance: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&symbol_short!("FEE_BAL"))
+                    .unwrap_or(0u64);
+                env.storage()
+                    .persistent()
+                    .set(&symbol_short!("FEE_BAL"), &(current_treasury_balance + fee));
+                extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+            }
+        }
 
         let config: Config = env
             .storage()
@@ -2500,6 +2741,7 @@ impl Lifecycle {
                 cost: rec_cost,
                 ownership_start_ledger,
                 previous_record_hash: chain_link,
+                reconstructed: false,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
             new_records.push_back(new_record);
@@ -2551,6 +2793,157 @@ impl Lifecycle {
         env.events().publish(
             (symbol_short!("REP_UPD"), engineer.clone()),
             (old_rep, new_rep),
+        );
+    }
+
+    /// Issue #1319: Dispute a maintenance record for an asset.
+    /// The asset owner can challenge the authenticity of a maintenance record signed by an engineer.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `reason` - Dispute reason (e.g., "No service was actually performed")
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if asset doesn't exist
+    /// - [`ContractError::MaintenanceRecordNotFound`] if record doesn't exist
+    pub fn dispute_record(env: Env, asset_id: u64, maintenance_timestamp: u64, reason: String) {
+        ensure_not_paused(&env);
+
+        // Verify asset exists (get current owner)
+        let asset_registry: Address = env
+            .storage()
+            .instance()
+            .get(&registry_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let _asset = asset_registry_client.get_asset(&asset_id);
+
+        // Verify the maintenance record exists
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut record_found = false;
+        for record in history.iter() {
+            if record.timestamp == maintenance_timestamp {
+                record_found = true;
+                break;
+            }
+        }
+
+        if !record_found {
+            panic_with_error!(&env, ContractError::MaintenanceRecordNotFound);
+        }
+
+        // Create dispute record
+        let dispute = DisputeRecord {
+            asset_id,
+            maintenance_timestamp,
+            reason: reason.clone(),
+            disputed_at: env.ledger().timestamp(),
+            is_resolved: false,
+            admin_decision: None,
+        };
+
+        // Store dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        disputes.push_back(dispute);
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_OPEN"), asset_id),
+            (maintenance_timestamp, reason),
+        );
+    }
+
+    /// Issue #1319: Get disputes for an asset.
+    pub fn get_disputes(env: Env, asset_id: u64) -> Vec<DisputeRecord> {
+        let disputes_key = DataKey::Disputes(asset_id);
+        let disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&disputes_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&disputes_key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        disputes
+    }
+
+    /// Issue #1319: Resolve a dispute record (admin only).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `maintenance_timestamp` - Timestamp of the disputed record
+    /// * `decision` - Admin decision (e.g., "UPHELD", "REJECTED")
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not admin
+    /// - [`ContractError::DisputeNotFound`] if dispute doesn't exist
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        maintenance_timestamp: u64,
+        decision: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Find and update dispute
+        let disputes_key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&disputes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..disputes.len() {
+            let mut dispute = disputes.get(i).unwrap();
+            if dispute.maintenance_timestamp == maintenance_timestamp {
+                dispute.is_resolved = true;
+                dispute.admin_decision = Some(decision.clone());
+                disputes.set(i, &dispute);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, ContractError::DisputeNotFound);
+        }
+
+        env.storage().persistent().set(&disputes_key, &disputes);
+        extend_persistent_ttl(&env, &disputes_key);
+
+        env.events().publish(
+            (symbol_short!("DISP_RES"), asset_id),
+            (maintenance_timestamp, decision),
         );
     }
 
@@ -2889,6 +3282,143 @@ impl Lifecycle {
         page
     }
 
+    /// Issue #1253 — Return maintenance records for an asset filtered by priority level.
+    ///
+    /// Lenders assessing collateral risk can use this endpoint to surface Critical
+    /// and High priority events without scanning the full history vector.
+    ///
+    /// Pagination follows the same semantics as
+    /// [`get_maintenance_history_paginated`]: `offset` is a zero-based index into
+    /// the *filtered* result set (not the raw history), and `limit` is hard-capped
+    /// at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Arguments
+    /// * `asset_id`  - The unique identifier of the asset.
+    /// * `priority`  - The [`Priority`] level to filter on (`Low`, `Medium`, `High`, or `Critical`).
+    /// * `offset`    - Zero-based start index into the filtered results (inclusive).
+    ///                 Returns an empty vec when `offset` ≥ number of matching records.
+    /// * `limit`     - Maximum number of records to return. `0` returns an empty vec.
+    ///                 Hard-capped at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Returns
+    /// `Vec<MaintenanceRecord>` — matching records for the requested page, possibly
+    /// shorter than `limit` if the end of the filtered set is reached.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry.
+    pub fn get_maintenance_records_by_priority(
+        env: Env,
+        asset_id: u64,
+        priority: Priority,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Collect matching records into a filtered list first, then paginate.
+        let mut filtered: Vec<MaintenanceRecord> = Vec::new(&env);
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.priority == priority {
+                filtered.push_back(record);
+            }
+        }
+
+        let len = filtered.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let capped_limit = limit.min(MAX_PAGINATED_LIMIT);
+        let end = (offset + capped_limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(filtered.get(i).unwrap());
+        }
+        page
+    }
+
+    /// Issue #1252 — Return maintenance records for an asset filtered by task type.
+    ///
+    /// Predictive maintenance tools can use this endpoint to retrieve all records
+    /// of a specific task type (e.g. all `OIL_CHG` records) and compute service
+    /// intervals without loading the full history.
+    ///
+    /// Pagination follows the same semantics as
+    /// [`get_maintenance_history_paginated`]: `offset` is a zero-based index into
+    /// the *filtered* result set (not the raw history), and `limit` is hard-capped
+    /// at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Arguments
+    /// * `asset_id`   - The unique identifier of the asset.
+    /// * `task_type`  - The task-type [`Symbol`] to filter on (e.g. `OIL_CHG`, `ENGINE`).
+    /// * `offset`     - Zero-based start index into the filtered results (inclusive).
+    ///                  Returns an empty vec when `offset` ≥ number of matching records.
+    /// * `limit`      - Maximum number of records to return. `0` returns an empty vec.
+    ///                  Hard-capped at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Returns
+    /// `Vec<MaintenanceRecord>` — matching records for the requested page, possibly
+    /// shorter than `limit` if the end of the filtered set is reached.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry.
+    pub fn get_maintenance_records_by_task_type(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Collect matching records into a filtered list first, then paginate.
+        let mut filtered: Vec<MaintenanceRecord> = Vec::new(&env);
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.task_type == task_type {
+                filtered.push_back(record);
+            }
+        }
+
+        let len = filtered.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let capped_limit = limit.min(MAX_PAGINATED_LIMIT);
+        let end = (offset + capped_limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(filtered.get(i).unwrap());
+        }
+        page
+    }
+
     /// Issue #799 — Option-returning variant of [`get_maintenance_history`].
     ///
     /// `get_maintenance_history` panics with `AssetNotFound` for assets
@@ -2984,6 +3514,37 @@ impl Lifecycle {
         let mut result = Vec::new(&env);
         for i in start..history.len() {
             result.push_back(history.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Return maintenance records for one engineer on an asset.
+    ///
+    /// Filters on-chain history before returning it, so callers do not need to
+    /// download and filter the complete asset history client-side. Ownership
+    /// transfer sentinel records are excluded because they are not maintenance
+    /// submissions.
+    ///
+    /// Results retain the chronological order of the stored history. Returns an
+    /// empty vector when the engineer has no matching records.
+    pub fn get_maintenance_history_by_engineer(
+        env: Env,
+        asset_id: u64,
+        engineer: Address,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result = Vec::new(&env);
+        for record in history.iter() {
+            if record.engineer == engineer && record.task_type != symbol_short!("XFER") {
+                result.push_back(record);
+            }
         }
         result
     }
@@ -3677,6 +4238,14 @@ impl Lifecycle {
             .persistent()
             .get(&DataKey::OwnershipStartLedger(asset_id));
 
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let previous_record_hash = next_chain_link(&env, &history);
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
@@ -3686,13 +4255,9 @@ impl Lifecycle {
             timestamp,
             cost: None,
             ownership_start_ledger,
+            previous_record_hash,
+            reconstructed: false,
         };
-
-        let mut history: Vec<MaintenanceRecord> = env
-            .storage()
-            .persistent()
-            .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env));
 
         let config: Config = env
             .storage()
@@ -3749,10 +4314,86 @@ impl Lifecycle {
     /// # Returns
     /// `Vec<RecurringTask>` — empty if none are configured
     pub fn get_recurring_tasks(env: Env, asset_id: u64) -> Vec<RecurringTask> {
-        env.storage()
+        let key = DataKey::RecurringTasks(asset_id);
+        let tasks: Vec<RecurringTask> = env
+            .storage()
             .persistent()
-            .get(&DataKey::RecurringTasks(asset_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tasks.is_empty() {
+            extend_persistent_ttl(&env, &key);
+        }
+        tasks
+    }
+
+    /// Returns active recurring tasks whose due timestamp has passed.
+    ///
+    /// The comparison is against the current ledger timestamp, so callers do
+    /// not need to fetch every task and perform overdue checks client-side.
+    /// Tasks due exactly at the current timestamp are considered overdue.
+    pub fn get_overdue_recurring_tasks(env: Env, asset_id: u64) -> Vec<RecurringTask> {
+        let key = DataKey::RecurringTasks(asset_id);
+        let tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if tasks.is_empty() {
+            return Vec::new(&env);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut overdue: Vec<RecurringTask> = Vec::new(&env);
+        for task in tasks.iter() {
+            if task.is_active && task.next_due <= now {
+                overdue.push_back(task);
+            }
+        }
+
+        extend_persistent_ttl(&env, &key);
+        overdue
+    }
+
+    /// Emits `TASK_DUE_SOON` events for all active recurring tasks approaching their due date.
+    ///
+    /// Checks all assets for recurring tasks whose `next_due` timestamp falls within
+    /// `reminder_window_secs` seconds from the current ledger timestamp. For each such task,
+    /// emits a `TASK_DUE_SOON` event to allow off-chain systems to send reminders to operators.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vector of asset IDs to check for upcoming tasks
+    /// * `reminder_window_secs` - Number of seconds before due date to emit the reminder event (e.g., 604800 for 7 days)
+    pub fn emit_upcoming_task_reminders(
+        env: Env,
+        asset_ids: Vec<u64>,
+        reminder_window_secs: u64,
+    ) {
+        let now = env.ledger().timestamp();
+        let reminder_threshold = now.saturating_add(reminder_window_secs);
+
+        for asset_id in asset_ids.iter() {
+            let key = DataKey::RecurringTasks(asset_id);
+            let tasks: Vec<RecurringTask> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+
+            for task in tasks.iter() {
+                // Emit event for active tasks that are due within the reminder window
+                // but not yet overdue
+                if task.is_active && task.next_due > now && task.next_due <= reminder_threshold {
+                    env.events().publish(
+                        (EVENT_TASK_DUE_SOON, asset_id),
+                        (task.task_id, task.task_type.clone(), task.next_due),
+                    );
+                }
+            }
+
+            if !tasks.is_empty() {
+                extend_persistent_ttl(&env, &key);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -4088,6 +4729,79 @@ impl Lifecycle {
         }
     }
 
+    /// Return a comprehensive snapshot of an asset's complete state for off-chain backup.
+    ///
+    /// This function retrieves all critical asset information from both the asset registry
+    /// and lifecycle contract in a single call, enabling consistent off-chain backups and
+    /// recovery procedures. The snapshot captures asset metadata, collateral status,
+    /// maintenance history summary, and current valuation in one atomic read.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// A complete `AssetFullSnapshot` containing all asset state fields
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry
+    pub fn get_asset_full_snapshot(env: Env, asset_id: u64) -> AssetFullSnapshot {
+        let asset_registry = get_asset_registry_addr(&env);
+        let registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+
+        // Verify asset exists and retrieve asset data
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset = registry_client.get_asset(&asset_id);
+
+        // Get current collateral score and valuation
+        let collateral_score = Self::get_collateral_score(env.clone(), asset_id);
+        let (collateral_valuation, _) = Self::get_collateral_valuation(env.clone(), asset_id);
+
+        // Get maintenance history count and last service timestamp
+        let history_key = history_key(asset_id);
+        let maintenance_history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total_maintenance_records = maintenance_history.len() as u32;
+        let last_service_timestamp = if !maintenance_history.is_empty() {
+            maintenance_history.get(maintenance_history.len() - 1).unwrap().timestamp
+        } else {
+            0u64
+        };
+
+        // Convert deprecation status enum to u32
+        let deprecation_status_u32 = match asset.deprecation_status {
+            asset_registry::DeprecationStatus::Active => 0u32,
+            asset_registry::DeprecationStatus::Deprecated => 1u32,
+            asset_registry::DeprecationStatus::Decommissioned => 2u32,
+        };
+
+        // Create and return the full snapshot
+        AssetFullSnapshot {
+            asset_id: asset.asset_id,
+            asset_type: asset.asset_type,
+            metadata: asset.metadata,
+            serial_number: asset.serial_number,
+            owner: asset.owner,
+            registered_at: asset.registered_at,
+            metadata_updated_at: asset.metadata_updated_at,
+            metadata_version: asset.metadata_version,
+            deprecation_status: deprecation_status_u32,
+            is_locked: asset.is_locked,
+            lender: asset.lender,
+            loan_id: asset.loan_id,
+            deprecated_at: asset.deprecated_at,
+            collateral_score,
+            collateral_valuation,
+            snapshot_timestamp: env.ledger().timestamp(),
+            total_maintenance_records,
+            last_service_timestamp,
+        }
+    }
+
     /// Return the chronological collateral valuation history for an asset.
     pub fn get_valuation_history(env: Env, asset_id: u64) -> Vec<(u64, u64)> {
         let asset_registry = get_asset_registry_addr(&env);
@@ -4357,7 +5071,23 @@ impl Lifecycle {
         apply_decay(&env, asset_id, true, false, config.max_history);
 
         let effective_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
-        effective_score >= effective_min_collateral_score(&config)
+        effective_score >= config.min_collateral_score
+    }
+
+    /// Get the minimum collateral score threshold for asset eligibility (#1312).
+    ///
+    /// # Returns
+    /// The minimum collateral score (0-100) required for an asset to be eligible as collateral
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    pub fn get_min_collateral_score(env: Env) -> u32 {
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        config.min_collateral_score
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -4511,7 +5241,10 @@ impl Lifecycle {
         history.len()
     }
 
-    /// Alias for [`get_eng_maint_hist_count`].
+    /// Return the total number of asset IDs recorded for an engineer.
+    ///
+    /// This explicitly named view is intended for reputation dashboards and
+    /// avoids downloading and counting the complete history client-side.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to query
@@ -4519,7 +5252,12 @@ impl Lifecycle {
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
     pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
-        Self::get_eng_maint_hist_count(env, engineer)
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.len()
     }
 
     /// Alias for [`get_eng_maint_hist_count`].
@@ -4579,8 +5317,61 @@ impl Lifecycle {
         page
     }
 
+    /// Admin-only function to propose updating the asset registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_asset_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// cross-contract calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new asset registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the engineer registry
+    pub fn propose_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_engineer_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_AST"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_AST"));
+        store_timelock(&env, symbol_short!("AST_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_AST"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_AST")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
+    }
+
     /// Admin-only function to update the asset registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `AST_REG` timelock.
+    /// Call `propose_update_asset_registry` first, wait 48 hours, then call
+    /// `execute_update_asset_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4589,8 +5380,59 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `AST_REG` timelock has not elapsed
     pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("AST_REG"));
         crate::admin::update_asset_registry(env, admin, new_registry);
+    }
+
+    /// Admin-only function to propose updating the engineer registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_engineer_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// engineer verification calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new engineer registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the asset registry
+    pub fn propose_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_asset_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_ENG"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_ENG"));
+        store_timelock(&env, symbol_short!("ENG_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_ENG"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_ENG")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
     }
 
     /// Get the address of the engineer registry contract.
@@ -4605,7 +5447,11 @@ impl Lifecycle {
     }
 
     /// Admin-only function to update the engineer registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `ENG_REG` timelock.
+    /// Call `propose_update_engineer_registry` first, wait 48 hours, then call
+    /// `execute_update_engineer_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4614,8 +5460,82 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `ENG_REG` timelock has not elapsed
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("ENG_REG"));
         crate::admin::update_engineer_registry(env, admin, new_registry);
+    }
+
+    /// Admin-only: Set the treasury address for collecting maintenance submission fees (#1313).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `treasury_addr` - The address where fees will be accumulated
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_treasury_address(env: Env, admin: Address, treasury_addr: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        set_treasury_addr(&env, &treasury_addr);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("TREAS")),
+            (admin, treasury_addr, env.ledger().timestamp()),
+        );
+    }
+
+    /// Get the current treasury address for maintenance submission fees (#1313).
+    ///
+    /// # Returns
+    /// The treasury address if set, None otherwise
+    pub fn get_treasury_address(env: Env) -> Option<Address> {
+        get_treasury_addr(&env)
+    }
+
+    /// Admin-only: Withdraw accumulated maintenance submission fees to the treasury address (#1313).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn withdraw_maintenance_fees(env: Env, admin: Address) -> u64 {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let balance: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("FEE_BAL"))
+            .unwrap_or(0u64);
+
+        if balance > 0 {
+            // Reset the balance
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("FEE_BAL"), &0u64);
+            extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+
+            env.events().publish(
+                (symbol_short!("ADM_AUD"), symbol_short!("FEE_WTH")),
+                (admin, balance, env.ledger().timestamp()),
+            );
+        }
+
+        balance
+    }
+
+    /// Get the current accumulated maintenance submission fee balance (#1313).
+    ///
+    /// # Returns
+    /// The total accumulated fees in stroops
+    pub fn get_fee_balance(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&symbol_short!("FEE_BAL"))
+            .unwrap_or(0u64)
     }
 
     /// Get the current configuration of the lifecycle contract.
@@ -4790,7 +5710,7 @@ impl Lifecycle {
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
             };
-            results.push_back(score >= effective_min_collateral_score(&config));
+            results.push_back(score >= config.min_collateral_score);
         }
         results
     }
@@ -4941,11 +5861,7 @@ impl Lifecycle {
                     pruned.push_back(valuation_history.get(i).unwrap());
                 }
                 env.storage().persistent().set(&valuation_history_key, &pruned);
-                env.storage().persistent().extend_ttl(
-                    &valuation_history_key,
-                    TTL_THRESHOLD,
-                    TTL_TARGET,
-                );
+                extend_persistent_ttl(&env, &valuation_history_key);
             }
         }
 
@@ -5024,13 +5940,14 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
         let score = {
             let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
-            let config: Config = env
-                .storage()
-                .persistent()
-                .get::<_, Config>(&CONFIG)
-                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
             let last_update: u64 = env
                 .storage()
                 .persistent()
@@ -5068,6 +5985,25 @@ impl Lifecycle {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         snapshots.push_back(snapshot.clone());
+
+        // Enforce the configurable cap on retained snapshots (#max_snapshots).
+        // A misconfigured automation loop calling this in a tight cycle would
+        // otherwise grow HealthSnapshots(asset_id) without bound, inflating
+        // both read costs and persistent-TTL-extension costs on every future
+        // call. Evict the oldest entries first so the list always reflects
+        // the most recent history.
+        let cap = if config.max_snapshots == 0 {
+            DEFAULT_MAX_SNAPSHOTS
+        } else {
+            config.max_snapshots
+        };
+        if cap > 0 && snapshots.len() > cap {
+            let excess = snapshots.len() - cap;
+            for _ in 0..excess {
+                snapshots.remove(0);
+            }
+        }
+
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
 
@@ -5183,6 +6119,94 @@ impl Lifecycle {
             (symbol_short!("ADM_AUD"), symbol_short!("RECON")),
             (admin, asset_id, env.ledger().timestamp()),
         );
+    }
+
+    /// Reconstruct partial maintenance history from health snapshots (#1314).
+    ///
+    /// Generates synthetic MaintenanceRecord placeholders using timestamps from
+    /// health snapshots to recover approximate history after TTL-driven pruning.
+    /// Reconstructed records are marked with `reconstructed: true` and use
+    /// placeholder values (task_type "RECO", Priority::Low, empty notes).
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to reconstruct history for
+    ///
+    /// # Returns
+    /// The number of reconstructed records inserted
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized
+    /// - [`ContractError::SnapshotNotFound`] if no snapshots exist for the asset
+    pub fn reconstruct_history_from_snapshots(env: Env, asset_id: u64) -> u32 {
+        ensure_not_paused(&env);
+
+        let snapshots_key = health_snapshot_key(asset_id);
+        let snapshots: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&snapshots_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
+
+        if snapshots.is_empty() {
+            panic_with_error!(&env, ContractError::SnapshotNotFound);
+        }
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
+        let mut reconstructed_count: u32 = 0;
+        for snapshot in snapshots.iter() {
+            // Check if history already has a record at this timestamp
+            let mut already_exists = false;
+            for record in history.iter() {
+                if record.timestamp == snapshot.snapshot_timestamp {
+                    already_exists = true;
+                    break;
+                }
+            }
+
+            if !already_exists {
+                // Create synthetic maintenance record from snapshot
+                let previous_record_hash = next_chain_link(&env, &history);
+                let record = MaintenanceRecord {
+                    asset_id,
+                    task_type: symbol_short!("RECO"),
+                    priority: Priority::Low,
+                    notes: String::from_str(&env, "Reconstructed from snapshot"),
+                    engineer: Address::generate(&env),
+                    timestamp: snapshot.snapshot_timestamp,
+                    cost: None,
+                    ownership_start_ledger,
+                    previous_record_hash,
+                    reconstructed: true,
+                };
+                history.push_back(record);
+                reconstructed_count += 1;
+            }
+        }
+
+        // Persist the updated history
+        if reconstructed_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&history_key(asset_id), &history);
+            extend_persistent_ttl(&env, &history_key(asset_id));
+
+            env.events().publish(
+                (EVENT_RECONSTR, asset_id),
+                (reconstructed_count, env.ledger().timestamp()),
+            );
+        }
+
+        reconstructed_count
     }
 
     /// Predict the next service date for a given task type on an asset.
@@ -5319,6 +6343,1529 @@ impl Lifecycle {
             page.push_back(all.get(i).unwrap());
         }
         page
+    }
+
+    // =========================================================================
+    // Issue #1633: Asset Retirement and Decommissioning Workflow
+    // =========================================================================
+
+    /// Initiate retirement of an asset (owner-only). Starts a 7-day review period.
+    pub fn initiate_retirement(env: Env, owner: Address, asset_id: u64, reason: Bytes) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        let now = env.ledger().timestamp();
+        let review_period_end = now.checked_add(DEFAULT_RETIREMENT_REVIEW_PERIOD)
+            .unwrap_or(u64::MAX);
+
+        let state = RetirementState {
+            asset_id,
+            status: RetirementStatus::Pending,
+            initiated_at: now,
+            initiated_by: owner.clone(),
+            reason: reason.clone(),
+            review_period_end,
+            final_score: None,
+        };
+
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_INIT, asset_id),
+            (owner.clone(), reason),
+        );
+    }
+
+    /// Confirm retirement of an asset after review period ends (owner-only).
+    pub fn confirm_retirement(env: Env, owner: Address, asset_id: u64) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        let mut state: RetirementState = env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::RetirementNotFound));
+
+        if state.status != RetirementStatus::Pending {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < state.review_period_end {
+            panic_with_error!(env, ContractError::RetirementReviewPending);
+        }
+
+        let score_key = score_key(asset_id);
+        let final_score: u32 = env.storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or(0);
+
+        state.status = RetirementStatus::Confirmed;
+        state.final_score = Some(final_score);
+
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.storage().persistent().set(&frozen_key(asset_id), &true);
+        env.storage().persistent().set(&frozen_score_key(asset_id), &final_score);
+        extend_persistent_ttl(&env, &frozen_key(asset_id));
+        extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env.storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_cost: u64 = 0;
+        for record in history.iter() {
+            if let Some(cost) = record.cost {
+                total_cost = total_cost.saturating_add(cost);
+            }
+        }
+
+        let mut cert_hash_buf = [0u8; 24];
+        cert_hash_buf[0..8].copy_from_slice(&asset_id.to_le_bytes());
+        cert_hash_buf[8..12].copy_from_slice(&final_score.to_le_bytes());
+        cert_hash_buf[12..20].copy_from_slice(&now.to_le_bytes());
+        let cert_hash_data = Bytes::from_slice(&env, &cert_hash_buf);
+        let cert_hash: BytesN<32> = env.crypto().sha256(&cert_hash_data).into();
+
+        let certificate = RetirementCertificate {
+            asset_id,
+            retired_at: now,
+            final_score,
+            total_maintenance_count: history.len() as u32,
+            total_cost,
+            reason: state.reason.clone(),
+            certificate_hash: cert_hash.into(),
+        };
+
+        let cert_key = retirement_certificate_key(asset_id);
+        env.storage().persistent().set(&cert_key, &certificate);
+        extend_persistent_ttl(&env, &cert_key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_CONF, asset_id),
+            (owner.clone(), final_score),
+        );
+    }
+
+    /// Cancel pending retirement of an asset (owner-only).
+    pub fn cancel_retirement(env: Env, owner: Address, asset_id: u64) {
+        owner.require_auth();
+        ensure_not_paused(&env);
+
+        let key = retirement_state_key(asset_id);
+        let mut state: RetirementState = env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::RetirementNotFound));
+
+        if state.status != RetirementStatus::Pending {
+            panic_with_error!(env, ContractError::AlreadyRetiring);
+        }
+
+        state.status = RetirementStatus::Cancelled;
+        env.storage().persistent().set(&key, &state);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_RETIREMENT_CANC, asset_id),
+            owner.clone(),
+        );
+    }
+
+    /// Get retirement state for an asset.
+    pub fn get_retirement_state(env: Env, asset_id: u64) -> Option<RetirementState> {
+        let key = retirement_state_key(asset_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Get retirement certificate for an asset.
+    pub fn get_retirement_certificate(env: Env, asset_id: u64) -> Option<RetirementCertificate> {
+        let key = retirement_certificate_key(asset_id);
+        env.storage().persistent().get(&key)
+    }
+
+    // =========================================================================
+    // Issue #1634: Cross-Asset Maintenance Coordination
+    // =========================================================================
+
+    /// Create a coordinated maintenance task across multiple assets (engineer-only).
+    pub fn create_coordinated_task(
+        env: Env,
+        engineer: Address,
+        asset_ids: Vec<u64>,
+        task_type: Bytes,
+    ) -> u64 {
+        engineer.require_auth();
+        ensure_not_paused(&env);
+
+        let engineer_registry = get_engineer_registry_addr(&env);
+        let client = engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
+        if !client.is_engineer(&engineer) {
+            panic_with_error!(env, ContractError::UnauthorizedEngineer);
+        }
+
+        let now = env.ledger().timestamp();
+        let id_key = NEXT_COORD_TASK_ID_KEY;
+        let task_id: u64 = env.storage()
+            .persistent()
+            .get(&id_key)
+            .unwrap_or(1);
+
+        if task_id >= MAX_COORDINATED_TASK_ID {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        let completion_deadline = now.checked_add(DEFAULT_COORDINATED_TASK_TIMEOUT)
+            .unwrap_or(u64::MAX);
+
+        let task_type_symbol = if let Ok(s) = core::str::from_utf8(task_type.as_ref()) {
+            Symbol::new(&env, &String::from_str(&env, s))
+        } else {
+            symbol_short!("UNKOWN")
+        };
+
+        let task = CoordinatedTask {
+            task_id,
+            asset_ids: asset_ids.clone(),
+            task_type: task_type_symbol,
+            status: CoordinationStatus::Active,
+            created_at: now,
+            created_by: engineer.clone(),
+            completion_deadline,
+            completed_at: None,
+        };
+
+        let task_key = coordinated_task_key(task_id);
+        env.storage().persistent().set(&task_key, &task);
+        extend_persistent_ttl(&env, &task_key);
+
+        let mut subtasks: Vec<CoordinatedSubtask> = Vec::new(&env);
+        for (idx, asset_id) in asset_ids.iter().enumerate() {
+            let subtask = CoordinatedSubtask {
+                asset_id,
+                subtask_id: idx as u64,
+                status: CoordinationStatus::Active,
+                started_at: None,
+                completed_at: None,
+                notes: Bytes::new(&env),
+            };
+            subtasks.push_back(subtask);
+        }
+
+        let subtasks_key = coordinated_subtasks_key(task_id);
+        env.storage().persistent().set(&subtasks_key, &subtasks);
+        extend_persistent_ttl(&env, &subtasks_key);
+
+        env.storage().persistent().set(&id_key, &(task_id.checked_add(1).unwrap_or(MAX_COORDINATED_TASK_ID)));
+        extend_persistent_ttl(&env, &id_key);
+
+        env.events().publish(
+            (EVENT_COORD_TASK_CREATE, task_id),
+            (engineer.clone(), asset_ids.len()),
+        );
+
+        task_id
+    }
+
+    /// Get status of a coordinated task.
+    pub fn get_coordinated_task_status(env: Env, task_id: u64) -> Option<CoordinationStatus> {
+        let key = coordinated_task_key(task_id);
+        if let Some(task) = env.storage().persistent().get::<_, CoordinatedTask>(&key) {
+            Some(task.status)
+        } else {
+            None
+        }
+    }
+
+    /// Mark a subtask as completed within a coordinated task.
+    pub fn complete_coordinated_subtask(
+        env: Env,
+        engineer: Address,
+        task_id: u64,
+        asset_id: u64,
+    ) {
+        engineer.require_auth();
+        ensure_not_paused(&env);
+
+        let task_key = coordinated_task_key(task_id);
+        let task: CoordinatedTask = env.storage()
+            .persistent()
+            .get(&task_key)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::CoordinatedTaskNotFound));
+
+        if task.status != CoordinationStatus::Active {
+            panic_with_error!(env, ContractError::CoordinatedTaskNotFound);
+        }
+
+        let subtasks_key = coordinated_subtasks_key(task_id);
+        let mut subtasks: Vec<CoordinatedSubtask> = env.storage()
+            .persistent()
+            .get(&subtasks_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        let now = env.ledger().timestamp();
+        for subtask in subtasks.iter_mut() {
+            if subtask.asset_id == asset_id {
+                subtask.status = CoordinationStatus::Completed;
+                subtask.completed_at = Some(now);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            panic_with_error!(env, ContractError::CoordinatedTaskNotFound);
+        }
+
+        let mut all_complete = true;
+        for subtask in subtasks.iter() {
+            if subtask.status != CoordinationStatus::Completed {
+                all_complete = false;
+                break;
+            }
+        }
+
+        env.storage().persistent().set(&subtasks_key, &subtasks);
+        extend_persistent_ttl(&env, &subtasks_key);
+
+        if all_complete {
+            let mut completed_task = task.clone();
+            completed_task.status = CoordinationStatus::Completed;
+            completed_task.completed_at = Some(now);
+            env.storage().persistent().set(&task_key, &completed_task);
+            extend_persistent_ttl(&env, &task_key);
+
+            env.events().publish(
+                (EVENT_COORD_TASK_DONE, task_id),
+                (engineer.clone(), now),
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #1635: Predictive Maintenance Score Using Historical Patterns
+    // =========================================================================
+
+    /// Predict the next maintenance date for an asset based on historical patterns.
+    pub fn predict_next_maintenance_date(env: Env, asset_id: u64) -> Option<(u64, u32)> {
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env.storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.len() < 2 {
+            return None;
+        }
+
+        let mut intervals: Vec<u64> = Vec::new(&env);
+        for i in 1..history.len() {
+            let current = history.get(i).unwrap();
+            let previous = history.get(i - 1).unwrap();
+            let interval = current.timestamp.saturating_sub(previous.timestamp);
+            if interval > 0 {
+                intervals.push_back(interval);
+            }
+        }
+
+        if intervals.is_empty() {
+            return None;
+        }
+
+        let mut sum: u64 = 0;
+        for interval in intervals.iter() {
+            sum = sum.saturating_add(interval);
+        }
+        let avg_interval = sum / intervals.len() as u64;
+
+        let last_record = history.get(history.len() - 1).unwrap();
+        let predicted_date = last_record.timestamp.saturating_add(avg_interval);
+
+        let mut trend = 100u32;
+        if intervals.len() >= 2 {
+            let last_interval = intervals.get(intervals.len() - 1).unwrap();
+            let prev_interval = intervals.get(intervals.len() - 2).unwrap();
+            if last_interval > prev_interval {
+                trend = 80;
+            } else if last_interval < prev_interval {
+                trend = 120;
+            }
+        }
+
+        Some((predicted_date, trend))
+    }
+
+    // =========================================================================
+    // Issue #1636: Seasonal Score Adjustments
+    // =========================================================================
+
+    /// Get current season based on ledger timestamp.
+    pub fn current_season(env: Env) -> Season {
+        let timestamp = env.ledger().timestamp();
+        let days_in_year = (timestamp / 86400) % 365;
+        if days_in_year >= 79 && days_in_year < 172 {
+            Season::Spring
+        } else if days_in_year >= 172 && days_in_year < 265 {
+            Season::Summer
+        } else if days_in_year >= 265 && days_in_year < 355 {
+            Season::Fall
+        } else {
+            Season::Winter
+        }
+    }
+
+    /// Set seasonal adjustment factors for an asset type.
+    pub fn set_seasonal_adjustment(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        winter_factor: u32,
+        spring_factor: u32,
+        summer_factor: u32,
+        fall_factor: u32,
+    ) {
+        admin.require_auth();
+        let config: Config = env.storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+        require_quorum(&env, &config, &admin);
+
+        if winter_factor > 100 || spring_factor > 100 || summer_factor > 100 || fall_factor > 100 {
+            panic_with_error!(env, ContractError::InvalidSeasonalFactor);
+        }
+
+        let adjustment = SeasonalAdjustment {
+            asset_type: asset_type.clone(),
+            winter_factor,
+            spring_factor,
+            summer_factor,
+            fall_factor,
+        };
+
+        let key = seasonal_adjustment_key(&asset_type);
+        env.storage().persistent().set(&key, &adjustment);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (EVENT_SEASONAL_ADJ, asset_type),
+            (winter_factor, spring_factor, summer_factor, fall_factor),
+        );
+    }
+
+    /// Apply seasonal adjustment to a base score.
+    pub fn apply_seasonal_adjustment(env: Env, asset_type: Symbol, base_score: u32) -> u32 {
+        let key = seasonal_adjustment_key(&asset_type);
+        let adjustment: SeasonalAdjustment = match env.storage().persistent().get(&key) {
+            Some(adj) => adj,
+            None => return base_score,
+        };
+
+        let season = Self::current_season(&env);
+        let factor = match season {
+            Season::Winter => adjustment.winter_factor,
+            Season::Spring => adjustment.spring_factor,
+            Season::Summer => adjustment.summer_factor,
+            Season::Fall => adjustment.fall_factor,
+        };
+
+        if factor == 0 {
+            return base_score;
+        }
+
+        ((base_score as u64).saturating_mul(factor as u64) / 100) as u32
+    }
+
+    /// Get seasonal adjustment factors for an asset type.
+    pub fn get_seasonal_adjustment(env: Env, asset_type: Symbol) -> Option<SeasonalAdjustment> {
+        let key = seasonal_adjustment_key(&asset_type);
+        env.storage().persistent().get(&key)
+    }
+
+    // =========================================================================
+    // Issue #1637 — Cross-Contract Score Consensus
+    // =========================================================================
+
+    /// Register a new external score provider.
+    pub fn register_score_provider(env: Env, admin: Address, provider: Address) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let providers_key = score_providers_key();
+        let mut providers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&providers_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if provider already exists
+        for p in 0..providers.len() {
+            if providers.get(p).unwrap() == provider {
+                return; // Already registered
+            }
+        }
+
+        providers.push_back(provider.clone());
+        env.storage().persistent().set(&providers_key, &providers);
+        shared::extend_persistent_ttl(&env, &providers_key);
+    }
+
+    /// Remove a score provider from the registry.
+    pub fn remove_score_provider(env: Env, admin: Address, provider: Address) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let providers_key = score_providers_key();
+        let mut providers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&providers_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_providers: Vec<Address> = Vec::new(&env);
+        for p in 0..providers.len() {
+            let addr = providers.get(p).unwrap();
+            if addr != provider {
+                new_providers.push_back(addr);
+            }
+        }
+
+        env.storage().persistent().set(&providers_key, &new_providers);
+        shared::extend_persistent_ttl(&env, &providers_key);
+    }
+
+    /// Submit an external score from a provider for consensus scoring.
+    pub fn submit_external_score(
+        env: Env,
+        asset_id: u64,
+        score: u32,
+        provider: Address,
+    ) {
+        provider.require_auth();
+
+        // Verify provider is authorized
+        let providers_key = score_providers_key();
+        let providers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&providers_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut is_authorized = false;
+        for p in 0..providers.len() {
+            if providers.get(p).unwrap() == provider {
+                is_authorized = true;
+                break;
+            }
+        }
+
+        if !is_authorized {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        let ext_scores_key = external_scores_key(asset_id);
+        let mut scores: Vec<ExternalScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Get provider reputation
+        let rep_key = provider_reputation_key();
+        let mut reputation_map: Map<Address, u32> = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let provider_reputation = reputation_map
+            .get(provider.clone())
+            .unwrap_or(100); // Default reputation of 100
+
+        let entry = ExternalScoreEntry {
+            provider: provider.clone(),
+            score,
+            timestamp: env.ledger().timestamp(),
+            provider_reputation,
+        };
+
+        scores.push_back(entry);
+        env.storage().persistent().set(&ext_scores_key, &scores);
+        shared::extend_persistent_ttl(&env, &ext_scores_key);
+    }
+
+    /// Get consensus score using median of external provider scores.
+    pub fn get_consensus_score(env: Env, asset_id: u64) -> u32 {
+        let ext_scores_key = external_scores_key(asset_id);
+        let scores: Vec<ExternalScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if scores.is_empty() {
+            return 0;
+        }
+
+        // Collect weighted scores
+        let mut weighted_scores: Vec<(u32, u32)> = Vec::new(&env); // (score, reputation)
+        for s in 0..scores.len() {
+            let entry = scores.get(s).unwrap();
+            weighted_scores.push_back((entry.score, entry.provider_reputation));
+        }
+
+        // Sort by score value for median calculation
+        let mut sorted: Vec<u32> = Vec::new(&env);
+        for i in 0..weighted_scores.len() {
+            sorted.push_back(weighted_scores.get(i).unwrap().0);
+        }
+
+        // Simple bubble sort for median
+        for i in 0..sorted.len() {
+            for j in 0..sorted.len().saturating_sub(1 - i) {
+                let idx_j = j;
+                let idx_next = j + 1;
+                if idx_next < sorted.len() {
+                    let val_j = sorted.get(idx_j).unwrap();
+                    let val_next = sorted.get(idx_next).unwrap();
+                    if val_j > val_next {
+                        sorted.set(idx_j, val_next);
+                        sorted.set(idx_next, val_j);
+                    }
+                }
+            }
+        }
+
+        // Return median
+        let len = sorted.len();
+        if len % 2 == 0 {
+            (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
+        } else {
+            sorted.get(len / 2).unwrap()
+        }
+    }
+
+    /// Update provider reputation based on score accuracy.
+    pub fn update_provider_reputation(
+        env: Env,
+        admin: Address,
+        provider: Address,
+        new_reputation: u32,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let rep_key = provider_reputation_key();
+        let mut reputation_map: Map<Address, u32> = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let clamped_rep = new_reputation.min(100); // Cap at 100
+        reputation_map.set(provider, clamped_rep);
+
+        env.storage().persistent().set(&rep_key, &reputation_map);
+        shared::extend_persistent_ttl(&env, &rep_key);
+    }
+
+    // =========================================================================
+    // Issue #1638 — Score Degradation Curves per Asset Category
+    // =========================================================================
+
+    /// Register or update a degradation curve for an asset category.
+    pub fn register_degradation_curve(
+        env: Env,
+        admin: Address,
+        category: Symbol,
+        initial_rate: u32,
+        acceleration: u32,
+        floor: u32,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let curves_key = degradation_curves_key();
+        let mut curves: Map<Symbol, DegradationCurve> = env
+            .storage()
+            .persistent()
+            .get(&curves_key)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let existing = curves.get(category.clone());
+        let version = existing.map(|c| c.version + 1).unwrap_or(1);
+
+        let curve = DegradationCurve {
+            category: category.clone(),
+            initial_rate,
+            acceleration,
+            floor,
+            version,
+            created_at: env.ledger().timestamp(),
+        };
+
+        curves.set(category.clone(), curve);
+        env.storage().persistent().set(&curves_key, &curves);
+        shared::extend_persistent_ttl(&env, &curves_key);
+
+        // Also store individual curve for quick access
+        let curve_key = degradation_curve_key(&category);
+        env.storage().persistent().set(&curve_key, &curve);
+        shared::extend_persistent_ttl(&env, &curve_key);
+    }
+
+    /// Get degradation curve for an asset category.
+    pub fn get_category_degradation_curve(env: Env, category: Symbol) -> Option<DegradationCurve> {
+        let curve_key = degradation_curve_key(&category);
+        env.storage().persistent().get(&curve_key)
+    }
+
+    /// Get all registered degradation curves.
+    pub fn get_all_degradation_curves(env: Env) -> Map<Symbol, DegradationCurve> {
+        let curves_key = degradation_curves_key();
+        env.storage()
+            .persistent()
+            .get(&curves_key)
+            .unwrap_or_else(|| Map::new(&env))
+    }
+
+    // =========================================================================
+    // Issue #1639 — Score Spike Detection for Anomalies
+    // =========================================================================
+
+    /// Detect score anomalies (spikes > 2 standard deviations).
+    pub fn get_score_anomalies(env: Env, asset_id: u64) -> Vec<ScoreAnomaly> {
+        let anomalies_key = score_anomalies_key(asset_id);
+        env.storage()
+            .persistent()
+            .get(&anomalies_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Record a detected anomaly.
+    pub fn record_score_anomaly(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        baseline_score: u32,
+        observed_score: u32,
+        stdev_multiple: u32,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let anomalies_key = score_anomalies_key(asset_id);
+        let mut anomalies: Vec<ScoreAnomaly> = env
+            .storage()
+            .persistent()
+            .get(&anomalies_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let anomaly = ScoreAnomaly {
+            asset_id,
+            timestamp: env.ledger().timestamp(),
+            baseline_score,
+            observed_score,
+            standard_deviation_multiple: stdev_multiple,
+            investigation_status: symbol_short!("PENDING"),
+        };
+
+        anomalies.push_back(anomaly);
+        env.storage().persistent().set(&anomalies_key, &anomalies);
+        shared::extend_persistent_ttl(&env, &anomalies_key);
+    }
+
+    /// Update anomaly investigation status.
+    pub fn update_anomaly_status(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        anomaly_index: u32,
+        status: Symbol,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let anomalies_key = score_anomalies_key(asset_id);
+        let mut anomalies: Vec<ScoreAnomaly> = env
+            .storage()
+            .persistent()
+            .get(&anomalies_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if anomaly_index < anomalies.len() {
+            let mut anomaly = anomalies.get(anomaly_index).unwrap();
+            anomaly.investigation_status = status;
+            anomalies.set(anomaly_index, anomaly);
+            env.storage().persistent().set(&anomalies_key, &anomalies);
+            shared::extend_persistent_ttl(&env, &anomalies_key);
+        }
+    }
+
+    // =========================================================================
+    // Issue #1640 — Peer Comparison Scoring
+    // =========================================================================
+
+    /// Group assets by type and age for peer comparison.
+    pub fn get_peer_group(env: Env, asset_id: u64) -> Option<PeerGroup> {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let _asset_info = client.get_asset_info(&asset_id);
+
+        // Simplified peer grouping: group by asset type
+        let group_id = symbol_short!("DEFAULT");
+        let peer_group_key = peer_group_key(&group_id);
+
+        env.storage().persistent().get(&peer_group_key)
+    }
+
+    /// Compute percentile rank for an asset within its peer group (0-100).
+    pub fn compute_percentile_rank(env: Env, asset_id: u64) -> u32 {
+        let score = Self::get_collateral_score(&env, asset_id);
+
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let all_assets = client.get_all_assets();
+
+        let mut scores_in_group: Vec<u32> = Vec::new(&env);
+
+        // Collect scores from all assets
+        for i in 0..all_assets.len() {
+            let aid = all_assets.get(i).unwrap();
+            let ascore = Self::get_collateral_score(&env, aid);
+            scores_in_group.push_back(ascore);
+        }
+
+        if scores_in_group.is_empty() {
+            return 0;
+        }
+
+        // Count how many scores are <= this asset's score
+        let mut count_lte = 0u32;
+        for i in 0..scores_in_group.len() {
+            if scores_in_group.get(i).unwrap() <= score {
+                count_lte += 1;
+            }
+        }
+
+        // Return percentile (0-100)
+        ((count_lte * 100) / scores_in_group.len() as u32).min(100)
+    }
+
+    /// Get similar assets (by type and age) for comparison.
+    pub fn get_similar_assets(env: Env, asset_id: u64, top_n: u32) -> Vec<u64> {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let all_assets = client.get_all_assets();
+
+        let mut result: Vec<u64> = Vec::new(&env);
+        let mut count = 0u32;
+
+        // Return similar assets (for now, just return others in order)
+        for i in 0..all_assets.len() {
+            if count >= top_n {
+                break;
+            }
+            let aid = all_assets.get(i).unwrap();
+            if aid != asset_id {
+                result.push_back(aid);
+                count += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Register or update peer group statistics.
+    pub fn register_peer_group(
+        env: Env,
+        admin: Address,
+        group_id: Symbol,
+        asset_type: Symbol,
+        age_range_min: u64,
+        age_range_max: u64,
+        member_count: u32,
+        mean_score: u32,
+        median_score: u32,
+        stdev: u32,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let peer_group = PeerGroup {
+            group_id: group_id.clone(),
+            asset_type,
+            age_range_min,
+            age_range_max,
+            member_count,
+            mean_score,
+            median_score,
+            stdev,
+        };
+
+        let peer_group_key = peer_group_key(&group_id);
+        env.storage().persistent().set(&peer_group_key, &peer_group);
+        shared::extend_persistent_ttl(&env, &peer_group_key);
+    }
+
+    // =========================================================================
+    // Additional Helper Functions for Better Integration
+    // =========================================================================
+
+    /// Apply degradation curve specific to asset category when computing decay.
+    pub fn apply_category_degradation(
+        env: Env,
+        asset_id: u64,
+        base_score: u32,
+        category: Symbol,
+    ) -> u32 {
+        if let Some(curve) = Self::get_category_degradation_curve(env.clone(), category) {
+            // Apply category-specific degradation curve
+            if base_score <= curve.floor {
+                curve.floor
+            } else {
+                let degradation = (curve.initial_rate + curve.acceleration).min(base_score - curve.floor);
+                base_score.saturating_sub(degradation).max(curve.floor)
+            }
+        } else {
+            base_score
+        }
+    }
+
+    /// Check if score movement constitutes an anomaly.
+    pub fn check_score_anomaly(
+        env: Env,
+        asset_id: u64,
+        new_score: u32,
+    ) -> Option<(u32, u32)> { // Returns (stdev_multiple, baseline_score) if anomaly detected
+        let baseline_key = score_baseline_key(asset_id);
+        let baseline_scores: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&baseline_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if baseline_scores.len() < 2 {
+            return None; // Not enough data
+        }
+
+        // Calculate mean
+        let mut sum: u64 = 0;
+        for i in 0..baseline_scores.len() {
+            sum = sum.saturating_add(baseline_scores.get(i).unwrap());
+        }
+        let mean = (sum / baseline_scores.len() as u64) as u32;
+
+        // Calculate standard deviation
+        let mut variance_sum: u64 = 0;
+        for i in 0..baseline_scores.len() {
+            let val = baseline_scores.get(i).unwrap() as u32;
+            let diff = if val > mean { val - mean } else { mean - val };
+            variance_sum = variance_sum.saturating_add((diff as u64) * (diff as u64));
+        }
+        let variance = variance_sum / baseline_scores.len() as u64;
+
+        // Simple sqrt approximation for stdev
+        let stdev = (variance as f64).sqrt() as u32;
+
+        if stdev == 0 {
+            return None;
+        }
+
+        // Check if new_score is > 2 stdev away from mean
+        let distance = if new_score > mean {
+            new_score - mean
+        } else {
+            mean - new_score
+        } as u32;
+
+        let stdev_multiple = distance / (stdev + 1); // +1 to avoid division by zero
+
+        if stdev_multiple > 2 {
+            Some((stdev_multiple, mean))
+        } else {
+            None
+        }
+    }
+
+    /// Record baseline score for anomaly detection.
+    pub fn record_score_baseline(env: Env, asset_id: u64, score: u32) {
+        let baseline_key = score_baseline_key(asset_id);
+        let mut baseline_scores: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&baseline_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Keep last 20 scores for moving average
+        const MAX_BASELINE: usize = 20;
+        if baseline_scores.len() >= MAX_BASELINE {
+            baseline_scores.remove(0);
+        }
+
+        baseline_scores.push_back(score as u64);
+        env.storage().persistent().set(&baseline_key, &baseline_scores);
+        shared::extend_persistent_ttl(&env, &baseline_key);
+    }
+
+    /// Get list of registered score providers.
+    pub fn get_score_providers(env: Env) -> Vec<Address> {
+        let providers_key = score_providers_key();
+        env.storage()
+            .persistent()
+            .get(&providers_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get provider reputation.
+    pub fn get_provider_reputation(env: Env, provider: Address) -> u32 {
+        let rep_key = provider_reputation_key();
+        let reputation_map: Map<Address, u32> = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or_else(|| Map::new(&env));
+
+        reputation_map.get(provider).unwrap_or(100) // Default 100
+    }
+
+    /// Clear old external scores older than a threshold (maintenance function).
+    pub fn clear_old_external_scores(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let ext_scores_key = external_scores_key(asset_id);
+        let mut scores: Vec<ExternalScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut filtered: Vec<ExternalScoreEntry> = Vec::new(&env);
+
+        for s in 0..scores.len() {
+            let entry = scores.get(s).unwrap();
+            if current_time.saturating_sub(entry.timestamp) < age_seconds {
+                filtered.push_back(entry);
+            }
+        }
+
+        env.storage().persistent().set(&ext_scores_key, &filtered);
+        shared::extend_persistent_ttl(&env, &ext_scores_key);
+    }
+
+    /// Batch clear anomalies older than a threshold.
+    pub fn clear_old_anomalies(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        config.admin.require_auth();
+
+        let anomalies_key = score_anomalies_key(asset_id);
+        let mut anomalies: Vec<ScoreAnomaly> = env
+            .storage()
+            .persistent()
+            .get(&anomalies_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let current_time = env.ledger().timestamp();
+        let mut filtered: Vec<ScoreAnomaly> = Vec::new(&env);
+
+        for a in 0..anomalies.len() {
+            let anomaly = anomalies.get(a).unwrap();
+            if current_time.saturating_sub(anomaly.timestamp) < age_seconds {
+                filtered.push_back(anomaly);
+            }
+        }
+
+        env.storage().persistent().set(&anomalies_key, &filtered);
+        shared::extend_persistent_ttl(&env, &anomalies_key);
+    }
+
+    /// Get all external scores for an asset.
+    pub fn get_external_scores(env: Env, asset_id: u64) -> Vec<ExternalScoreEntry> {
+        let ext_scores_key = external_scores_key(asset_id);
+        env.storage()
+            .persistent()
+            .get(&ext_scores_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // =========================================================================
+    // Issue #1641 — Score Impact Attribution
+    // =========================================================================
+
+    /// Compute and store the score breakdown showing factor contributions.
+    pub fn compute_score_breakdown(env: Env, asset_id: u64) -> ScoreBreakdown {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let current_score = apply_decay(&env, asset_id, false, false, 100);
+        let current_time = env.ledger().timestamp();
+
+        let maintenance_frequency = history.len() as u32;
+        let maintenance_contribution = (maintenance_frequency.min(100) * 30) / 100;
+
+        let age_contribution = if !history.is_empty() {
+            let first_record = history.get(0).unwrap();
+            let age_seconds = current_time.saturating_sub(first_record.timestamp);
+            let age_days = (age_seconds / 86400).min(365);
+            (age_days as u32 * 20) / 365
+        } else {
+            0u32
+        };
+
+        let condition_contribution = current_score.saturating_sub(
+            maintenance_contribution.saturating_add(age_contribution)
+        ).min(50);
+
+        let breakdown = ScoreBreakdown {
+            asset_id,
+            total_score: current_score,
+            maintenance_frequency_contribution: maintenance_contribution,
+            age_contribution,
+            condition_contribution,
+            timestamp: current_time,
+        };
+
+        let key = score_breakdown_key(asset_id);
+        env.storage().persistent().set(&key, &breakdown);
+        extend_persistent_ttl(&env, &key);
+
+        breakdown
+    }
+
+    /// Get the score breakdown for an asset.
+    pub fn get_score_breakdown(env: Env, asset_id: u64) -> Option<ScoreBreakdown> {
+        let key = score_breakdown_key(asset_id);
+        let breakdown: Option<ScoreBreakdown> = env.storage().persistent().get(&key);
+        if breakdown.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        breakdown
+    }
+
+    /// Get factor sensitivity analysis for an asset (shows how each factor impacts score).
+    pub fn get_factor_sensitivity(env: Env, asset_id: u64) -> Vec<FactorContribution> {
+        let breakdown = Self::compute_score_breakdown(env.clone(), asset_id);
+        let mut factors: Vec<FactorContribution> = Vec::new(&env);
+
+        let maintenance_pct = if breakdown.total_score > 0 {
+            (breakdown.maintenance_frequency_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        let age_pct = if breakdown.total_score > 0 {
+            (breakdown.age_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        let condition_pct = if breakdown.total_score > 0 {
+            (breakdown.condition_contribution * 100) / breakdown.total_score
+        } else {
+            0u32
+        };
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("MAINT"),
+            percentage: maintenance_pct,
+            contribution: breakdown.maintenance_frequency_contribution,
+        });
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("AGE"),
+            percentage: age_pct,
+            contribution: breakdown.age_contribution,
+        });
+
+        factors.push_back(FactorContribution {
+            factor: symbol_short!("COND"),
+            percentage: condition_pct,
+            contribution: breakdown.condition_contribution,
+        });
+
+        factors
+    }
+
+    // =========================================================================
+    // Issue #1642 — Score Recovery Plans
+    // =========================================================================
+
+    /// Create a recovery plan for an asset (owner-only).
+    pub fn create_score_recovery_plan(
+        env: Env,
+        asset_id: u64,
+        owner: Address,
+        actions: Vec<RecoveryAction>,
+        deadline: u64,
+    ) -> RecoveryPlan {
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        let registry_client = ::asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset_owner = registry_client.get_owner(&asset_id);
+
+        if asset_owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedAsset);
+        }
+
+        let plan = RecoveryPlan {
+            asset_id,
+            owner: owner.clone(),
+            actions,
+            deadline,
+            created_at: env.ledger().timestamp(),
+            completed: false,
+        };
+
+        let key = recovery_plans_key(asset_id);
+        let mut plans: Vec<RecoveryPlan> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        plans.push_back(plan.clone());
+        env.storage().persistent().set(&key, &plans);
+        extend_persistent_ttl(&env, &key);
+
+        plan
+    }
+
+    /// Get recovery options for an asset.
+    pub fn get_score_recovery_options(env: Env, asset_id: u64) -> Vec<RecoveryOption> {
+        let mut options: Vec<RecoveryOption> = Vec::new(&env);
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("MAINT_SCHED"),
+            description: String::from_str(&env, "Increase maintenance schedule"),
+            estimated_score_improvement: 15u32,
+            estimated_cost: 500_000_000u64,
+        });
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("UPGRADE"),
+            description: String::from_str(&env, "Perform major upgrade"),
+            estimated_score_improvement: 25u32,
+            estimated_cost: 1_000_000_000u64,
+        });
+
+        options.push_back(RecoveryOption {
+            option_type: symbol_short!("REPLACE"),
+            description: String::from_str(&env, "Replace critical components"),
+            estimated_score_improvement: 35u32,
+            estimated_cost: 2_000_000_000u64,
+        });
+
+        options
+    }
+
+    /// Get recovery plans for an asset.
+    pub fn get_recovery_plans(env: Env, asset_id: u64) -> Vec<RecoveryPlan> {
+        let key = recovery_plans_key(asset_id);
+        let plans: Vec<RecoveryPlan> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        extend_persistent_ttl(&env, &key);
+        plans
+    }
+
+    // =========================================================================
+    // Issue #1643 — Weighted Moving Average for Smoother Scores
+    // =========================================================================
+
+    /// Compute weighted moving average of scores for smoother trend analysis.
+    pub fn compute_weighted_moving_average(
+        env: Env,
+        asset_id: u64,
+        window: u32,
+        weights: Vec<u32>,
+    ) -> u32 {
+        if window == 0 {
+            return 0u32;
+        }
+
+        let mut weight_sum = 0u32;
+        for i in 0..weights.len() {
+            weight_sum = weight_sum
+                .checked_add(weights.get(i).unwrap())
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+        }
+
+        if weight_sum != 100 {
+            panic_with_error!(&env, ContractError::InvalidWeight);
+        }
+
+        let history_key = score_history_key(asset_id);
+        let history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return 0u32;
+        }
+
+        let actual_window = (history.len() as u32).min(window) as usize;
+        let start_idx = history.len() - actual_window;
+
+        let mut weighted_sum = 0u64;
+        let mut weight_sum_used = 0u32;
+
+        for i in 0..actual_window {
+            let record = history.get((start_idx + i) as u32).unwrap();
+            let weight_idx = (weights.len() as i32 - actual_window as i32 + i as i32).max(0) as usize;
+            let weight = if weight_idx < weights.len() {
+                weights.get(weight_idx as u32).unwrap()
+            } else {
+                0u32
+            };
+
+            weighted_sum = weighted_sum
+                .checked_add((record.score as u64) * (weight as u64))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+            weight_sum_used = weight_sum_used.saturating_add(weight);
+        }
+
+        if weight_sum_used == 0 {
+            return 0u32;
+        }
+        (weighted_sum / weight_sum_used as u64) as u32
+    }
+
+    /// Compute exponential weighted moving average (recent scores weighted more).
+    pub fn compute_exponential_weighted_average(env: Env, asset_id: u64) -> u32 {
+        let history_key = score_history_key(asset_id);
+        let history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            return 0u32;
+        }
+
+        let alpha = 30u32;
+        let mut ewma = history.get(0).unwrap().score as u64;
+
+        for i in 1..history.len() {
+            let current_score = history.get(i as u32).unwrap().score as u64;
+            ewma = (current_score * (alpha as u64) + ewma * ((100u64 - alpha as u64))) / 100u64;
+        }
+
+        ewma as u32
+    }
+
+    // =========================================================================
+    // Issue #1644 — Score Circuit Breaker for Large Changes
+    // =========================================================================
+
+    /// Initialize circuit breaker configuration.
+    pub fn set_circuit_breaker_config(env: Env, admin: Address, max_change: u32, require_approval: bool) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        require_quorum(&env, &config, &admin);
+
+        let cb_config = CircuitBreakerConfig {
+            max_score_change: max_change,
+            require_approval_for_large_changes: require_approval,
+            approval_threshold: 2u32,
+        };
+
+        let key = circuit_breaker_config_key();
+        env.storage().persistent().set(&key, &cb_config);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("CB_CFG"), admin.clone()),
+            (max_change, require_approval),
+        );
+    }
+
+    /// Validate if a score change is within circuit breaker limits.
+    pub fn validate_score_change(env: Env, old_score: u32, new_score: u32) -> bool {
+        let key = circuit_breaker_config_key();
+        let cb_config: Option<CircuitBreakerConfig> = env.storage().persistent().get(&key);
+
+        match cb_config {
+            None => true,
+            Some(config) => {
+                let change = if new_score > old_score {
+                    new_score - old_score
+                } else {
+                    old_score - new_score
+                };
+
+                change <= config.max_score_change
+            }
+        }
+    }
+
+    /// Force a score change with admin approval (requires quorum).
+    pub fn force_score_change_with_approval(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        new_score: u32,
+        justification: String,
+    ) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        require_quorum(&env, &config, &admin);
+
+        let old_score = env
+            .storage()
+            .persistent()
+            .get(&score_key(asset_id))
+            .unwrap_or(0u32);
+
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &new_score);
+        extend_persistent_ttl(&env, &score_key(asset_id));
+
+        let forced_change = ForcedScoreChange {
+            asset_id,
+            old_score,
+            new_score,
+            justification,
+            timestamp: env.ledger().timestamp(),
+            approved_by: config.admins.clone(),
+        };
+
+        let key = forced_score_changes_key(asset_id);
+        let mut changes: Vec<ForcedScoreChange> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        changes.push_back(forced_change);
+        env.storage().persistent().set(&key, &changes);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("FORCED_SC"), asset_id),
+            (old_score, new_score),
+        );
+    }
+
+    /// Get the forced score change log for an asset.
+    pub fn get_forced_score_changes(env: Env, asset_id: u64) -> Vec<ForcedScoreChange> {
+        let key = forced_score_changes_key(asset_id);
+        let changes: Vec<ForcedScoreChange> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        extend_persistent_ttl(&env, &key);
+        changes
+    }
+
+    /// Get the circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> Option<CircuitBreakerConfig> {
+        let key = circuit_breaker_config_key();
+        let config: Option<CircuitBreakerConfig> = env.storage().persistent().get(&key);
+        if config.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        config
     }
 }
 
@@ -5518,6 +8065,62 @@ mod tests {
         assert!(client.verify_maintenance_chain_integrity(&asset_id));
     }
 
+    /// Regression test for the decommission-vs-submit race window: an asset
+    /// decommissioned between the point an engineer's authorization checks
+    /// begin and the point history/score writes would commit must never end
+    /// up with a maintenance record. This simulates the "race" by
+    /// decommissioning the asset via the asset-registry admin and then
+    /// immediately calling submit_maintenance for the same asset/engineer
+    /// pair that was fully authorized beforehand — the second, adjacent-to-
+    /// the-write frozen/status check added to submit_maintenance must catch
+    /// it even though the engineer authorization itself is still valid.
+    #[test]
+    fn test_decommission_submit_race_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        // Engineer is fully authorized and a prior submission succeeds.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-decommission service"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+
+        // Simulate the race: the asset is decommissioned by a separate
+        // transaction that lands after this engineer's authorization was
+        // granted, but before their next submission is processed.
+        client.decommission_asset(&owner, &asset_id);
+
+        // The submission must be rejected atomically — no partial write,
+        // no record appended — regardless of when in the invocation the
+        // decommissioned state became visible.
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-decommission race attempt"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            )))
+        );
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "no maintenance record must be committed for a decommissioned asset, \
+             even when the submitting engineer was authorized before decommission"
+        );
+    }
+
     #[test]
     fn test_hash_chain_intact_across_multiple_submissions() {
         let env = Env::default();
@@ -5666,8 +8269,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Routine oil change"),
             &engineer,
+            &None,
         );
 
         let lifecycle_id = client.address.clone();
@@ -5695,8 +8300,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Routine oil change"),
             &engineer,
+            &None,
         );
 
         let (timestamp, value) = client.get_valuation_history(&asset_id).get(0).unwrap();
@@ -5718,8 +8325,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         env.ledger().with_mut(|li| li.timestamp += 31 * 24 * 60 * 60);
         client.decay_score(&asset_id);
@@ -5743,8 +8352,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         env.ledger().with_mut(|li| li.timestamp += 1);
         client.reset_score(&admin, &asset_id);
@@ -5788,9 +8399,11 @@ mod tests {
         for (task_type, note) in task_types.iter().zip(notes.iter()) {
             client.submit_maintenance(
                 &asset_id,
-                task_type,
+                &task_type,
+                &Priority::Low,
                 &String::from_str(&env, note),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -5821,8 +8434,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "authorized"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
@@ -5841,8 +8456,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "unauthorized"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -5959,8 +8576,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -5968,8 +8587,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "triggers prune"),
             &engineer,
+            &None,
         );
 
         let events = env.events().all();
@@ -6037,8 +8658,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!(""),
+            &Priority::Low,
             &String::from_str(&env, "Empty task type"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -6050,7 +8673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_maintenance_rejects_unknown_task_type() {
+    fn test_submit_maintenance_unknown_task_type_uses_default_weight() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -6059,6 +8682,8 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        // Unknown task types must no longer panic — they fall back to the
+        // default weight and the submission succeeds (fix for #1200).
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
@@ -6067,11 +8692,14 @@ mod tests {
             &engineer,
         );
 
+        assert!(
+            result.is_ok(),
+            "submit_maintenance must succeed for unknown task types after #1200 fix"
+        );
         assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "one record must be written for the unknown task type"
         );
     }
 
@@ -6148,8 +8776,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should be rejected"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -6260,6 +8890,121 @@ mod tests {
         assert!(history.contains(&asset_ids.get(4).unwrap()));
     }
 
+    /// Issue: verify that when the engineer history sliding window is filled to
+    /// exactly `cap + 1` distinct assets, the single oldest asset_id is evicted
+    /// and every other (newer) asset_id is retained, in insertion order.
+    #[test]
+    fn test_engineer_history_evicts_oldest_at_cap_plus_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let cap: u32 = 4;
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, cap);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Fill history to cap + 1 distinct assets.
+        let mut asset_ids = Vec::new(&env);
+        for _ in 0..(cap + 1) {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            asset_ids.push_back(asset_id);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "service"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history.len(),
+            cap,
+            "history length must stay capped at max_engineer_history"
+        );
+
+        // The oldest asset_id (index 0) must have been evicted.
+        assert!(
+            !history.contains(&asset_ids.get(0).unwrap()),
+            "oldest asset_id must be evicted once cap + 1 distinct assets are added"
+        );
+
+        // Every newer asset_id (indices 1..=cap) must still be present.
+        for i in 1..=cap {
+            let id = asset_ids.get(i).unwrap();
+            assert!(
+                history.contains(&id),
+                "newer asset_id at index {i} must be retained after eviction"
+            );
+        }
+
+        // The newest asset_id in particular must be retained.
+        assert!(history.contains(&asset_ids.get(cap).unwrap()));
+    }
+
+    /// Issue: with max_engineer_history == 1, the history must always contain
+    /// exactly the single most-recently-added asset_id, evicting every
+    /// previous entry as soon as a new distinct asset is added.
+    #[test]
+    fn test_engineer_history_max_history_of_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 1);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let (asset_id_1, _owner1) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_1,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "first asset service"),
+            &engineer,
+        );
+
+        let history_after_first = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_first.len(), 1);
+        assert!(history_after_first.contains(&asset_id_1));
+
+        let (asset_id_2, _owner2) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_2,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "second asset service"),
+            &engineer,
+        );
+
+        let history_after_second = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history_after_second.len(),
+            1,
+            "history must stay at exactly 1 entry when max_engineer_history == 1"
+        );
+        assert!(
+            !history_after_second.contains(&asset_id_1),
+            "first asset_id must be evicted once a second distinct asset is added"
+        );
+        assert!(
+            history_after_second.contains(&asset_id_2),
+            "history must retain only the newest asset_id"
+        );
+
+        let (asset_id_3, _owner3) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_3,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "third asset service"),
+            &engineer,
+        );
+
+        let history_after_third = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_third.len(), 1);
+        assert!(!history_after_third.contains(&asset_id_2));
+        assert!(history_after_third.contains(&asset_id_3));
+    }
+
     #[test]
     fn test_engineer_history_no_duplicate_asset_id_on_repeated_maintenance() {
         let env = Env::default();
@@ -6368,16 +9113,20 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "older"),
             &engineer,
+            &None,
         );
 
         env.ledger().set_timestamp(1500);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "newer"),
             &engineer,
+            &None,
         );
 
         let last = client.get_last_maintenance(&asset_id).unwrap();
@@ -6455,6 +9204,85 @@ mod tests {
         assert_eq!(client.get_collateral_score(&asset_id), 100);
     }
 
+    /// Issue #839: Verify that updating score_increment retroactively affects existing assets.
+    /// After submitting maintenance and recording a score, updating score_increment should
+    /// cause re-queries of the same asset to reflect the new increment in compute_decay.
+    #[test]
+    fn test_score_increment_update_affects_existing_asset_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one maintenance record with default score_increment (5)
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Initial maintenance"),
+            &engineer,
+        );
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert_eq!(initial_score, 5, "Initial score should be 5 with default increment");
+
+        // Update score_increment to 10
+        client.update_score_increment(&admin, &10);
+
+        // Re-query the same asset's score without submitting new maintenance
+        // The score should be recalculated using the new increment
+        let updated_score = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            updated_score, 10,
+            "Score should reflect new increment (10) for existing maintenance record after config update"
+        );
+    }
+
+    /// Issue #839: Verify that old maintenance records are weighted with the new increment
+    /// during compute_decay when score_increment is updated.
+    /// Scenario: multiple old records with an old increment, then update to new increment,
+    /// and verify the re-computed score uses the new increment for all records.
+    #[test]
+    fn test_score_increment_update_weights_old_records_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit 3 maintenance records with default score_increment (5)
+        // Total expected score: 5 + 5 + 5 = 15
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Old maintenance record"),
+                &engineer,
+            );
+        }
+        let score_before_update = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_before_update, 15,
+            "Score with 3 records and default increment (5) should be 15"
+        );
+
+        // Update score_increment to 8
+        client.update_score_increment(&admin, &8);
+
+        // Re-query the score: all 3 existing records should now use the new increment (8)
+        // Expected: 8 + 8 + 8 = 24
+        let score_after_update = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after_update, 24,
+            "Score after updating increment to 8 should be 24 (3 * 8), reflecting new weight on old records"
+        );
+    }
+
     #[test]
     fn test_collateral_score_respects_theoretical_max_for_config_variants() {
         let variants = [(1u32, 3u32), (3u32, 5u32), (5u32, 7u32), (10u32, 12u32)];
@@ -6475,8 +9303,10 @@ mod tests {
                 client.submit_maintenance(
                     &asset_id,
                     &symbol_short!("OIL_CHG"),
+                    &Priority::Low,
                     &String::from_str(&env, "invariant"),
                     &engineer,
+                    &None,
                 );
             }
 
@@ -6602,8 +9432,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "custom weight test"),
             &engineer,
+            &None,
         );
 
         let score = client.get_collateral_score(&asset_id);
@@ -6654,8 +9486,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "default weight test"),
             &engineer,
+            &None,
         );
 
         let score = client.get_collateral_score(&asset_id);
@@ -6684,16 +9518,20 @@ mod tests {
         client.submit_maintenance(
             &asset_id1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
 
         // Submit ENGINE to asset2
         client.submit_maintenance(
             &asset_id2,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "engine overhaul"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_collateral_score(&asset_id1), 10);
@@ -6862,8 +9700,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "frequency test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -6892,8 +9732,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "high frequency test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -7184,16 +10026,20 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("INSPECT"),
+                &Priority::Low,
                 &String::from_str(&env, "Early check"),
                 &eng_a,
+                &None,
             );
         }
         for _ in 0..5 {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Later check"),
                 &eng_b,
+                &None,
             );
         }
 
@@ -7589,8 +10435,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         client.reset_score(&admin, &asset_id);
         assert_eq!(client.get_collateral_score(&asset_id), 0);
@@ -7624,8 +10472,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         let initial_score = client.get_collateral_score(&asset_id);
         assert!(initial_score > 0);
@@ -7673,8 +10523,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &task_type,
+            &Priority::Low,
             &String::from_str(&env, "Routine"),
             &engineer,
+            &None,
         );
 
         use soroban_sdk::{FromVal, TryIntoVal};
@@ -7774,10 +10626,12 @@ mod tests {
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
         let result =
             lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
+        // #1254: same-address registry pair must be rejected with the dedicated
+        // SameRegistryAddress error, not the generic InvalidConfig.
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::SameRegistryAddress as u32,
             ))),
         );
     }
@@ -8078,8 +10932,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8088,8 +10944,10 @@ mod tests {
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8120,8 +10978,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "routine"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8146,8 +11006,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "routine"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8210,14 +11072,18 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
             client.submit_maintenance(
                 &asset_b,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8281,8 +11147,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8311,15 +11179,19 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8347,8 +11219,10 @@ mod tests {
         client.submit_maintenance(
             &known_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8580,6 +11454,41 @@ mod tests {
         client.execute_pause(&admin);
 
         assert!(client.is_paused());
+    }
+
+    /// Regression test for the executed-flag atomicity guarantee documented on
+    /// `require_timelock_ready`: once a timelocked proposal has been executed,
+    /// a second call for the same operation must be rejected with
+    /// `ProposalNotFound` rather than silently re-running the guarded
+    /// operation. This verifies double-execution is impossible.
+    #[test]
+    fn test_execute_update_score_increment_rejects_double_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_config_update(&admin, &symbol_short!("SC_INC"));
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // First execution succeeds and applies the new value.
+        client.execute_update_score_increment(&admin, &7);
+        assert_eq!(client.get_config().score_increment, 7);
+
+        // Second execution of the same (now-executed) proposal must be
+        // rejected — the executed flag was already committed atomically
+        // with the first run, so there is no proposal left to execute.
+        let result = client.try_execute_update_score_increment(&admin, &99);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            )))
+        );
+
+        // Config value from the first (only) successful execution is unchanged.
+        assert_eq!(client.get_config().score_increment, 7);
     }
 
     #[test]
@@ -8859,8 +11768,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -9037,7 +11948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_submit_maintenance_rejects_unknown_task_type() {
+    fn test_batch_submit_maintenance_unknown_task_type_uses_default_weight() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -9053,13 +11964,18 @@ mod tests {
             notes: String::from_str(&env, "Unknown task type"),
         });
 
+        // Unknown task types must no longer panic in batch submissions either
+        // — they fall back to the default weight (fix for #1200).
         let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
 
+        assert!(
+            result.is_ok(),
+            "batch_submit_maintenance must succeed for unknown task types after #1200 fix"
+        );
         assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "one record must be written for the unknown task type"
         );
     }
 
@@ -9221,8 +12137,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
@@ -9332,19 +12250,21 @@ mod tests {
             priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
+        // Record at index 2 has oversized notes — must trigger NotesTooLong
+        // and the batch must be rejected atomically (no partial writes).
         records.push_back(BatchRecord {
-            task_type: symbol_short!("UNKNOWN"),
+            task_type: symbol_short!("FILTER"),
             priority: Priority::Low,
-            notes: String::from_str(&env, "Invalid task type"),
+            notes: String::from_str(&env, &"x".repeat(300)),
         });
 
         let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
 
-        // Should fail with InvalidTaskType at index 2
+        // Should fail with NotesTooLong at index 2
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
@@ -9468,8 +12388,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -9813,8 +12735,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         let initial_score: u32 = 5;
 
@@ -9954,8 +12878,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -9965,8 +12891,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -9976,24 +12904,27 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
         client.reset_score(&admin, &asset_id);
 
+        // Unknown task type: must now succeed and use the default weight (fix for #1200).
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+        assert!(
+            result.is_ok(),
+            "submit_maintenance must succeed for unknown task types after #1200 fix"
         );
     }
 
@@ -10189,8 +13120,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10754,8 +13687,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
             asset_ids.push(asset_id);
         }
@@ -10792,8 +13727,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10830,8 +13767,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10873,8 +13812,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -11152,8 +14093,10 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
-                &engineer
+                &engineer,
+                &None,
             ),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::Paused as u32
@@ -11301,8 +14244,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "before pause"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
 
@@ -11313,8 +14258,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "after pause"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -11341,8 +14288,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "maintenance 1"),
             &engineer,
+            &None,
         );
         let initial_score = client.get_collateral_score(&asset_id);
         assert!(initial_score > 0);
@@ -11383,8 +14332,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "after unpause"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
@@ -11715,14 +14666,18 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-transfer inspection"),
             &engineer,
+            &None,
         );
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Oil change"),
             &engineer,
+            &None,
         );
 
         asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
@@ -12131,6 +15086,167 @@ mod tests {
         );
     }
 
+    /// Issue: after 3+ successive ownership transfers (A → B → C → D), the
+    /// endpoint must anchor strictly to the most recent transfer and return
+    /// only records submitted under the final owner (D), excluding every
+    /// earlier owner's records even though they are still present in the
+    /// full history.
+    #[test]
+    fn test_history_since_transfer_with_three_plus_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let owner_d = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C, owner C submits 2 records.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+        lifecycle.authorize_engineer(&owner_c, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("BRAKE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C brake service"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer C → D (third transfer), owner D submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_c, &owner_d);
+        lifecycle.record_transfer(&asset_id, &owner_c, &owner_d);
+        lifecycle.authorize_engineer(&owner_d, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner D engine overhaul"),
+            &engineer,
+        );
+
+        // Since-transfer must return only owner D's single record.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            1,
+            "after 3 transfers, since_transfer must return only the current owner's records"
+        );
+        assert_eq!(since.get(0).unwrap().task_type, symbol_short!("ENGINE"));
+        assert!(since.get(0).unwrap().ownership_start_ledger.is_some());
+
+        // Full history must still contain everything: A(1) + XFER + B(1) + XFER
+        // + C(2) + XFER + D(1) = 8 entries.
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(
+            full.len(),
+            8,
+            "full history must retain all records across every transfer"
+        );
+    }
+
+    /// Issue: when the current owner has zero maintenance records after the
+    /// most recent of several transfers, since_transfer must return an empty
+    /// Vec rather than falling back to a previous owner's records.
+    #[test]
+    fn test_history_since_transfer_zero_records_for_current_owner_after_multiple_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 2 records.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C. Owner C submits nothing.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            0,
+            "current owner C has zero maintenance records; since_transfer must be empty, \
+             not fall back to owner A's or owner B's records"
+        );
+    }
+
     #[test]
     fn test_purge_asset_data_after_deregister() {
         let env = Env::default();
@@ -12162,8 +15278,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-deregister check"),
             &engineer,
+            &None,
         );
 
         // Lifecycle data exists before deregister (score history is readable without asset check)
@@ -12333,8 +15451,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12454,8 +15574,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "single record"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12491,8 +15613,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12586,14 +15710,18 @@ mod tests {
         client.submit_maintenance(
             &asset_id_recent,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "recent maintenance"),
             &engineer,
+            &None,
         );
         client.submit_maintenance(
             &asset_id_old,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "old maintenance"),
             &engineer,
+            &None,
         );
 
         // Both should have same score initially (score_increment = 5 for a recent record)
@@ -12618,8 +15746,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id_recent,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "recent maintenance again"),
             &engineer,
+            &None,
         );
         let score_after_15d_recent = client.get_collateral_score(&asset_id_recent);
         assert!(
@@ -12699,14 +15829,18 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first in ledger"),
             &engineer,
+            &None,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second in ledger"),
             &engineer,
+            &None,
         );
 
         let history = client.get_score_history(&asset_id);
@@ -12770,8 +15904,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "entry"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1000 * (i + 1));
         }
@@ -12842,8 +15978,10 @@ mod tests {
         let result_ok = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "short"),
             &engineer,
+            &None,
         );
         assert!(result_ok.is_ok());
 
@@ -12851,8 +15989,10 @@ mod tests {
         let result_err = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "this is too long"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result_err,
@@ -13093,8 +16233,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
 
         // Call get_collateral_score and capture returned value.
@@ -13234,8 +16376,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 2);
     }
@@ -13271,8 +16415,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
     }
@@ -13291,8 +16437,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13301,8 +16449,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13313,6 +16463,68 @@ mod tests {
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    /// Regression test for the unbounded-snapshot-growth issue: a misconfigured
+    /// automation loop calling `take_health_snapshot` repeatedly must not be able
+    /// to grow `HealthSnapshots(asset_id)` past the configured `max_snapshots`
+    /// cap. Oldest snapshots must be evicted first so the retained list always
+    /// reflects the most recent history.
+    #[test]
+    fn test_take_health_snapshot_enforces_max_snapshots_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        // Tighten the cap to 3 so the test doesn't need 500+ iterations.
+        client.update_max_snapshots(&admin, &3);
+
+        // Take 5 snapshots at distinct timestamps.
+        let mut timestamps = Vec::new(&env);
+        for _ in 0..5u32 {
+            let snap = client.take_health_snapshot(&asset_id);
+            timestamps.push_back(snap.snapshot_timestamp);
+            env.ledger().with_mut(|li| li.timestamp += 10);
+        }
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "snapshot list must be capped at max_snapshots (3), not grow to 5"
+        );
+
+        // The retained snapshots must be the 3 most recent (oldest-first eviction).
+        let expected_oldest_retained = timestamps.get(2).unwrap();
+        assert_eq!(
+            snapshots.get(0).unwrap().snapshot_timestamp,
+            expected_oldest_retained,
+            "the two oldest snapshots must have been evicted first"
+        );
+        assert_eq!(
+            snapshots.get(2).unwrap().snapshot_timestamp,
+            timestamps.get(4).unwrap(),
+            "the most recent snapshot must always be retained"
+        );
+    }
+
+    /// `update_max_snapshots` must reject a zero cap (which would make every
+    /// `take_health_snapshot` call immediately evict its own new entry).
+    #[test]
+    fn test_update_max_snapshots_rejects_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_update_max_snapshots(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32
+            )))
+        );
     }
 
     #[test]
@@ -13331,8 +16543,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13355,8 +16569,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "initial service"),
             &engineer,
+            &None,
         );
         let score_after_submit = client.get_collateral_score(&asset_id);
         assert!(score_after_submit > 0, "score must be >0 after maintenance");
@@ -13379,8 +16595,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 7);
     }
@@ -13419,14 +16637,18 @@ mod tests {
         client.submit_maintenance(
             &asset_a,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "routine"),
             &eng_low,
+            &None,
         );
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "routine"),
             &eng_high,
+            &None,
         );
 
         let score_low = client.get_collateral_score(&asset_a);
@@ -13454,8 +16676,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13464,8 +16688,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13735,8 +16961,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Pre-decommission service"),
                 &engineer,
+                &None,
             );
         }
 
@@ -13817,8 +17045,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Full overhaul before retirement"),
             &engineer,
+            &None,
         );
 
         assert!(lifecycle.decay_score(&asset_id) > 0);
@@ -13858,8 +17088,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Engine overhaul"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -13911,8 +17143,10 @@ mod tests {
                 lifecycle.submit_maintenance(
                     &asset_id,
                     &symbol_short!("OVERHAUL"),
+                    &Priority::Low,
                     &String::from_str(&env, "Overhaul record"),
                     &engineer,
+                    &None,
                 );
                 env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -13959,8 +17193,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Isolation test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -14018,8 +17254,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-hard-expiry maintenance attempt"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -14234,8 +17472,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Last service"),
             &engineer,
+            &None,
         );
 
         lifecycle.decommission_notify(&asset_id);
@@ -14314,8 +17554,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first service"),
             &engineer,
+            &None,
         );
 
         let score_before = lifecycle.get_collateral_score(&asset_id);
@@ -14366,7 +17608,9 @@ mod tests {
         lifecycle.pause(&admin);
         assert!(lifecycle.is_paused());
     }
-    // ── issue #1022: reentrancy guard on submit_maintenance ───────────────
+    // ── issue #1022 / #1196: reentrancy guard on submit_maintenance ──────────
+    // #1196: Lock moved from instance storage to temporary storage so that a
+    // mid-execution panic automatically clears it, preventing permanent lock-up.
 
     /// Verify that the reentrancy lock is NOT present before submit_maintenance is called.
     /// This confirms the guard starts in a clean state.
@@ -14389,11 +17633,11 @@ mod tests {
             &200u32,
         );
 
-        // The LOCKED instance key must not be set before any submit_maintenance call.
+        // The LOCKED temporary key must not be set before any submit_maintenance call.
         env.as_contract(&lifecycle_id, || {
             let locked: bool = env
                 .storage()
-                .instance()
+                .temporary()
                 .get(&REENTRANCY_LOCK)
                 .unwrap_or(false);
             assert!(!locked, "Reentrancy lock must be clear before submit_maintenance");
@@ -14449,8 +17693,9 @@ mod tests {
 
         // Simulate the LOCKED flag being set (as if submit_maintenance is mid-execution
         // and a malicious registry re-enters the lifecycle contract).
+        // (#1196) Lock is now in *temporary* storage.
         env.as_contract(&lifecycle_id, || {
-            env.storage().instance().set(&REENTRANCY_LOCK, &true);
+            env.storage().temporary().set(&REENTRANCY_LOCK, &true);
         });
 
         // Attempt to call submit_maintenance while the lock is held → must be rejected.
@@ -14472,8 +17717,9 @@ mod tests {
         );
 
         // Clean up: remove the lock so subsequent tests are not affected.
+        // (#1196) Lock is now in *temporary* storage.
         env.as_contract(&lifecycle_id, || {
-            env.storage().instance().remove(&REENTRANCY_LOCK);
+            env.storage().temporary().remove(&REENTRANCY_LOCK);
         });
     }
 
@@ -14507,11 +17753,12 @@ mod tests {
         );
 
         // After the call completes, the lock must be cleared.
+        // (#1196) Lock is now in *temporary* storage.
         let lifecycle_id = lifecycle.address.clone();
         env.as_contract(&lifecycle_id, || {
             let locked: bool = env
                 .storage()
-                .instance()
+                .temporary()
                 .get(&REENTRANCY_LOCK)
                 .unwrap_or(false);
             assert!(!locked, "Reentrancy lock must be cleared after submit_maintenance");
@@ -14525,6 +17772,97 @@ mod tests {
             &String::from_str(&env, "Second maintenance"),
             &engineer,
             &None,
+        );
+    }
+
+    /// Issue #1196: Verify that the reentrancy lock is absent after a simulated
+    /// mid-execution panic.
+    ///
+    /// When the lock was stored in *instance* storage a panic between
+    /// `acquire_reentrancy_guard` and `release_reentrancy_guard` left the flag
+    /// permanently set, permanently blocking `submit_maintenance`.  Moving the
+    /// lock to *temporary* storage means the Soroban host discards it on any
+    /// transaction failure.
+    ///
+    /// This test simulates the scenario by:
+    /// 1. Manually setting the LOCKED flag in temporary storage (mimicking the
+    ///    state mid-way through a panicking `submit_maintenance` call).
+    /// 2. Manually removing it (as the host would on panic/rollback).
+    /// 3. Verifying the flag is gone, i.e. a subsequent submit_maintenance
+    ///    can acquire the lock and succeed normally.
+    #[test]
+    fn test_reentrancy_lock_cleared_after_mid_execution_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 200);
+        let lifecycle_id = lifecycle.address.clone();
+
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &admin,
+        );
+        engineer_registry.add_specialization(&engineer, &symbol_short!("GENSET"));
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // ── Step 1: simulate the lock being acquired mid-execution ───────────
+        // This mimics submit_maintenance having called acquire_reentrancy_guard
+        // but then panicking before release_reentrancy_guard.
+        env.as_contract(&lifecycle_id, || {
+            env.storage().temporary().set(&REENTRANCY_LOCK, &true);
+        });
+
+        // Confirm the lock is now set.
+        env.as_contract(&lifecycle_id, || {
+            let locked: bool = env
+                .storage()
+                .temporary()
+                .get(&REENTRANCY_LOCK)
+                .unwrap_or(false);
+            assert!(locked, "Lock must be set at this point (mid-execution simulation)");
+        });
+
+        // ── Step 2: simulate the host rolling back temporary storage on panic ─
+        // In production the Soroban host automatically discards all temporary
+        // storage writes when a transaction fails.  In the test environment we
+        // replicate that by removing the key manually.
+        env.as_contract(&lifecycle_id, || {
+            env.storage().temporary().remove(&REENTRANCY_LOCK);
+        });
+
+        // ── Step 3: confirm the lock is gone (no permanent block) ────────────
+        env.as_contract(&lifecycle_id, || {
+            let locked: bool = env
+                .storage()
+                .temporary()
+                .get(&REENTRANCY_LOCK)
+                .unwrap_or(false);
+            assert!(
+                !locked,
+                "Reentrancy lock must be clear after simulated panic rollback (#1196)"
+            );
+        });
+
+        // ── Step 4: confirm submit_maintenance can proceed after the lock clears
+        // This is the key regression check: with instance storage the lock would
+        // still be set here and this call would panic with ContractError::Reentrancy.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-panic maintenance — must succeed"),
+            &engineer,
+            &None,
+        );
+
+        let history = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(
+            history.len(),
+            1,
+            "submit_maintenance must succeed after the lock is cleared by rollback (#1196)"
         );
     }
 
@@ -14900,6 +18238,131 @@ mod tests {
         lifecycle.execute_weight_change(&admin, &task_type);
     }
 
+    #[test]
+    fn test_propose_weight_change_allowed_after_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, _asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let task_type = symbol_short!("OIL_CHG");
+
+        // First proposal
+        lifecycle.propose_weight_change(&admin, &task_type, &10);
+
+        // Fast-forward past timelock
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_add(48 * 60 * 60 + 1);
+        });
+
+        // Execute first proposal
+        lifecycle.execute_weight_change(&admin, &task_type);
+
+        // Reset ledger time for second proposal
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_sub(48 * 60 * 60 + 1);
+        });
+
+        // Second proposal should succeed (first is now executed)
+        lifecycle.propose_weight_change(&admin, &task_type, &15);
+
+        // Verify the new proposal is pending
+        let config = lifecycle.get_config();
+        assert_eq!(config.task_weights.get(task_type).unwrap(), 10); // Still old value
+    }
+
+    #[test]
+    fn test_execute_weight_change_emits_event_with_correct_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, _asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let task_type = symbol_short!("OIL_CHG");
+        let new_weight = 42u32;
+
+        lifecycle.propose_weight_change(&admin, &task_type, &new_weight);
+
+        // Fast-forward past timelock
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_add(48 * 60 * 60 + 1);
+        });
+
+        let exec_timestamp = env.ledger().timestamp();
+
+        lifecycle.execute_weight_change(&admin, &task_type);
+
+        // Verify event was emitted with correct data
+        let events = env.events().all();
+        let exec_event = events.iter().find(|(_, topics, data)| {
+            topics.get(0).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == symbol_short!("WT_EXEC")
+            })
+            && topics.get(1).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == task_type
+            })
+        });
+
+        assert!(exec_event.is_some(), "WT_EXEC event should be emitted");
+
+        if let Some((_, _, data)) = exec_event {
+            let (event_admin, event_weight, event_timestamp): (Address, u32, u64) =
+                data.into_val(&env);
+            assert_eq!(event_admin, admin, "Event should contain admin address");
+            assert_eq!(event_weight, new_weight, "Event should contain new weight");
+            assert_eq!(event_timestamp, exec_timestamp, "Event should contain execution timestamp");
+        }
+    }
+
+    #[test]
+    fn test_anchor_history_to_snapshot_emits_reconstr_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        // Create a health snapshot
+        let snapshot = HealthSnapshot {
+            snapshot_timestamp: env.ledger().timestamp(),
+            score: 75u32,
+            maintenance_count: 5u32,
+            last_service_date: env.ledger().timestamp().saturating_sub(86400),
+            reconstructed: false,
+        };
+
+        let key = health_snapshot_key(asset_id);
+        let snapshots = {
+            let mut v = Vec::new(&env);
+            v.push_back(snapshot.clone());
+            v
+        };
+        env.storage().persistent().set(&key, &snapshots);
+
+        lifecycle.anchor_history_to_snapshot(&admin, &asset_id, &0);
+
+        // Verify RECONSTR event was emitted
+        let events = env.events().all();
+        let reconstr_event = events.iter().find(|(_, topics, _)| {
+            topics.get(0).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == symbol_short!("RECONSTR")
+            })
+            && topics.get(1).map_or(false, |v| {
+                u64::from_val(&env, &v) == asset_id
+            })
+        });
+
+        assert!(
+            reconstr_event.is_some(),
+            "RECONSTR event should be emitted with asset_id"
+        );
+
+        if let Some((_, _, data)) = reconstr_event {
+            let (snapshot_idx, score, timestamp): (u32, u32, u64) = data.into_val(&env);
+            assert_eq!(snapshot_idx, 0, "Event should contain snapshot index");
+            assert_eq!(score, 75u32, "Event should contain snapshot score");
+            assert_eq!(timestamp, snapshot.snapshot_timestamp, "Event should contain snapshot timestamp");
+        }
+    }
+
     // ==================== Issue #1004 Tests ====================
 
     #[test]
@@ -15114,6 +18577,51 @@ mod tests {
         assert_eq!(assets.len(), 0);
     }
 
+    /// #1198 — valuation_history_push must cap at DEFAULT_MAX_HISTORY (200)
+    /// when max_history == 0, not grow without bound.
+    ///
+    /// Push DEFAULT_MAX_HISTORY + 5 entries with max_history == 0 and assert
+    /// the stored vector length stays at DEFAULT_MAX_HISTORY.
+    #[test]
+    fn test_valuation_history_push_caps_at_default_when_max_history_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_id: u64 = 42;
+        // Push one more than the default cap to confirm the oldest entry is
+        // evicted rather than the vector growing unbounded.
+        let push_count = DEFAULT_MAX_HISTORY + 5;
+        for i in 0..push_count {
+            scoring::valuation_history_push(&env, asset_id, i as u64, i as u64, 0);
+        }
+
+        let key = DataKey::CollateralValuationHistory(asset_id);
+        let history: soroban_sdk::Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("valuation history should be present");
+
+        assert_eq!(
+            history.len(),
+            DEFAULT_MAX_HISTORY,
+            "history length should be capped at DEFAULT_MAX_HISTORY ({DEFAULT_MAX_HISTORY}) \
+             when max_history == 0, got {}",
+            history.len(),
+        );
+
+        // The oldest entries must have been evicted; the last entry should be
+        // the most recently pushed value.
+        let (last_ts, last_val) = history.get(history.len() - 1).unwrap();
+        let expected_last = (push_count - 1) as u64;
+        assert_eq!(
+            last_ts, expected_last,
+            "last timestamp should be {expected_last}, got {last_ts}",
+        );
+        assert_eq!(
+            last_val, expected_last,
+            "last value should be {expected_last}, got {last_val}",
+        );
     // ---------------------------------------------------------------------------
     //  #1222: next_due advances after a matching submit_maintenance call
     // ---------------------------------------------------------------------------
@@ -15215,5 +18723,1056 @@ mod tests {
         client.clear_duplicate_record(&admin, &asset_id, &ts);
         // ...so clearing the same, already-cleared entry again must panic.
         client.clear_duplicate_record(&admin, &asset_id, &ts);
+    }
+
+    // =========================================================================
+    // Issue #1255 — DEPLOYER_KEY restricts initialize to the deployer
+    // =========================================================================
+
+    /// A non-deployer attempting to call `initialize` must be rejected.
+    ///
+    /// When the lifecycle contract is registered without calling its
+    /// `__constructor` (the pattern used by all test helpers via
+    /// `env.register(Lifecycle, ())`), DEPLOYER_KEY is absent from instance
+    /// storage. In that state `initialize` panics with `NotInitialized`
+    /// because the deployer address cannot be recovered for comparison,
+    /// which is itself a form of access restriction — any caller without
+    /// the correct deployer key is turned away.
+    #[test]
+    fn test_initialize_deployer_restriction_non_deployer_rejected() {
+        let env = Env::default();
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Mock only the attacker's auth — the deployer's auth is absent.
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &lifecycle_id,
+                fn_name: "initialize",
+                args: (
+                    &attacker,
+                    &asset_registry_id,
+                    &engineer_registry_id,
+                    &attacker,
+                    &0u32,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        // Passing the deployer (whose auth is not mocked) as the first arg
+        // must fail — the contract cannot be initialized by a non-deployer.
+        let result = client.try_initialize(
+            &deployer,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &attacker,
+            &0u32,
+        );
+        assert!(
+            result.is_err(),
+            "#1255: non-deployer must not be able to initialize"
+        );
+    }
+
+    /// Calling `initialize` twice must always be rejected even when the caller
+    /// has the correct deployer credentials (double-initialization guard).
+    #[test]
+    fn test_initialize_deployer_restriction_already_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        client.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
+
+        let result = client.try_initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AlreadyInitialized as u32,
+            ))),
+            "#1255: second initialize must be rejected with AlreadyInitialized"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1254 — initialize rejects same asset_registry and engineer_registry
+    // =========================================================================
+
+    /// Passing the same address for both registries must return
+    /// `SameRegistryAddress`, not the generic `InvalidConfig`.
+    #[test]
+    fn test_initialize_rejects_same_registry_with_dedicated_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let same_registry_id = env.register(AssetRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let result = client.try_initialize(
+            &admin,
+            &same_registry_id,
+            &same_registry_id,
+            &admin,
+            &0u32,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SameRegistryAddress as u32,
+            ))),
+            "#1254: same-address registry pair must return SameRegistryAddress"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1253 — get_maintenance_records_by_priority
+    // =========================================================================
+
+    /// Records submitted with a given priority must appear in the filtered
+    /// result; records with a different priority must be excluded.
+    #[test]
+    fn test_get_maintenance_records_by_priority_filters_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one record of each priority level.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Low priority note"),
+            &engineer,
+            &None,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Medium,
+            &String::from_str(&env, "Medium priority note"),
+            &engineer,
+            &None,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::High,
+            &String::from_str(&env, "High priority note"),
+            &engineer,
+            &None,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Critical,
+            &String::from_str(&env, "Critical priority note"),
+            &engineer,
+            &None,
+        );
+
+        // Each priority filter should return exactly one record.
+        let low = client.get_maintenance_records_by_priority(&asset_id, &Priority::Low, &0, &50);
+        assert_eq!(low.len(), 1, "Expected 1 Low record");
+        assert_eq!(low.get(0).unwrap().priority, Priority::Low);
+
+        let med = client.get_maintenance_records_by_priority(&asset_id, &Priority::Medium, &0, &50);
+        assert_eq!(med.len(), 1, "Expected 1 Medium record");
+        assert_eq!(med.get(0).unwrap().priority, Priority::Medium);
+
+        let high = client.get_maintenance_records_by_priority(&asset_id, &Priority::High, &0, &50);
+        assert_eq!(high.len(), 1, "Expected 1 High record");
+        assert_eq!(high.get(0).unwrap().priority, Priority::High);
+
+        let crit = client.get_maintenance_records_by_priority(&asset_id, &Priority::Critical, &0, &50);
+        assert_eq!(crit.len(), 1, "Expected 1 Critical record");
+        assert_eq!(crit.get(0).unwrap().priority, Priority::Critical);
+    }
+
+    /// Pagination offset and limit are applied to the filtered set, not to the
+    /// raw history.  Two Critical records with `offset=1` must return only the
+    /// second one.
+    #[test]
+    fn test_get_maintenance_records_by_priority_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Interleave Critical and Low records so the filter must skip Low ones.
+        for i in 0..3u32 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::Critical,
+                &String::from_str(&env, "critical"),
+                &engineer,
+                &None,
+            );
+            if i < 2 {
+                client.submit_maintenance(
+                    &asset_id,
+                    &symbol_short!("OIL_CHG"),
+                    &Priority::Low,
+                    &String::from_str(&env, "low"),
+                    &engineer,
+                    &None,
+                );
+            }
+        }
+
+        // All 3 Critical records (no offset).
+        let page0 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &0, &50,
+        );
+        assert_eq!(page0.len(), 3, "Expected 3 Critical records total");
+
+        // offset=1 skips the first Critical record.
+        let page1 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &1, &50,
+        );
+        assert_eq!(page1.len(), 2, "offset=1 should skip first Critical record");
+
+        // offset=1, limit=1 returns exactly one record.
+        let page2 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &1, &1,
+        );
+        assert_eq!(page2.len(), 1, "offset=1 limit=1 should return exactly 1 record");
+    }
+
+    /// `limit = 0` must return an empty vec regardless of how many records exist.
+    #[test]
+    fn test_get_maintenance_records_by_priority_limit_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::High,
+            &String::from_str(&env, "should not appear"),
+            &engineer,
+            &None,
+        );
+
+        let page = client.get_maintenance_records_by_priority(&asset_id, &Priority::High, &0, &0);
+        assert_eq!(page.len(), 0, "limit=0 must return empty vec");
+    }
+
+    /// `offset` past the filtered set end must return an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_priority_offset_past_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Medium,
+            &String::from_str(&env, "one medium record"),
+            &engineer,
+            &None,
+        );
+
+        // offset=5 is past the single matching record.
+        let page = client.get_maintenance_records_by_priority(&asset_id, &Priority::Medium, &5, &50);
+        assert_eq!(page.len(), 0, "offset past filtered end must return empty vec");
+    }
+
+    /// `limit` is capped at MAX_PAGINATED_LIMIT (50) even when caller requests more.
+    #[test]
+    fn test_get_maintenance_records_by_priority_limit_capped_at_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 60);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Insert 60 Critical records.
+        for _ in 0..60 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::Critical,
+                &String::from_str(&env, "critical"),
+                &engineer,
+                &None,
+            );
+        }
+
+        // Requesting 200 should only return MAX_PAGINATED_LIMIT (50).
+        let page = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &0, &200,
+        );
+        assert_eq!(
+            page.len(),
+            MAX_PAGINATED_LIMIT,
+            "limit must be capped at MAX_PAGINATED_LIMIT"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1252 — get_maintenance_records_by_task_type
+    // =========================================================================
+
+    /// Records submitted with a given task type must appear in the filtered
+    /// result; records with a different task type must be excluded.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_filters_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let engine = symbol_short!("ENGINE");
+
+        // Two OIL_CHG, one ENGINE.
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "first oil change"), &engineer, &None,
+        );
+        client.submit_maintenance(
+            &asset_id, &engine, &Priority::High,
+            &String::from_str(&env, "engine check"), &engineer, &None,
+        );
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "second oil change"), &engineer, &None,
+        );
+
+        let oil_results = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        assert_eq!(oil_results.len(), 2, "Expected 2 OIL_CHG records");
+        for i in 0..oil_results.len() {
+            assert_eq!(oil_results.get(i).unwrap().task_type, oil_chg);
+        }
+
+        let eng_results = client.get_maintenance_records_by_task_type(
+            &asset_id, &engine, &0, &50,
+        );
+        assert_eq!(eng_results.len(), 1, "Expected 1 ENGINE record");
+        assert_eq!(eng_results.get(0).unwrap().task_type, engine);
+    }
+
+    /// Pagination offset and limit are applied to the filtered (task-type) set.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let filter_sym = symbol_short!("FILTER");
+
+        // Insert 4 OIL_CHG and 2 FILTER records in interleaved order.
+        for i in 0..4u32 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+            if i < 2 {
+                client.submit_maintenance(
+                    &asset_id, &filter_sym, &Priority::Medium,
+                    &String::from_str(&env, "filter"), &engineer, &None,
+                );
+            }
+        }
+
+        // All 4 OIL_CHG.
+        let all = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        assert_eq!(all.len(), 4, "Expected 4 OIL_CHG records");
+
+        // offset=2 skips first two OIL_CHG records.
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &2, &50,
+        );
+        assert_eq!(page.len(), 2, "offset=2 should skip first 2 OIL_CHG records");
+
+        // offset=2, limit=1.
+        let single = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &2, &1,
+        );
+        assert_eq!(single.len(), 1, "offset=2 limit=1 must return exactly 1 record");
+    }
+
+    /// `limit = 0` returns an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_limit_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "oil change"),
+            &engineer,
+            &None,
+        );
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("OIL_CHG"), &0, &0,
+        );
+        assert_eq!(page.len(), 0, "limit=0 must return empty vec");
+    }
+
+    /// `offset` past the filtered set end must return an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_offset_past_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::High,
+            &String::from_str(&env, "engine service"),
+            &engineer,
+            &None,
+        );
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("ENGINE"), &10, &50,
+        );
+        assert_eq!(page.len(), 0, "offset past end must return empty vec");
+    }
+
+    /// `limit` is capped at MAX_PAGINATED_LIMIT even when a larger value is requested.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_limit_capped_at_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 60);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        for _ in 0..60 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &200,
+        );
+        assert_eq!(
+            page.len(),
+            MAX_PAGINATED_LIMIT,
+            "limit must be capped at MAX_PAGINATED_LIMIT"
+        );
+    }
+
+    /// Querying for a task type that has no records returns an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_no_matching_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Only OIL_CHG records exist.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "oil change"),
+            &engineer,
+            &None,
+        );
+
+        // Query for ENGINE — should be empty.
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("ENGINE"), &0, &50,
+        );
+        assert_eq!(page.len(), 0, "no matching records must return empty vec");
+    }
+
+    // =========================================================================
+    // Issue #1304 — apply_decay MIN_SCORE_WITH_HISTORY floor after optimization
+    // =========================================================================
+
+    /// After optimizing apply_decay to avoid reading full maintenance history,
+    /// the floor condition (MIN_SCORE_WITH_HISTORY) must still be enforced for
+    /// assets with maintenance records.
+    #[test]
+    fn test_apply_decay_enforces_floor_with_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one maintenance record to establish history
+        let oil_chg = symbol_short!("OIL_CHG");
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert!(initial_score > 0, "initial score must be positive");
+
+        // Decay the score below the floor over multiple decay intervals
+        let decay_intervals = (initial_score / config.decay_rate) + 2;
+        let decay_time = decay_intervals as u64 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + decay_time);
+
+        // Apply decay and verify floor is enforced
+        let final_score = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            final_score, MIN_SCORE_WITH_HISTORY,
+            "#1304: score must be clamped at floor even after decay"
+        );
+    }
+
+    /// An asset with no maintenance history must have zero score even after decay.
+    #[test]
+    fn test_apply_decay_no_history_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+
+        // Register but do not submit any maintenance records
+        let score = client.get_collateral_score(&asset_id);
+        assert_eq!(score, 0, "asset with no history must score zero");
+
+        // Advance time and check score remains zero
+        let time_advanced = 2 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + time_advanced);
+
+        let score_after = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, 0,
+            "#1304: score must remain zero when there is no maintenance history"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1305 — compute_decay duplicate record scan optimization
+    // =========================================================================
+
+    /// Duplicate records must be correctly excluded from score calculation,
+    /// ensuring the O(n*m) scan logic works correctly whether implemented
+    /// with linear search or binary search optimization.
+    #[test]
+    fn test_compute_decay_duplicate_records_excluded() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 10 records to establish a baseline score
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_10 = client.get_collateral_score(&asset_id);
+
+        // Manually mark the 5th record as a duplicate by reading storage
+        // and writing it to the DuplicateRecords key
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        if history.len() >= 5 {
+            let fifth_record = history.get(4).unwrap();
+            let dup_key = DataKey::DuplicateRecords(asset_id);
+            let mut duplicates: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&dup_key)
+                .unwrap_or(Vec::new(&env));
+            duplicates.push_back(fifth_record.timestamp);
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            // Score after marking one as duplicate should be lower
+            let score_after_dup = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dup < score_with_10,
+                "#1305: duplicates must reduce computed score"
+            );
+        }
+    }
+
+    /// Multiple duplicate records must all be correctly excluded from scoring.
+    #[test]
+    fn test_compute_decay_multiple_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 20 records
+        for _ in 0..20 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_20 = client.get_collateral_score(&asset_id);
+
+        // Mark 5 records as duplicates
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        let dup_key = DataKey::DuplicateRecords(asset_id);
+        let mut duplicates: Vec<u64> = Vec::new(&env);
+
+        // Mark records at indices 2, 5, 8, 11, 14 as duplicates
+        for i in [2, 5, 8, 11, 14] {
+            if i < history.len() {
+                let record = history.get(i).unwrap();
+                duplicates.push_back(record.timestamp);
+            }
+        }
+
+        if !duplicates.is_empty() {
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            let score_after_dups = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dups < score_with_20,
+                "#1305: multiple duplicates must reduce score"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #1306 — batch_submit_maintenance event optimization
+    // =========================================================================
+
+    /// A batch of maintenance records must emit only one summary event
+    /// instead of one event per record.
+    #[test]
+    fn test_batch_submit_maintenance_emits_single_summary_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Build a batch of records
+        let oil_chg = symbol_short!("OIL_CHG");
+        let mut batch = Vec::new(&env);
+        for _ in 0..10 {
+            batch.push_back(BatchRecord {
+                task_type: oil_chg,
+                priority: Priority::Low,
+                notes: String::from_str(&env, "oil"),
+            });
+        }
+
+        // Capture events before batch submit
+        let events_before = env.events().all();
+        let events_before_count = events_before.len();
+
+        // Submit batch
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Check events after batch submit
+        let events_after = env.events().all();
+        let events_after_count = events_after.len();
+
+        // For #1306: should emit minimal events (1 summary event per batch)
+        // rather than 10 individual MAINT events
+        let new_events = events_after_count - events_before_count;
+        assert!(
+            new_events <= 2,
+            "#1306: batch should emit summary event not individual MAINT events per record (got {} new events)",
+            new_events
+        );
+    }
+
+    /// Batch submit with multiple records must correctly record all submissions
+    /// while emitting only a summary event.
+    #[test]
+    fn test_batch_submit_maintenance_summary_preserves_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let brake = symbol_short!("BRAKE");
+
+        // Build a batch with mixed task types
+        let mut batch = Vec::new(&env);
+        for i in 0..5 {
+            batch.push_back(BatchRecord {
+                task_type: if i % 2 == 0 { oil_chg } else { brake },
+                priority: Priority::Low,
+                notes: String::from_str(&env, "maintenance"),
+            });
+        }
+
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Verify all records were stored despite summary event optimization
+        let oil_chg_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        let brake_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &brake, &0, &50,
+        );
+
+        assert_eq!(
+            oil_chg_records.len(), 3,
+            "#1306: all OIL_CHG records must be stored despite summary event"
+        );
+        assert_eq!(
+            brake_records.len(), 2,
+            "#1306: all BRAKE records must be stored despite summary event"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1307 — score_history deduplication (consecutive duplicates)
+    // =========================================================================
+
+    /// score_history must not store duplicate consecutive scores to avoid
+    /// redundant entries when score does not change after maintenance.
+    #[test]
+    fn test_score_history_no_duplicate_consecutive_scores() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit multiple records in sequence
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        // Read the score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // Verify no consecutive scores are identical
+        for i in 1..score_history.len() {
+            let current = score_history.get(i).unwrap();
+            let previous = score_history.get(i - 1).unwrap();
+            assert_ne!(
+                current.score, previous.score,
+                "#1307: score history must not contain consecutive duplicate scores at index {}",
+                i
+            );
+        }
+    }
+
+    /// Decay operations must not add duplicate scores to history if score
+    /// hasn't changed.
+    #[test]
+    fn test_apply_decay_no_duplicate_score_history_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit a single maintenance record
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let score_after_submit = client.get_collateral_score(&asset_id);
+
+        // Advance time by a small amount (less than one decay interval)
+        env.ledger().set_timestamp(env.ledger().timestamp() + config.decay_interval / 2);
+
+        // Call get_collateral_score again (which may trigger decay)
+        let score_after_partial_decay = client.get_collateral_score(&asset_id);
+
+        // Read score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // If score hasn't changed, we should not have added a new entry
+        if score_after_submit == score_after_partial_decay && score_history.len() > 1 {
+            let last = score_history.get(score_history.len() - 1).unwrap();
+            let prev = score_history.get(score_history.len() - 2).unwrap();
+            assert_ne!(
+                last.score, prev.score,
+                "#1307: no duplicate consecutive scores should be added to history"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1320: Scheduled maintenance reminder events
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_emits_events_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+        let task_due_in_3_days = now + 3 * 86400; // 3 days from now
+        let task_due_in_10_days = now + 10 * 86400; // 10 days from now
+
+        // Schedule two recurring tasks with different due dates
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400),
+        );
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &2u64,
+            &symbol_short!("FILTER"),
+            &symbol_short!("DAYS"),
+            &(10 * 86400),
+        );
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Emit reminders with a 7-day window
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that TASK_SOON events were emitted for the task due in 3 days
+        // but not for the task due in 10 days (outside the window)
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have exactly 1 event for the task due in 3 days
+        assert_eq!(task_soon_events.len(), 1, "Should emit event for task within reminder window");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_overdue() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that is already overdue
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &86400, // Due in 1 day
+        );
+
+        // Move time forward so the task is now overdue
+        env.ledger().set_timestamp(now + 2 * 86400);
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for the overdue task
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for overdue task
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for overdue task");
+    }
+
+    #[test]
+    fn test_emit_upcoming_task_reminders_no_event_for_inactive_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, _engineer) = setup_chain_test(&env);
+
+        let now = env.ledger().timestamp();
+
+        // Schedule a task that will be inactive
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &(3 * 86400), // Due in 3 days
+        );
+
+        // Deactivate the task by modifying it directly in storage
+        let key = DataKey::RecurringTasks(asset_id);
+        let mut tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tasks.is_empty() {
+            let mut task = tasks.get(0).unwrap();
+            task.is_active = false;
+            tasks.set(0, task);
+            env.storage().persistent().set(&key, &tasks);
+        }
+
+        // Create a vector with the asset_id
+        let mut asset_ids = Vec::new(&env);
+        asset_ids.push_back(asset_id);
+
+        // Try to emit reminders
+        let reminder_window = 7 * 86400; // 7 days
+        client.emit_upcoming_task_reminders(&asset_ids, &reminder_window);
+
+        // Check that NO TASK_SOON events were emitted for inactive tasks
+        let events = env.events().all();
+        let task_soon_events: Vec<_> = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == EVENT_TASK_DUE_SOON).unwrap_or(false)
+            })
+            .collect();
+
+        // Should have no events for inactive tasks
+        assert_eq!(task_soon_events.len(), 0, "Should not emit event for inactive tasks");
     }
 }

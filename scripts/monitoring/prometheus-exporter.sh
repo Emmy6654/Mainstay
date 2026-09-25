@@ -63,6 +63,9 @@ collect_metrics() {
 # HELP mainstay_assets_total Total number of registered assets.
 # TYPE mainstay_assets_total gauge
 mainstay_assets_total $total_assets
+
+# HELP mainstay_collateral_score Per-asset collateral score (0-100).
+# TYPE mainstay_collateral_score gauge
 EOF
 
     # --- Engineer Registry metrics ---
@@ -73,9 +76,12 @@ EOF
 # HELP mainstay_engineers_total Total number of registered engineers.
 # TYPE mainstay_engineers_total gauge
 mainstay_engineers_total $total_engineers
+
+# HELP mainstay_days_since_last_service Days since last maintenance service per asset.
+# TYPE mainstay_days_since_last_service gauge
 EOF
 
-    # --- Maintenance records: iterate all assets for total count ---
+    # --- Maintenance records: iterate all assets for per-asset metrics ---
     # NOTE: For production deployments with 1,000+ assets, this per-asset
     # iteration is expensive.  Consider using a cached metric or a contract
     # view that returns aggregate counts.  Increase SCRAPE_INTERVAL to 300s
@@ -98,6 +104,20 @@ EOF
             if [[ "$score" -gt 0 ]]; then
                 scored_assets=$((scored_assets + 1))
             fi
+
+            # Export per-asset collateral score metric
+            echo "mainstay_collateral_score{asset_id=\"$id\"} $score" >> "$METRICS_FILE.tmp"
+
+            # Calculate days since last service
+            local last_service_ts
+            last_service_ts="$(invoke_read "$CONTRACT_LIFECYCLE" get_last_service_timestamp --asset_id "$id" 2>/dev/null || echo "0")"
+            if [[ "$last_service_ts" -gt 0 ]]; then
+                local days_since=$((($ts - $last_service_ts) / 86400))
+                echo "mainstay_days_since_last_service{asset_id=\"$id\"} $days_since" >> "$METRICS_FILE.tmp"
+            else
+                # Asset has never been serviced
+                echo "mainstay_days_since_last_service{asset_id=\"$id\"} -1" >> "$METRICS_FILE.tmp"
+            fi
         done
     fi
 
@@ -107,6 +127,7 @@ EOF
     fi
 
     cat >> "$METRICS_FILE.tmp" <<EOF
+
 # HELP mainstay_maintenance_records_total Total maintenance records across all assets.
 # TYPE mainstay_maintenance_records_total gauge
 mainstay_maintenance_records_total $total_records

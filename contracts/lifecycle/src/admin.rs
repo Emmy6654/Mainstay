@@ -20,7 +20,7 @@ use crate::{
     set_engineer_registry_addr, store_timelock, require_timelock_ready,
     CONFIG, PAUSED_KEY, PENDING_ADMIN_KEY,
     EVENT_ADMIN_SET, EVENT_PROP_ADMIN, EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR,
-    TTL_THRESHOLD, TTL_TARGET,
+    TTL_THRESHOLD, TTL_TARGET, MAX_ADMINS,
 };
 use crate::events::EVENT_PRUNED;
 use shared::extend_persistent_ttl;
@@ -50,9 +50,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -111,100 +109,7 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
-    env.storage().persistent().set(&PAUSED_KEY, &false);
-    extend_persistent_ttl(&env, &PAUSED_KEY);
-    env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn pause(env: Env, admin: Address) {
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
     require_quorum(&env, &config, &admin);
-    env.storage().persistent().set(&PAUSED_KEY, &true);
-    extend_persistent_ttl(&env, &PAUSED_KEY);
-    env.events().publish((symbol_short!("PAUSED"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn unpause(env: Env, admin: Address) {
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
-    env.storage().persistent().set(&PAUSED_KEY, &false);
-    extend_persistent_ttl(&env, &PAUSED_KEY);
-    env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn propose_pause(env: Env, admin: Address) {
-    ensure_not_paused(&env);
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    require_quorum(&env, &config, &admin);
-    store_timelock(&env, symbol_short!("PAUSE"));
-    env.events().publish((symbol_short!("PROP_PAUSE"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("PROP_PAUSE")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn execute_pause(env: Env, admin: Address) {
-    require_timelock_ready(&env, symbol_short!("PAUSE"));
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    require_quorum(&env, &config, &admin);
-    env.storage().persistent().set(&PAUSED_KEY, &true);
-    extend_persistent_ttl(&env, &PAUSED_KEY);
-    env.events().publish((symbol_short!("PAUSED"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn propose_unpause(env: Env, admin: Address) {
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
-    store_timelock(&env, symbol_short!("UNPAUSE"));
-    env.events().publish((symbol_short!("PROP_UNPAUSE"),), (admin.clone(),));
-    env.events().publish(
-        (symbol_short!("ADM_AUD"), symbol_short!("PROP_UNPAUSE")),
-        (admin, env.ledger().timestamp()),
-    );
-}
-
-pub(crate) fn execute_unpause(env: Env, admin: Address) {
-    require_timelock_ready(&env, symbol_short!("UNPAUSE"));
-    admin.require_auth();
-    let config: Config = env.storage().persistent().get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -251,6 +156,16 @@ pub(crate) fn accept_admin(env: Env) {
     env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
 }
 
+/// Internal implementation of `set_admin_quorum`.
+///
+/// Called by the public contract entry-point after it has already performed
+/// input validation (auth, threshold check, and duplicate check).  This layer
+/// repeats the duplicate check as defence-in-depth so the invariant holds even
+/// if the function is ever called from another internal site.
+///
+/// # Uniqueness requirement (#1195)
+/// `new_admins` must contain only distinct addresses.  Panics with
+/// [`ContractError::DuplicateAdmin`] if any address appears more than once.
 pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address>, threshold: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
@@ -262,10 +177,37 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     if threshold > 0 && threshold > new_admins.len() {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
+    // #1259: Hard cap — admin lists must not exceed MAX_ADMINS (10).
+    // require_quorum iterates the full list; an unbounded list could push
+    // per-call compute toward Soroban instruction limits (DoS vector).
+    if new_admins.len() > MAX_ADMINS {
+        panic_with_error!(&env, ContractError::TooManyAdmins);
+    }
+    // #1195: Reject lists that contain any repeated address.  A duplicate
+    // inflates the apparent quorum count so that fewer real signers than
+    // `threshold` could satisfy `require_quorum`, undermining the security
+    // guarantee.  All addresses must be unique.
+    //
+    // We check uniqueness with a nested O(n²) scan — acceptable because
+    // admin lists are expected to be small (≤ ~10 entries) and the
+    // soroban_sdk::Vec does not expose a sorted or hashed variant.
+    let n = new_admins.len();
+    let mut i: u32 = 0;
+    while i < n {
+        let a = new_admins.get(i).unwrap();
+        let mut j = i + 1;
+        while j < n {
+            if new_admins.get(j).unwrap() == a {
+                panic_with_error!(&env, ContractError::DuplicateAdmin);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
     config.admins = new_admins.clone();
     config.admin_threshold = threshold;
     env.storage().persistent().set(&CONFIG, &config);
-    env.storage().persistent().extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &CONFIG);
     env.events().publish(
         (symbol_short!("SET_QRUM"), admin.clone()),
         (new_admins, threshold),
@@ -403,10 +345,50 @@ pub(crate) fn update_max_engineer_history(env: Env, admin: Address, new_max: u32
     );
 }
 
-pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+/// Admin-only function to update the per-asset health-snapshot retention cap.
+///
+/// # Arguments
+/// * `admin`   - The admin address that must match the stored config admin.
+/// * `new_max` - New cap on the number of snapshots kept per asset in
+///               `HealthSnapshots(asset_id)` (must be > 0). When
+///               `take_health_snapshot` would exceed this cap, the oldest
+///               snapshots are evicted first.
+///
+/// # Panics
+/// - [`ContractError::NotInitialized`] if the contract has not been initialised.
+/// - [`ContractError::UnauthorizedAdmin`] if the caller is not the admin.
+/// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+pub(crate) fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
     if new_max == 0 {
+        panic_with_error!(&env, ContractError::InvalidConfig);
+    }
+    let mut config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    if config.admin != admin {
+        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+    }
+    config.max_snapshots = new_max;
+    env.storage().persistent().set(&CONFIG, &config);
+    extend_persistent_ttl(&env, &CONFIG);
+    env.events().publish(
+        (symbol_short!("UPD_SNAP"), admin.clone()),
+        new_max,
+    );
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+        (admin, env.ledger().timestamp(), symbol_short!("MAX_SNAP"), new_max),
+    );
+}
+
+pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+    ensure_not_paused(&env);
+    admin.require_auth();
+    // #1258: A max_notes_length < 10 lets notes trivially bypass meaningful
+    // content validation. Zero in particular turns the length guard into
+    // `notes.len() > 0`, accepting any non-empty string unconditionally.
+    if new_max < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)
@@ -427,7 +409,8 @@ pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
 pub(crate) fn set_max_notes_length(env: Env, admin: Address, length: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
-    if length == 0 {
+    // #1258: Minimum 10 characters to prevent trivial bypass of notes validation.
+    if length < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)
@@ -459,7 +442,7 @@ pub(crate) fn set_eligibility_threshold(env: Env, admin: Address, value: u32) {
     let old = config.eligibility_threshold;
     config.eligibility_threshold = value;
     env.storage().persistent().set(&CONFIG, &config);
-    env.storage().persistent().extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &CONFIG);
     env.events().publish((symbol_short!("SET_ELIG"), admin.clone()), (old, value));
     env.events().publish(
         (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
@@ -501,7 +484,7 @@ pub(crate) fn update_scoring_weights(
     }
     let key = scoring_weights_key(&env, &asset_type);
     env.storage().persistent().set(&key, &weights_json);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
     env.events().publish(
         (symbol_short!("SCR_WT"), asset_type.clone()),
         weights_json.clone(),
@@ -690,7 +673,7 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
             let mut kept: Vec<(u64, u64)> = Vec::new(&env);
             for i in start..vh.len() { kept.push_back(vh.get(i).unwrap()); }
             env.storage().persistent().set(&val_key, &kept);
-            env.storage().persistent().extend_ttl(&val_key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &val_key);
         }
     }
     env.events().publish((symbol_short!("PRUNE"), admin.clone()), asset_id);

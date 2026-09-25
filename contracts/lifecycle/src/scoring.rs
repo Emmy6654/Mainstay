@@ -45,30 +45,34 @@ pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u
         if last.0 == timestamp {
             history.set(last_idx, (timestamp, value));
             env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            shared::extend_persistent_ttl(&env, &key);
             return;
         }
     }
 
-    if max_history > 0 && history.len() >= max_history {
+    // Treat max_history == 0 as "use contract default" so callers that pass
+    // zero (e.g. during initialisation before config is set) never leave the
+    // history vector unbounded.  Fixes #1198.
+    let effective_max = if max_history == 0 {
+        super::DEFAULT_MAX_HISTORY
+    } else {
+        max_history
+    };
+    if history.len() >= effective_max {
         history.remove(0);
     }
     history.push_back((timestamp, value));
     env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &key);
 }
 
-pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
+pub fn get_task_weight(_env: &Env, task_type: &Symbol, config: &Config) -> u32 {
     // First check if task type has a configured weight
     if let Some(weight) = config.task_weights.get(task_type.clone()) {
         return weight;
     }
 
-    // Fall back to default hardcoded weights
+    // Fall back to hardcoded built-in weights
     if task_type == &symbol_short!("OIL_CHG")
         || task_type == &symbol_short!("LUBE")
         || task_type == &symbol_short!("INSPECT")
@@ -87,7 +91,16 @@ pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
     {
         return super::MAX_BUILT_IN_TASK_WEIGHT;
     }
-    panic_with_error!(env, ContractError::InvalidTaskType);
+
+    // Unknown task type: return the configurable default weight instead of
+    // panicking. A zero value in `config.default_task_weight` means "use the
+    // contract-level constant", so operators never accidentally configure a
+    // silent no-op weight (see issue #1200).
+    if config.default_task_weight > 0 {
+        config.default_task_weight
+    } else {
+        super::DEFAULT_TASK_WEIGHT
+    }
 }
 
 pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {

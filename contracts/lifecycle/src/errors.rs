@@ -62,18 +62,13 @@ pub enum ContractError {
     StandardAlreadyRegistered = 36,
     /// Engineer has exceeded the configured max_submissions_per_hour rate limit.
     RateLimitExceeded = 37,
-    /// The supplied invoice evidence is empty or does not match the recorded cost.
-    InvalidCostReconciliation = 38,
-    /// A task group contains an invalid or duplicate record timestamp.
-    InvalidTaskGroup = 39,
-    /// A maintenance record already has a dispute or evidence item with this identifier.
-    DuplicateDispute = 40,
-    /// The supplied evidence content hash is empty.
-    InvalidEvidenceHash = 41,
-    /// A dispute has already been resolved and cannot be changed.
-    DisputeAlreadyResolved = 42,
-    /// A dispute references a record that is not in the asset history.
-    DisputedRecordNotFound = 43,
+    /// Bulk engineer authorization revocation exceeds the maximum allowed batch size.
+    BatchRevokeTooLarge = 38,
+    /// The admins list supplied to set_admin_quorum exceeds the maximum allowed size (10).
+    TooManyAdmins = 39,
+    /// Insufficient fee provided for the maintenance submission priority level (#1313).
+    InsufficientFee = 40,
+    ConflictOfInterest = 41,
 }
 
 impl From<SharedContractError> for ContractError {
