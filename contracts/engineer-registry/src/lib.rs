@@ -48,6 +48,9 @@ pub enum ContractError {
     ConflictOverrideRequired = 31,
     InvalidOnCallSchedule = 32,
     OnCallScheduleNotFound = 33,
+    InvalidWorkWindow = 34,
+    EngineerUnavailable = 35,
+    WorkAssignmentNotFound = 36,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -149,6 +152,36 @@ pub struct OnCallSchedule {
 }
 
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentStatus {
+    Assigned = 0,
+    InProgress = 1,
+    Completed = 2,
+    Cancelled = 3,
+}
+
+/// A declared period in which an engineer can accept work.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityWindow {
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub max_assignments: u32,
+}
+
+/// A task assignment with a bounded time window and lifecycle status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkAssignment {
+    pub assignment_id: u64,
+    pub engineer: Address,
+    pub task_type: Symbol,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub status: AssignmentStatus,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineerStatus {
     Active = 0,
@@ -213,6 +246,9 @@ const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
 const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
 const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
+const AVAILABILITY_KEY: Symbol = symbol_short!("AVAIL");
+const WORKLOAD_KEY: Symbol = symbol_short!("WORK");
+const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 /// Default reputation decay interval: 90 days in seconds (#1315)
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
@@ -1949,6 +1985,144 @@ impl EngineerRegistry {
             }
         }
         engineers
+    }
+
+    /// Declare an engineer's available work window.
+    pub fn set_availability(
+        env: Env,
+        engineer: Address,
+        starts_at: u64,
+        ends_at: u64,
+        max_assignments: u32,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        if ends_at <= starts_at || max_assignments == 0 {
+            panic_with_error!(&env, ContractError::InvalidWorkWindow);
+        }
+        let key = (AVAILABILITY_KEY, engineer);
+        env.storage().persistent().set(
+            &key,
+            &AvailabilityWindow {
+                starts_at,
+                ends_at,
+                max_assignments,
+            },
+        );
+        extend_persistent_ttl(&env, &key);
+    }
+
+    /// Assign work only when the engineer has declared availability and
+    /// capacity for the complete task window.
+    pub fn assign_task(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        task_type: Symbol,
+        starts_at: u64,
+        ends_at: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if ends_at <= starts_at {
+            panic_with_error!(&env, ContractError::InvalidWorkWindow);
+        }
+        let record = env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+        let availability: AvailabilityWindow = env
+            .storage()
+            .persistent()
+            .get(&(AVAILABILITY_KEY, engineer.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerUnavailable));
+        if starts_at < availability.starts_at || ends_at > availability.ends_at {
+            panic_with_error!(&env, ContractError::EngineerUnavailable);
+        }
+
+        let key = (WORKLOAD_KEY, engineer.clone());
+        let mut assignments: Vec<WorkAssignment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut overlapping = 0u32;
+        for assignment in assignments.iter() {
+            if assignment.status != AssignmentStatus::Completed
+                && assignment.status != AssignmentStatus::Cancelled
+                && assignment.starts_at < ends_at
+                && starts_at < assignment.ends_at
+            {
+                overlapping = overlapping.saturating_add(1);
+            }
+        }
+        if overlapping >= availability.max_assignments {
+            panic_with_error!(&env, ContractError::EngineerUnavailable);
+        }
+
+        let assignment_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&NEXT_ASSIGNMENT_ID_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&NEXT_ASSIGNMENT_ID_KEY, &assignment_id.saturating_add(1));
+        extend_persistent_ttl(&env, &NEXT_ASSIGNMENT_ID_KEY);
+        assignments.push_back(WorkAssignment {
+            assignment_id,
+            engineer: engineer.clone(),
+            task_type,
+            starts_at,
+            ends_at,
+            status: AssignmentStatus::Assigned,
+        });
+        env.storage().persistent().set(&key, &assignments);
+        extend_persistent_ttl(&env, &key);
+        assignment_id
+    }
+
+    /// Update the lifecycle status of an assignment.
+    pub fn update_assignment_status(
+        env: Env,
+        engineer: Address,
+        assignment_id: u64,
+        status: AssignmentStatus,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let key = (WORKLOAD_KEY, engineer.clone());
+        let mut assignments: Vec<WorkAssignment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
+        for i in 0..assignments.len() {
+            let mut assignment = assignments.get(i).unwrap();
+            if assignment.assignment_id == assignment_id {
+                assignment.status = status;
+                assignments.set(i, assignment);
+                env.storage().persistent().set(&key, &assignments);
+                extend_persistent_ttl(&env, &key);
+                return;
+            }
+        }
+        panic_with_error!(&env, ContractError::WorkAssignmentNotFound);
+    }
+
+    /// Return all assignments recorded for an engineer.
+    pub fn get_engineer_workload(env: Env, engineer: Address) -> Vec<WorkAssignment> {
+        env.storage()
+            .persistent()
+            .get(&(WORKLOAD_KEY, engineer))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn set_ce_requirement(
