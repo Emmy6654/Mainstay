@@ -189,6 +189,16 @@ server {
         proxy_set_header X-Request-ID $mainstay_request_id;
         add_header X-Request-ID $mainstay_request_id always;
 
+        proxy_cache mainstay_api;
+        proxy_cache_methods GET HEAD;
+        proxy_cache_key "$scheme$request_method$host$request_uri$http_x_api_key";
+        proxy_cache_bypass $http_authorization;
+        proxy_no_cache $http_authorization $upstream_http_set_cookie;
+        proxy_cache_valid 200 5s;
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating;
+        add_header X-Cache-Status $upstream_cache_status always;
+
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-Frame-Options "DENY" always;
