@@ -4220,6 +4220,36 @@ mod tests {
     }
 
     #[test]
+    fn apprenticeship_scenario_promotes_engineer_after_mentor_approval() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        let apprentice = setup_engineer(&env, &client, &issuer, 203);
+
+        client.start_apprenticeship(&apprentice, &mentor, &100);
+        assert_eq!(client.get_engineer_tier(&apprentice), EngineerTier::Apprentice);
+        assert_eq!(
+            client.try_complete_apprenticeship(&apprentice),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ApprenticeshipNotComplete as u32,
+            )))
+        );
+
+        client.record_apprenticeship_hours(&apprentice, &60);
+        client.record_apprenticeship_hours(&apprentice, &60);
+        client.complete_apprenticeship(&apprentice);
+
+        assert_eq!(client.get_engineer_tier(&apprentice), EngineerTier::Full);
+        assert_eq!(
+            client.try_get_engineer_tier(&apprentice).unwrap(),
+            EngineerTier::Full
+        );
+    }
+
+    #[test]
     fn test_batch_verify_engineers_all_active() {
         let env = Env::default();
         env.mock_all_auths();
