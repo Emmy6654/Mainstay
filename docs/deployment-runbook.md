@@ -17,6 +17,12 @@ Docker command-line arguments. Vault Agent renders `/run/mainstay/mainstay.env`
 with mode `0600`; rotating the KV value is picked up by the agent template
 without changing Terraform state.
 
+Create the Vault AWS-auth role with the least-privilege policy in
+`terraform/vault-api-policy.hcl`. Store third-party credentials under the KV
+path configured by `vault_secret_path`, rotate them in Vault, and revoke the
+old value after the agent has rendered the replacement. The API proxy does not
+include `X-API-Key` values in access logs.
+
 ---
 
 ## 0. Formal Security Audit Requirement
