@@ -82,7 +82,7 @@ map $http_origin $cors_origin {
 limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
 limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
-log_format ratelimit '$remote_addr [$time_local] "$request" $status '
+log_format ratelimit '$remote_addr [$time_local] "$request_method $uri" $status '
                      'limit_req=$limit_req_status';
 
 upstream api_backend {

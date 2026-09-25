@@ -166,9 +166,29 @@ resource "aws_dynamodb_table" "data_subject_requests" {
   }
 }
 
+resource "aws_cloudwatch_log_group" "nginx_access" {
+  name              = "/mainstay/nginx/access"
+  retention_in_days = var.log_retention_days
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
+resource "aws_cloudwatch_log_group" "nginx_error" {
+  name              = "/mainstay/nginx/error"
+  retention_in_days = var.log_retention_days
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
 resource "aws_sqs_queue" "data_subject_requests" {
   name                       = "mainstay-data-subject-requests-${var.region}"
-  message_retention_seconds = 604800
+  message_retention_seconds = var.request_retention_seconds
   receive_wait_time_seconds = 20
   visibility_timeout_seconds = 300
   sqs_managed_sse_enabled   = true
@@ -297,6 +317,13 @@ resource "aws_launch_template" "api" {
   }))
 
   vpc_security_group_ids = [aws_security_group.api.id]
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      encrypted = true
+    }
+  }
   iam_instance_profile {
     name = aws_iam_instance_profile.api.name
   }
