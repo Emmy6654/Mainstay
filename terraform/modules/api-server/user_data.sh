@@ -59,6 +59,8 @@ docker run -d \
   -e STELLAR_RPC_URL="$RPC_URL" \
   -e STELLAR_NETWORK_PASSPHRASE="$NETWORK" \
   -e DEPLOY_REGION="$REGION" \
+  -e DSAR_TABLE_NAME="${dsar_table_name}" \
+  -e DSAR_QUEUE_URL="${dsar_queue_url}" \
   -e RUST_LOG=info \
   --memory="512m" \
   --cpus="1" \

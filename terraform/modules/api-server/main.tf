@@ -136,6 +136,88 @@ resource "aws_security_group_rule" "api_from_alb" {
   description              = "HTTP only from the ALB"
 }
 
+# ── Data-subject request processing ─────────────────────────
+resource "aws_dynamodb_table" "data_subject_requests" {
+  name         = "mainstay-data-subject-requests-${var.region}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "request_id"
+
+  attribute {
+    name = "request_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = {
+    Name    = "mainstay-data-subject-requests-${var.region}"
+    Project = "Mainstay"
+  }
+}
+
+resource "aws_sqs_queue" "data_subject_requests" {
+  name                       = "mainstay-data-subject-requests-${var.region}"
+  message_retention_seconds = 604800
+  receive_wait_time_seconds = 20
+  visibility_timeout_seconds = 300
+  sqs_managed_sse_enabled   = true
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
+resource "aws_iam_role" "api" {
+  name = "mainstay-api-${var.region}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "api_privacy" {
+  name = "mainstay-api-privacy-${var.region}"
+  role = aws_iam_role.api.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.data_subject_requests.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.data_subject_requests.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "api" {
+  name = "mainstay-api-${var.region}"
+  role = aws_iam_role.api.name
+}
+
 # ── Application Load Balancer ──────────────────────────────
 resource "aws_lb" "api" {
   name               = "mainstay-api-${replace(var.region, "-", "")}"
@@ -206,13 +288,18 @@ resource "aws_launch_template" "api" {
   key_name      = var.key_name
 
   user_data = base64encode(templatefile("${path.module}/user_data.sh", {
-    region       = var.region
-    rpc_url      = var.rpc_url
-    network      = var.network_passphrase
+    region          = var.region
+    rpc_url         = var.rpc_url
+    network         = var.network_passphrase
     allowed_origins = var.allowed_origins
+    dsar_table_name = aws_dynamodb_table.data_subject_requests.name
+    dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
   }))
 
   vpc_security_group_ids = [aws_security_group.api.id]
+  iam_instance_profile {
+    name = aws_iam_instance_profile.api.name
+  }
 
   metadata_options {
     http_tokens   = "required"
