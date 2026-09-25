@@ -7161,6 +7161,7 @@ impl Lifecycle {
             .persistent()
             .get(&baseline_key)
             .unwrap_or_else(|| Vec::new(&env));
+        let detected = Self::check_score_anomaly(env.clone(), asset_id, score);
 
         // Keep last 20 scores for moving average
         const MAX_BASELINE: usize = 20;
@@ -7171,6 +7172,29 @@ impl Lifecycle {
         baseline_scores.push_back(score as u64);
         env.storage().persistent().set(&baseline_key, &baseline_scores);
         shared::extend_persistent_ttl(&env, &baseline_key);
+
+        if let Some((stdev_multiple, baseline_score)) = detected {
+            let anomalies_key = score_anomalies_key(asset_id);
+            let mut anomalies: Vec<ScoreAnomaly> = env
+                .storage()
+                .persistent()
+                .get(&anomalies_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            anomalies.push_back(ScoreAnomaly {
+                asset_id,
+                timestamp: env.ledger().timestamp(),
+                baseline_score,
+                observed_score: score,
+                standard_deviation_multiple: stdev_multiple,
+                investigation_status: symbol_short!("PENDING"),
+            });
+            env.storage().persistent().set(&anomalies_key, &anomalies);
+            shared::extend_persistent_ttl(&env, &anomalies_key);
+            env.events().publish(
+                (symbol_short!("ANOMALY"), asset_id),
+                (baseline_score, score, stdev_multiple),
+            );
+        }
     }
 
     /// Get list of registered score providers.
