@@ -4180,6 +4180,46 @@ mod tests {
     }
 
     #[test]
+    fn ce_compliance_matches_reference_window_model() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        let engineer = setup_engineer(&env, &client, &issuer, 202);
+        let specialization = symbol_short!("solar_pnl");
+        client.add_specialization(&issuer, &engineer, &specialization);
+        client.set_ce_requirement(&admin, &specialization, &10, &100);
+
+        env.ledger().set_timestamp(1_000);
+        let now = env.ledger().timestamp();
+        let completions = [
+            ContinuingEducation { hours: 4, completed_at: now, topic: specialization.clone() },
+            ContinuingEducation { hours: 7, completed_at: now - 50, topic: specialization.clone() },
+            ContinuingEducation { hours: 100, completed_at: now - 101, topic: specialization.clone() },
+            ContinuingEducation { hours: 100, completed_at: now, topic: symbol_short!("wind_turb") },
+        ];
+        for completion in completions.iter() {
+            client.register_ce_completion(&admin, &engineer, completion);
+        }
+
+        let required_hours = 10u32;
+        let cutoff = now.saturating_sub(100);
+        let reference_hours = completions
+            .iter()
+            .filter(|completion| {
+                completion.topic == specialization && completion.completed_at >= cutoff
+            })
+            .map(|completion| completion.hours)
+            .sum::<u32>();
+
+        assert_eq!(
+            client.verify_engineer_ce_compliance(&engineer),
+            reference_hours >= required_hours
+        );
+    }
+
+    #[test]
     fn test_batch_verify_engineers_all_active() {
         let env = Env::default();
         env.mock_all_auths();
