@@ -4139,6 +4139,46 @@ mod tests {
         engineer
     }
 
+    proptest::proptest! {
+        #[test]
+        fn service_area_membership_matches_every_region_combination(
+            selected in proptest::array::uniform5(proptest::bool::ANY),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, admin) = setup(&env);
+            let issuer = Address::generate(&env);
+            client.add_trusted_issuer(&admin, &issuer);
+            let engineer = setup_engineer(&env, &client, &issuer, 201);
+            let regions = [
+                Region::NorthAmerica,
+                Region::LatinAmerica,
+                Region::Europe,
+                Region::MiddleEastAfrica,
+                Region::AsiaPacific,
+            ];
+            let configured = regions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, region)| selected[index].then_some(*region))
+                .collect::<soroban_sdk::Vec<_>>();
+            let configured = soroban_sdk::Vec::from_slice(&env, &configured);
+
+            client.set_engineer_service_area(&engineer, &configured);
+
+            for (index, region) in regions.iter().enumerate() {
+                let matches = client
+                    .get_engineers_for_region(region)
+                    .contains(&engineer);
+                assert_eq!(
+                    matches,
+                    selected[index],
+                    "region membership diverged for region index {index}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_batch_verify_engineers_all_active() {
         let env = Env::default();
