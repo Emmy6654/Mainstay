@@ -46,6 +46,8 @@ pub enum ContractError {
     ApprenticeshipNotComplete = 29,
     ConflictOfInterest = 30,
     ConflictOverrideRequired = 31,
+    InvalidOnCallSchedule = 32,
+    OnCallScheduleNotFound = 33,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -134,6 +136,18 @@ pub struct TrainingRecord {
     pub issuer: Address,
 }
 
+/// A time-bounded emergency on-call assignment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnCallSchedule {
+    pub schedule_id: u64,
+    pub engineer: Address,
+    pub region: Region,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub active: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineerStatus {
@@ -197,6 +211,8 @@ const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
 const CONFLICT_HISTORY_KEY: Symbol = symbol_short!("COI_HIST");
 const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
 const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
+const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
+const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
 /// Default reputation decay interval: 90 days in seconds (#1315)
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
@@ -1823,6 +1839,116 @@ impl EngineerRegistry {
             }
         }
         result
+    }
+
+    /// Publish an engineer's availability for emergency on-call coverage.
+    pub fn schedule_on_call(
+        env: Env,
+        engineer: Address,
+        region: Region,
+        starts_at: u64,
+        ends_at: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        if ends_at <= starts_at {
+            panic_with_error!(&env, ContractError::InvalidOnCallSchedule);
+        }
+        let engineer_record = env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        if !engineer_record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+
+        let schedule_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&NEXT_ON_CALL_ID_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&NEXT_ON_CALL_ID_KEY, &schedule_id.saturating_add(1));
+        extend_persistent_ttl(&env, &NEXT_ON_CALL_ID_KEY);
+
+        let key = (ON_CALL_KEY, region);
+        let mut schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        schedules.push_back(OnCallSchedule {
+            schedule_id,
+            engineer: engineer.clone(),
+            region,
+            starts_at,
+            ends_at,
+            active: true,
+        });
+        env.storage().persistent().set(&key, &schedules);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("ON_CALL"), engineer),
+            (schedule_id, region, starts_at, ends_at),
+        );
+        schedule_id
+    }
+
+    /// Remove an engineer's on-call assignment before its scheduled end.
+    pub fn cancel_on_call(env: Env, engineer: Address, region: Region, schedule_id: u64) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let key = (ON_CALL_KEY, region);
+        let mut schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
+        for i in 0..schedules.len() {
+            let mut schedule = schedules.get(i).unwrap();
+            if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
+                schedule.active = false;
+                schedules.set(i, schedule);
+                env.storage().persistent().set(&key, &schedules);
+                extend_persistent_ttl(&env, &key);
+                return;
+            }
+        }
+        panic_with_error!(&env, ContractError::OnCallScheduleNotFound);
+    }
+
+    /// Return active on-call schedules for a region at a timestamp.
+    pub fn get_on_call_schedules(
+        env: Env,
+        region: Region,
+        at: u64,
+    ) -> Vec<OnCallSchedule> {
+        let schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&(ON_CALL_KEY, region))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut active = Vec::new(&env);
+        for schedule in schedules.iter() {
+            if schedule.active && schedule.starts_at <= at && at < schedule.ends_at {
+                active.push_back(schedule);
+            }
+        }
+        active
+    }
+
+    /// Return the engineer addresses currently assigned to on-call coverage.
+    pub fn get_on_call_engineers(env: Env, region: Region, at: u64) -> Vec<Address> {
+        let schedules = Self::get_on_call_schedules(env.clone(), region, at);
+        let mut engineers = Vec::new(&env);
+        for schedule in schedules.iter() {
+            if !engineers.contains(schedule.engineer.clone()) {
+                engineers.push_back(schedule.engineer);
+            }
+        }
+        engineers
     }
 
     pub fn set_ce_requirement(
