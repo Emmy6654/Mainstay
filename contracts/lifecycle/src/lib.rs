@@ -12,6 +12,7 @@ pub(crate) mod admin;
 pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     environmental_impact_key, health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
+    update_subscribers_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
@@ -3805,6 +3806,62 @@ impl Lifecycle {
             }
         }
         report
+    }
+
+    /// Subscribe an address to update events for an asset.
+    ///
+    /// Soroban contracts cannot make outbound HTTP requests. Subscribers give
+    /// an off-chain webhook relay a durable, on-chain subscription list while
+    /// the relay consumes the lifecycle events in real time.
+    pub fn subscribe_to_updates(env: Env, asset_id: u64, subscriber: Address) {
+        subscriber.require_auth();
+        let key = update_subscribers_key(asset_id);
+        let mut subscribers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for existing in subscribers.iter() {
+            if existing == subscriber {
+                return;
+            }
+        }
+        subscribers.push_back(subscriber.clone());
+        env.storage().persistent().set(&key, &subscribers);
+        extend_persistent_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("SUB_UPD"), asset_id), subscriber);
+    }
+
+    /// Remove an address from an asset's update subscriptions.
+    pub fn unsubscribe_from_updates(env: Env, asset_id: u64, subscriber: Address) {
+        subscriber.require_auth();
+        let key = update_subscribers_key(asset_id);
+        let mut subscribers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut index = 0;
+        while index < subscribers.len() {
+            if subscribers.get(index).unwrap() == subscriber {
+                subscribers.remove(index);
+                break;
+            }
+            index += 1;
+        }
+        env.storage().persistent().set(&key, &subscribers);
+        extend_persistent_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("UNSUB_UPD"), asset_id), subscriber);
+    }
+
+    /// List the addresses subscribed to an asset's lifecycle updates.
+    pub fn get_update_subscribers(env: Env, asset_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&update_subscribers_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns the average maintenance cost for a specific task type on an asset.

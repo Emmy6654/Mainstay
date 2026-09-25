@@ -21,6 +21,11 @@ pub(crate) fn environmental_impact_key(asset_id: u64, record_index: u32) -> (Sym
     (symbol_short!("ENV_IMP"), asset_id, record_index)
 }
 
+/// Addresses interested in real-time lifecycle updates for an asset.
+pub(crate) fn update_subscribers_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("UPD_SUB"), asset_id)
+}
+
 /// Current collateral score for an asset: `u32`.
 pub(crate) fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
