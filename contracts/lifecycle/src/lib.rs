@@ -14,7 +14,7 @@ pub(crate) use storage::{
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
-    maintenance_audit_key, maintenance_attestations_key,
+    maintenance_audit_key, maintenance_attestations_key, attestor_auth_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -1104,6 +1104,82 @@ impl Lifecycle {
                 already_present = true;
                 break;
             }
+        }
+
+        /// Authorize an independent party to attest maintenance records for an asset.
+        pub fn authorize_attestor(env: Env, owner: Address, asset_id: u64, attestor: Address) {
+            ensure_not_paused(&env);
+            owner.require_auth();
+            let asset_registry = get_asset_registry_addr(&env);
+            verify_asset_exists(&env, &asset_registry, &asset_id);
+            let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                .get_asset(&asset_id);
+            if asset.owner != owner {
+                panic_with_error!(&env, ContractError::UnauthorizedOwner);
+            }
+            let key = attestor_auth_key(asset_id, &attestor);
+            env.storage().persistent().set(&key, &true);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Record an attestation from an owner-authorized independent party.
+        pub fn attest_maintenance(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            attestor: Address,
+            statement: Bytes,
+        ) {
+            ensure_not_paused(&env);
+            attestor.require_auth();
+            let auth_key = attestor_auth_key(asset_id, &attestor);
+            if !env.storage().persistent().get::<_, bool>(&auth_key).unwrap_or(false) {
+                panic_with_error!(&env, ContractError::UnauthorizedAttestor);
+            }
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut found = false;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                panic_with_error!(&env, ContractError::RecordNotFound);
+            }
+            let key = DataKey::MaintenanceAttestations(asset_id);
+            let mut attestations: Vec<MaintenanceAttestation> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            attestations.push_back(MaintenanceAttestation {
+                asset_id,
+                record_timestamp,
+                attestor: attestor.clone(),
+                statement,
+                timestamp: env.ledger().timestamp(),
+            });
+            env.storage().persistent().set(&key, &attestations);
+            extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (symbol_short!("MNT_ATTEST"), asset_id),
+                (record_timestamp, attestor),
+            );
+        }
+
+        pub fn get_maintenance_attestations(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceAttestation> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceAttestations(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
         }
         if !already_present {
             list.push_back(engineer);
