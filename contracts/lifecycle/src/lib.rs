@@ -26,8 +26,8 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, CostReconciliation, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    DisputeStatus, MaintenanceDispute, ScoreEntry, TaskGroup, TimelockProposal, TransferRecord,
-    WeightProposal,
+    DisputeStatus, EvidenceAttachment, MaintenanceDispute, ScoreEntry, TaskGroup,
+    TimelockProposal, TransferRecord, WeightProposal,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -3453,6 +3453,74 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .get(&DataKey::Disputes(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Attach a SHA-256 content hash for off-chain evidence to a record.
+    ///
+    /// The evidence itself remains in the operator's content store; this
+    /// immutable on-chain hash lets anyone verify that downloaded evidence
+    /// matches what was submitted.
+    pub fn add_maintenance_evidence(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+        engineer: Address,
+        content_hash: Bytes,
+    ) {
+        engineer.require_auth();
+        if content_hash.len() != 32 {
+            panic_with_error!(&env, ContractError::InvalidEvidenceHash);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut authorized = false;
+        for record in history.iter() {
+            if record.timestamp == record_timestamp && record.engineer == engineer {
+                authorized = true;
+                break;
+            }
+        }
+        if !authorized {
+            panic_with_error!(&env, ContractError::DisputedRecordNotFound);
+        }
+        let key = DataKey::Evidence(asset_id, record_timestamp);
+        let mut evidence: Vec<EvidenceAttachment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if evidence
+            .iter()
+            .any(|item| item.content_hash == content_hash)
+        {
+            panic_with_error!(&env, ContractError::InvalidEvidenceHash);
+        }
+        evidence.push_back(EvidenceAttachment {
+            content_hash,
+            submitted_by: engineer,
+            submitted_at: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &evidence);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("EVIDENCE"), asset_id),
+            (record_timestamp, evidence.len()),
+        );
+    }
+
+    /// Return all evidence hashes attached to a maintenance record.
+    pub fn get_maintenance_evidence(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+    ) -> Vec<EvidenceAttachment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Evidence(asset_id, record_timestamp))
             .unwrap_or_else(|| Vec::new(&env))
     }
 

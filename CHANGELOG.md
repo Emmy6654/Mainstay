@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added invoice cost reconciliation, task grouping, maintenance dispute resolution,
+  and hash-based maintenance evidence attachments to the lifecycle contract.
+
 ### Added
 - `.github/CODEOWNERS`: required-reviewer rules gate all PRs touching `contracts/`, CI workflows, `SECURITY.md`, and the threat-model doc (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
 - `CONTRIBUTING.md`: documented branch-protection requirements (1 approval + passing CI, no force-push) and the CODEOWNERS review expectation for `contracts/` (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))

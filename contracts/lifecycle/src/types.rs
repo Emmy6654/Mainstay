@@ -99,6 +99,15 @@ pub struct MaintenanceDispute {
     pub resolved_at: Option<u64>,
 }
 
+/// A content hash for off-chain maintenance evidence such as a photo or invoice.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceAttachment {
+    pub content_hash: Bytes,
+    pub submitted_by: Address,
+    pub submitted_at: u64,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
