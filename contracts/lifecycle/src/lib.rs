@@ -14,6 +14,7 @@ pub(crate) use storage::{
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    maintenance_audit_key, maintenance_attestations_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -29,7 +30,8 @@ use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_
 use crate::types::{
     AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, ComplianceReport, Config, CostAnalytics, DataKey, EngineerProductivity, FleetPerformance, HealthSnapshot, IndustryBenchmark,
     MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
+    MaintenanceAttestation,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -222,6 +224,18 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
     } else {
         let last = history.get(history.len() - 1).unwrap();
         Some(hash_maintenance_record(env, &last))
+    }
+
+    fn append_maintenance_audit(env: &Env, asset_id: u64, entry: MaintenanceAuditEntry) {
+        let key = DataKey::MaintenanceAudit(asset_id);
+        let mut entries: Vec<MaintenanceAuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        entries.push_back(entry);
+        env.storage().persistent().set(&key, &entries);
+        extend_persistent_ttl(env, &key);
     }
 }
 
@@ -2274,10 +2288,19 @@ impl Lifecycle {
         };
 
         history.push_back(record);
+        let audit_entry = MaintenanceAuditEntry {
+            asset_id,
+            record_timestamp: timestamp,
+            actor: engineer.clone(),
+            action: symbol_short!("SUBMIT"),
+            record_hash: hash_maintenance_record(&env, &history.get(history.len() - 1).unwrap()),
+            timestamp,
+        };
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
+        append_maintenance_audit(&env, asset_id, audit_entry);
 
         // #1222: Advance next_due for any recurring task this submission satisfies,
         // so the schedule doesn't stay perpetually overdue after the first submission.
@@ -2760,6 +2783,18 @@ impl Lifecycle {
         // All validation passed — now commit everything atomically.
         for record in new_records.iter() {
             history.push_back(record);
+            append_maintenance_audit(
+                &env,
+                asset_id,
+                MaintenanceAuditEntry {
+                    asset_id,
+                    record_timestamp: record.timestamp,
+                    actor: engineer.clone(),
+                    action: symbol_short!("SUBMIT"),
+                    record_hash: hash_maintenance_record(&env, record),
+                    timestamp,
+                },
+            );
         }
         for entry in score_entries.iter() {
             score_history_push(&env, asset_id, entry, config.max_history);
@@ -3221,6 +3256,17 @@ impl Lifecycle {
             .persistent()
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return the append-only audit trail for an asset's maintenance records.
+    pub fn get_maintenance_audit(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<MaintenanceAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceAudit(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Get a paginated slice of the maintenance history for an asset (#996).
