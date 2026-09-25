@@ -1944,9 +1944,14 @@ impl EngineerRegistry {
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MENTOR_START"), apprentice),
+            (env.ledger().timestamp(), hours_required),
+        );
     }
 
     pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
+        ensure_not_paused(&env);
         let key = (APP_KEY, apprentice);
         let mut apprenticeship: Apprenticeship = env
             .storage()
@@ -1960,6 +1965,10 @@ impl EngineerRegistry {
             .min(apprenticeship.hours_required);
         env.storage().persistent().set(&key, &apprenticeship);
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MENTOR_HOURS"), apprentice),
+            (hours, apprenticeship.hours_completed),
+        );
     }
 
     pub fn complete_apprenticeship(env: Env, apprentice: Address) {
@@ -1983,6 +1992,19 @@ impl EngineerRegistry {
         env.storage().persistent().set(&engineer_key(&apprentice), &record);
         env.storage().persistent().remove(&key);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
+        env.events().publish(
+            (symbol_short!("MENTOR_DONE"), apprentice),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Return the active mentorship agreement for an apprentice.
+    ///
+    /// The agreement is removed after `complete_apprenticeship` succeeds.
+    pub fn get_apprenticeship(env: Env, apprentice: Address) -> Option<Apprenticeship> {
+        env.storage()
+            .persistent()
+            .get(&(APP_KEY, apprentice))
     }
 
     pub fn get_engineer_tier(env: Env, engineer: Address) -> EngineerTier {
