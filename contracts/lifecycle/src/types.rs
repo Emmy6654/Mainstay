@@ -57,6 +57,16 @@ pub struct MaintenanceRecord {
     pub previous_record_hash: Option<Bytes>,
 }
 
+/// Evidence that a recorded maintenance cost was reconciled with an invoice.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostReconciliation {
+    pub invoice_hash: Bytes,
+    pub verified_cost: u64,
+    pub verified_by: Address,
+    pub verified_at: u64,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +200,14 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
+    /// Invoice reconciliation for a maintenance record, keyed by asset and timestamp.
+    CostReconciliation(u64, u64),
+    /// Related maintenance record timestamps grouped by an external work-order ID.
+    TaskGroup(u64, Bytes),
+    /// Disputes raised against maintenance records for an asset.
+    Disputes(u64),
+    /// Content hashes for evidence attached to a maintenance record.
+    Evidence(u64, u64),
     /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
     CollateralValuationHistory(u64),
 }

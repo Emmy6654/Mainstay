@@ -25,7 +25,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    BatchRecord, Config, CostReconciliation, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
 };
 use shared::extend_persistent_ttl;
@@ -3202,12 +3202,76 @@ impl Lifecycle {
                     count += 1;
                 }
             }
+
         }
         if count == 0 {
             0
         } else {
             total / count
         }
+    }
+
+    /// Reconcile a self-reported maintenance cost against an invoice.
+    ///
+    /// The invoice is kept off-chain; only its content hash and the verified
+    /// amount are stored on-chain. The verified amount must equal the record's
+    /// reported cost so indexers can distinguish reconciled records.
+    pub fn reconcile_maintenance_cost(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        record_timestamp: u64,
+        invoice_hash: Bytes,
+        verified_cost: u64,
+    ) {
+        require_admin(&env, &admin);
+        if invoice_hash.is_empty() {
+            panic_with_error!(&env, ContractError::InvalidCostReconciliation);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for record in history.iter() {
+            if record.timestamp == record_timestamp {
+                found = true;
+                if record.cost != Some(verified_cost) {
+                    panic_with_error!(&env, ContractError::InvalidCostReconciliation);
+                }
+                break;
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::NoMaintenanceHistory);
+        }
+        let key = DataKey::CostReconciliation(asset_id, record_timestamp);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::InvalidCostReconciliation);
+        }
+        env.storage().persistent().set(&key, &CostReconciliation {
+            invoice_hash,
+            verified_cost,
+            verified_by: admin,
+            verified_at: env.ledger().timestamp(),
+        });
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("COST_VER"), asset_id),
+            (record_timestamp, verified_cost),
+        );
+    }
+
+    /// Return invoice reconciliation data for a maintenance record, if present.
+    pub fn get_cost_reconciliation(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+    ) -> Option<CostReconciliation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CostReconciliation(asset_id, record_timestamp))
     }
 
     /// View alias for [`get_last_service`].
