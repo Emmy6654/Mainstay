@@ -132,6 +132,24 @@ resource "aws_lb_listener" "http" {
       port        = "443"
       status_code = "HTTP_301"
     }
+
+    resource "aws_iam_role" "api" {
+      name = "mainstay-api-${var.region}"
+
+      assume_role_policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [{
+          Effect    = "Allow"
+          Principal = { Service = "ec2.amazonaws.com" }
+          Action    = "sts:AssumeRole"
+        }]
+      })
+    }
+
+    resource "aws_iam_instance_profile" "api" {
+      name = "mainstay-api-${var.region}"
+      role = aws_iam_role.api.name
+    }
   }
 }
 
@@ -146,7 +164,14 @@ resource "aws_launch_template" "api" {
     region       = var.region
     rpc_url      = var.rpc_url
     network      = var.network_passphrase
+    vault_address = var.vault_address
+    vault_aws_role = var.vault_aws_role
+    vault_secret_path = var.vault_secret_path
   }))
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.api.name
+  }
 
   vpc_security_group_ids = [aws_security_group.api.id]
 

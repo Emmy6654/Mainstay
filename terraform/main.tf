@@ -192,6 +192,9 @@ module "api_server_us_east_1" {
   acm_certificate_arn = var.acm_certificate_arns["us-east-1"]
   rpc_url             = var.rpc_urls["us-east-1"]
   network_passphrase  = var.network_passphrase
+  vault_address       = var.vault_address
+  vault_aws_role      = var.vault_aws_role
+  vault_secret_path   = var.vault_secret_path
 
   providers = {
     aws = aws.us_east_1
@@ -209,6 +212,9 @@ module "api_server_eu_west_1" {
   acm_certificate_arn = var.acm_certificate_arns["eu-west-1"]
   rpc_url             = var.rpc_urls["eu-west-1"]
   network_passphrase  = var.network_passphrase
+  vault_address       = var.vault_address
+  vault_aws_role      = var.vault_aws_role
+  vault_secret_path   = var.vault_secret_path
 
   providers = {
     aws = aws.eu_west_1
@@ -226,6 +232,9 @@ module "api_server_ap_southeast_1" {
   acm_certificate_arn = var.acm_certificate_arns["ap-southeast-1"]
   rpc_url             = var.rpc_urls["ap-southeast-1"]
   network_passphrase  = var.network_passphrase
+  vault_address       = var.vault_address
+  vault_aws_role      = var.vault_aws_role
+  vault_secret_path   = var.vault_secret_path
 
   providers = {
     aws = aws.ap_southeast_1
