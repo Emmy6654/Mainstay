@@ -62,6 +62,23 @@ variable "network_passphrase" {
   default     = "Public Global Stellar Network ; September 2015"
 }
 
+variable "vault_address" {
+  description = "HashiCorp Vault address used by API instances"
+  type        = string
+  sensitive   = false
+}
+
+variable "vault_aws_role" {
+  description = "Vault AWS auth role mapped to the API instance profile"
+  type        = string
+}
+
+variable "vault_secret_path" {
+  description = "Vault KV path containing API and third-party credentials"
+  type        = string
+  default     = "secret/data/mainstay/api"
+}
+
 # ── SQS queues for cross-region cache invalidation ──────────
 resource "aws_sqs_queue" "cache_invalidation" {
   for_each = var.regions

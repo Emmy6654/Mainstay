@@ -39,6 +39,21 @@ variable "network_passphrase" {
   type        = string
 }
 
+variable "vault_address" {
+  description = "HashiCorp Vault address used by the API instance"
+  type        = string
+}
+
+variable "vault_aws_role" {
+  description = "Vault AWS auth role for this instance profile"
+  type        = string
+}
+
+variable "vault_secret_path" {
+  description = "Vault KV path containing API and third-party credentials"
+  type        = string
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"
