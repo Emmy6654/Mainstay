@@ -239,3 +239,7 @@ path = "test_concurrent_operations.rs"
 [[test]]
 name = "test_storage_growth"
 path = "test_storage_growth.rs"
+
+[[test]]
+name = "test_state_snapshots"
+path = "test_state_snapshots.rs"
