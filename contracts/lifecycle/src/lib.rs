@@ -12,7 +12,7 @@ pub(crate) mod admin;
 pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     environmental_impact_key, health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
-    update_subscribers_key,
+    maintenance_corrections_key, update_subscribers_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, user_submission_limit_key, retirement_state_key, retirement_certificate_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
@@ -28,7 +28,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, EnvironmentalImpact, EsgReport, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, EnvironmentalImpact, EsgReport, HealthSnapshot, MaintenanceCorrection, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -3866,6 +3866,73 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .get(&update_subscribers_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Append a correction for a maintenance record without changing its
+    /// original entry. Corrections are admin-authorized and versioned.
+    pub fn correct_maintenance_record(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        record_index: u32,
+        corrected_notes: Option<String>,
+        corrected_cost: Option<u64>,
+        reason: String,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory));
+        if history.get(record_index).is_none() {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
+        }
+        let key = maintenance_corrections_key(asset_id, record_index);
+        let mut corrections: Vec<MaintenanceCorrection> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let version = corrections.len().saturating_add(1);
+        let correction = MaintenanceCorrection {
+            asset_id,
+            record_index,
+            version,
+            corrected_notes,
+            corrected_cost,
+            reason,
+            corrected_by: admin.clone(),
+            corrected_at: env.ledger().timestamp(),
+        };
+        corrections.push_back(correction.clone());
+        env.storage().persistent().set(&key, &corrections);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MNT_CORR"), asset_id),
+            (record_index, version, admin),
+        );
+    }
+
+    /// Return every correction for a record, oldest version first.
+    pub fn get_maintenance_record_versions(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+    ) -> Vec<MaintenanceCorrection> {
+        env.storage()
+            .persistent()
+            .get(&maintenance_corrections_key(asset_id, record_index))
             .unwrap_or_else(|| Vec::new(&env))
     }
 

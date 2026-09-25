@@ -26,6 +26,11 @@ pub(crate) fn update_subscribers_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("UPD_SUB"), asset_id)
 }
 
+/// Append-only corrections for an asset's maintenance record.
+pub(crate) fn maintenance_corrections_key(asset_id: u64, record_index: u32) -> (Symbol, u64, u32) {
+    (symbol_short!("MNT_CORR"), asset_id, record_index)
+}
+
 /// Current collateral score for an asset: `u32`.
 pub(crate) fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)

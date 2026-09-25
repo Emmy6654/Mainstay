@@ -83,6 +83,20 @@ pub struct EsgReport {
     pub measured_records: u32,
 }
 
+/// An append-only correction for a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceCorrection {
+    pub asset_id: u64,
+    pub record_index: u32,
+    pub version: u32,
+    pub corrected_notes: Option<String>,
+    pub corrected_cost: Option<u64>,
+    pub reason: String,
+    pub corrected_by: Address,
+    pub corrected_at: u64,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
