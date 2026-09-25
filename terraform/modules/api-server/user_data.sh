@@ -169,7 +169,7 @@ mkdir -p /etc/nginx/ssl
 openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
   -keyout /etc/nginx/ssl/key.pem \
   -out /etc/nginx/ssl/cert.pem \
-  -subj "/CN=api.${REGION}.mainstay.io"
+  -subj "/CN=api.$${REGION}.mainstay.io"
 
 systemctl enable nginx
 systemctl restart nginx
