@@ -71,6 +71,8 @@ pub enum ContractError {
     ConflictOfInterest = 41,
     UnauthorizedAttestor = 42,
     RecordNotFound = 43,
+    CompressionFailed = 44,
+    CompressionRequiresDecommissioned = 45,
 }
 
 impl From<SharedContractError> for ContractError {
