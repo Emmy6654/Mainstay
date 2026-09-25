@@ -11,9 +11,10 @@ pub(crate) mod admin;
 // `super::history_key(...)` etc. in scoring.rs keep working unchanged.
 pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
-    health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
+    environmental_impact_key, health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
+    maintenance_corrections_key, update_subscribers_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    transfer_hist_key, submission_window_key, user_submission_limit_key, retirement_state_key, retirement_certificate_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -27,7 +28,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, EnvironmentalImpact, EsgReport, HealthSnapshot, MaintenanceCorrection, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -290,7 +291,12 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
 /// *before* any record is written, so a single large batch cannot bypass the
 /// cap the way `count` individual calls would be blocked.
 fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count: u32) {
-    if config.max_submissions_per_hour == 0 {
+    let limit: u32 = env
+        .storage()
+        .persistent()
+        .get(&user_submission_limit_key(engineer))
+        .unwrap_or(config.max_submissions_per_hour);
+    if limit == 0 {
         return;
     }
 
@@ -308,10 +314,10 @@ fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count
     let new_count = base_count
         .checked_add(count)
         .unwrap_or(u32::MAX);
-    if new_count > config.max_submissions_per_hour {
+    if new_count > limit {
         env.events().publish(
             (symbol_short!("RATE_LIM"), engineer.clone()),
-            (base_count, count, config.max_submissions_per_hour),
+            (base_count, count, limit),
         );
         panic_with_error!(env, ContractError::RateLimitExceeded);
     }
@@ -3733,6 +3739,203 @@ impl Lifecycle {
         result
     }
 
+    /// Attach measured environmental impact to an existing maintenance record.
+    ///
+    /// Impact is stored separately from the append-only record so existing
+    /// deployments can add ESG data without rewriting historical records.
+    pub fn record_environmental_impact(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+        impact: EnvironmentalImpact,
+        engineer: Address,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory));
+        let record = history
+            .get(record_index)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds));
+        if record.engineer != engineer {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        }
+        let key = environmental_impact_key(asset_id, record_index);
+        env.storage().persistent().set(&key, &impact);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("ESG_IMP"), asset_id),
+            (record_index, impact),
+        );
+    }
+
+    /// Return environmental impact measurements for a maintenance record.
+    pub fn get_environmental_impact(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+    ) -> Option<EnvironmentalImpact> {
+        env.storage()
+            .persistent()
+            .get(&environmental_impact_key(asset_id, record_index))
+    }
+
+    /// Aggregate measured maintenance impacts for ESG reporting.
+    pub fn get_esg_report(env: Env, asset_id: u64) -> EsgReport {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut report = EsgReport {
+            total_energy_wh: 0,
+            total_carbon_grams: 0,
+            total_waste_grams: 0,
+            measured_records: 0,
+        };
+        for index in 0..history.len() {
+            if let Some(impact) = env
+                .storage()
+                .persistent()
+                .get::<_, EnvironmentalImpact>(&environmental_impact_key(asset_id, index))
+            {
+                report.total_energy_wh = report.total_energy_wh.saturating_add(impact.energy_wh);
+                report.total_carbon_grams =
+                    report.total_carbon_grams.saturating_add(impact.carbon_grams);
+                report.total_waste_grams =
+                    report.total_waste_grams.saturating_add(impact.waste_grams);
+                report.measured_records = report.measured_records.saturating_add(1);
+            }
+        }
+        report
+    }
+
+    /// Subscribe an address to update events for an asset.
+    ///
+    /// Soroban contracts cannot make outbound HTTP requests. Subscribers give
+    /// an off-chain webhook relay a durable, on-chain subscription list while
+    /// the relay consumes the lifecycle events in real time.
+    pub fn subscribe_to_updates(env: Env, asset_id: u64, subscriber: Address) {
+        subscriber.require_auth();
+        let key = update_subscribers_key(asset_id);
+        let mut subscribers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for existing in subscribers.iter() {
+            if existing == subscriber {
+                return;
+            }
+        }
+        subscribers.push_back(subscriber.clone());
+        env.storage().persistent().set(&key, &subscribers);
+        extend_persistent_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("SUB_UPD"), asset_id), subscriber);
+    }
+
+    /// Remove an address from an asset's update subscriptions.
+    pub fn unsubscribe_from_updates(env: Env, asset_id: u64, subscriber: Address) {
+        subscriber.require_auth();
+        let key = update_subscribers_key(asset_id);
+        let mut subscribers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut index = 0;
+        while index < subscribers.len() {
+            if subscribers.get(index).unwrap() == subscriber {
+                subscribers.remove(index);
+                break;
+            }
+            index += 1;
+        }
+        env.storage().persistent().set(&key, &subscribers);
+        extend_persistent_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("UNSUB_UPD"), asset_id), subscriber);
+    }
+
+    /// List the addresses subscribed to an asset's lifecycle updates.
+    pub fn get_update_subscribers(env: Env, asset_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&update_subscribers_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Append a correction for a maintenance record without changing its
+    /// original entry. Corrections are admin-authorized and versioned.
+    pub fn correct_maintenance_record(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        record_index: u32,
+        corrected_notes: Option<String>,
+        corrected_cost: Option<u64>,
+        reason: String,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory));
+        if history.get(record_index).is_none() {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
+        }
+        let key = maintenance_corrections_key(asset_id, record_index);
+        let mut corrections: Vec<MaintenanceCorrection> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let version = corrections.len().saturating_add(1);
+        let correction = MaintenanceCorrection {
+            asset_id,
+            record_index,
+            version,
+            corrected_notes,
+            corrected_cost,
+            reason,
+            corrected_by: admin.clone(),
+            corrected_at: env.ledger().timestamp(),
+        };
+        corrections.push_back(correction.clone());
+        env.storage().persistent().set(&key, &corrections);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MNT_CORR"), asset_id),
+            (record_index, version, admin),
+        );
+    }
+
+    /// Return every correction for a record, oldest version first.
+    pub fn get_maintenance_record_versions(
+        env: Env,
+        asset_id: u64,
+        record_index: u32,
+    ) -> Vec<MaintenanceCorrection> {
+        env.storage()
+            .persistent()
+            .get(&maintenance_corrections_key(asset_id, record_index))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Returns the average maintenance cost for a specific task type on an asset.
     ///
     /// Only considers records matching the given `task_type`. Records with
@@ -5266,6 +5469,43 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        /// Set a per-user rolling-hour submission limit.
+        ///
+        /// This override is evaluated before the contract-wide default. Passing
+        /// `0` removes the override and restores the global limit.
+        pub fn update_user_submission_limit(
+            env: Env,
+            admin: Address,
+            user: Address,
+            new_max: u32,
+        ) {
+            ensure_not_paused(&env);
+            admin.require_auth();
+            let config: Config = env
+                .storage()
+                .persistent()
+                .get(&CONFIG)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+            if config.admin != admin {
+                panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+            }
+            let key = user_submission_limit_key(&user);
+            if new_max == 0 {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &new_max);
+                extend_persistent_ttl(&env, &key);
+            }
+            env.events().publish(
+                (symbol_short!("USR_RATE"), user.clone()),
+                (new_max, env.ledger().timestamp()),
+            );
+            env.events().publish(
+                (symbol_short!("ADM_AUD"), symbol_short!("USR_RATE")),
+                (admin, user, new_max),
+            );
+        }
+
         config.max_submissions_per_hour = new_max;
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -5305,7 +5545,12 @@ impl Lifecycle {
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
-        if config.max_submissions_per_hour == 0 {
+        let limit: u32 = env
+            .storage()
+            .persistent()
+            .get(&user_submission_limit_key(&engineer))
+            .unwrap_or(config.max_submissions_per_hour);
+        if limit == 0 {
             return true;
         }
 
@@ -5319,7 +5564,7 @@ impl Lifecycle {
         if now.saturating_sub(window_start) >= SUBMISSION_RATE_WINDOW_SECS {
             return true;
         }
-        count < config.max_submissions_per_hour
+        count < limit
     }
 
     /// Propose a WASM upgrade for the lifecycle contract.
