@@ -41,10 +41,55 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# ── Security Group ─────────────────────────────────────────
-resource "aws_security_group" "api" {
-  name        = "mainstay-api-${var.region}"
-  description = "Security group for Mainstay API servers"
+# ── Private subnets and egress ──────────────────────────────
+resource "aws_eip" "nat" {
+  count  = 2
+  domain = "vpc"
+
+  tags = { Name = "mainstay-nat-eip-${var.region}-${count.index}" }
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = 2
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  depends_on = [aws_internet_gateway.main]
+  tags       = { Name = "mainstay-nat-${var.region}-${count.index}" }
+}
+
+resource "aws_subnet" "private" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, count.index + 2)
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = false
+
+  tags = { Name = "mainstay-private-${var.region}-${count.index}" }
+}
+
+resource "aws_route_table" "private" {
+  count  = 2
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = { Name = "mainstay-private-rt-${var.region}-${count.index}" }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# ── Security groups ─────────────────────────────────────────
+resource "aws_security_group" "alb" {
+  name        = "mainstay-alb-${var.region}"
+  description = "Public HTTPS entry point for the Mainstay API"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -63,6 +108,14 @@ resource "aws_security_group" "api" {
     description = "HTTP (redirect to HTTPS)"
   }
 
+  tags = { Name = "mainstay-alb-sg-${var.region}" }
+}
+
+resource "aws_security_group" "api" {
+  name        = "mainstay-api-${var.region}"
+  description = "Private security group for Mainstay API servers"
+  vpc_id      = aws_vpc.main.id
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -73,12 +126,22 @@ resource "aws_security_group" "api" {
   tags = { Name = "mainstay-sg-${var.region}" }
 }
 
+resource "aws_security_group_rule" "api_from_alb" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.api.id
+  source_security_group_id = aws_security_group.alb.id
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  description              = "HTTP only from the ALB"
+}
+
 # ── Application Load Balancer ──────────────────────────────
 resource "aws_lb" "api" {
   name               = "mainstay-api-${replace(var.region, "-", "")}"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.api.id]
+  security_groups    = [aws_security_group.alb.id]
   subnets            = aws_subnet.public[*].id
 
   tags = { Name = "mainstay-alb-${var.region}" }
@@ -165,7 +228,7 @@ resource "aws_launch_template" "api" {
 # ── Auto Scaling Group ─────────────────────────────────────
 resource "aws_autoscaling_group" "api" {
   name                = "mainstay-asg-${var.region}"
-  vpc_zone_identifier = aws_subnet.public[*].id
+  vpc_zone_identifier = aws_subnet.private[*].id
   min_size            = 2
   max_size            = 6
   desired_capacity    = 2
