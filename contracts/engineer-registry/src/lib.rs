@@ -46,6 +46,11 @@ pub enum ContractError {
     ApprenticeshipNotComplete = 29,
     ConflictOfInterest = 30,
     ConflictOverrideRequired = 31,
+    InvalidOnCallSchedule = 32,
+    OnCallScheduleNotFound = 33,
+    InvalidWorkWindow = 34,
+    EngineerUnavailable = 35,
+    WorkAssignmentNotFound = 36,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -134,6 +139,48 @@ pub struct TrainingRecord {
     pub issuer: Address,
 }
 
+/// A time-bounded emergency on-call assignment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnCallSchedule {
+    pub schedule_id: u64,
+    pub engineer: Address,
+    pub region: Region,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentStatus {
+    Assigned = 0,
+    InProgress = 1,
+    Completed = 2,
+    Cancelled = 3,
+}
+
+/// A declared period in which an engineer can accept work.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityWindow {
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub max_assignments: u32,
+}
+
+/// A task assignment with a bounded time window and lifecycle status.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkAssignment {
+    pub assignment_id: u64,
+    pub engineer: Address,
+    pub task_type: Symbol,
+    pub starts_at: u64,
+    pub ends_at: u64,
+    pub status: AssignmentStatus,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineerStatus {
@@ -197,6 +244,11 @@ const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
 const CONFLICT_HISTORY_KEY: Symbol = symbol_short!("COI_HIST");
 const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
 const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
+const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
+const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
+const AVAILABILITY_KEY: Symbol = symbol_short!("AVAIL");
+const WORKLOAD_KEY: Symbol = symbol_short!("WORK");
+const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 /// Default reputation decay interval: 90 days in seconds (#1315)
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
@@ -1825,6 +1877,254 @@ impl EngineerRegistry {
         result
     }
 
+    /// Publish an engineer's availability for emergency on-call coverage.
+    pub fn schedule_on_call(
+        env: Env,
+        engineer: Address,
+        region: Region,
+        starts_at: u64,
+        ends_at: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        if ends_at <= starts_at {
+            panic_with_error!(&env, ContractError::InvalidOnCallSchedule);
+        }
+        let engineer_record = env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        if !engineer_record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+
+        let schedule_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&NEXT_ON_CALL_ID_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&NEXT_ON_CALL_ID_KEY, &schedule_id.saturating_add(1));
+        extend_persistent_ttl(&env, &NEXT_ON_CALL_ID_KEY);
+
+        let key = (ON_CALL_KEY, region);
+        let mut schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        schedules.push_back(OnCallSchedule {
+            schedule_id,
+            engineer: engineer.clone(),
+            region,
+            starts_at,
+            ends_at,
+            active: true,
+        });
+        env.storage().persistent().set(&key, &schedules);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("ON_CALL"), engineer),
+            (schedule_id, region, starts_at, ends_at),
+        );
+        schedule_id
+    }
+
+    /// Remove an engineer's on-call assignment before its scheduled end.
+    pub fn cancel_on_call(env: Env, engineer: Address, region: Region, schedule_id: u64) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let key = (ON_CALL_KEY, region);
+        let mut schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
+        for i in 0..schedules.len() {
+            let mut schedule = schedules.get(i).unwrap();
+            if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
+                schedule.active = false;
+                schedules.set(i, schedule);
+                env.storage().persistent().set(&key, &schedules);
+                extend_persistent_ttl(&env, &key);
+                return;
+            }
+        }
+        panic_with_error!(&env, ContractError::OnCallScheduleNotFound);
+    }
+
+    /// Return active on-call schedules for a region at a timestamp.
+    pub fn get_on_call_schedules(
+        env: Env,
+        region: Region,
+        at: u64,
+    ) -> Vec<OnCallSchedule> {
+        let schedules: Vec<OnCallSchedule> = env
+            .storage()
+            .persistent()
+            .get(&(ON_CALL_KEY, region))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut active = Vec::new(&env);
+        for schedule in schedules.iter() {
+            if schedule.active && schedule.starts_at <= at && at < schedule.ends_at {
+                active.push_back(schedule);
+            }
+        }
+        active
+    }
+
+    /// Return the engineer addresses currently assigned to on-call coverage.
+    pub fn get_on_call_engineers(env: Env, region: Region, at: u64) -> Vec<Address> {
+        let schedules = Self::get_on_call_schedules(env.clone(), region, at);
+        let mut engineers = Vec::new(&env);
+        for schedule in schedules.iter() {
+            if !engineers.contains(schedule.engineer.clone()) {
+                engineers.push_back(schedule.engineer);
+            }
+        }
+        engineers
+    }
+
+    /// Declare an engineer's available work window.
+    pub fn set_availability(
+        env: Env,
+        engineer: Address,
+        starts_at: u64,
+        ends_at: u64,
+        max_assignments: u32,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        if ends_at <= starts_at || max_assignments == 0 {
+            panic_with_error!(&env, ContractError::InvalidWorkWindow);
+        }
+        let key = (AVAILABILITY_KEY, engineer);
+        env.storage().persistent().set(
+            &key,
+            &AvailabilityWindow {
+                starts_at,
+                ends_at,
+                max_assignments,
+            },
+        );
+        extend_persistent_ttl(&env, &key);
+    }
+
+    /// Assign work only when the engineer has declared availability and
+    /// capacity for the complete task window.
+    pub fn assign_task(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        task_type: Symbol,
+        starts_at: u64,
+        ends_at: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if ends_at <= starts_at {
+            panic_with_error!(&env, ContractError::InvalidWorkWindow);
+        }
+        let record = env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+        let availability: AvailabilityWindow = env
+            .storage()
+            .persistent()
+            .get(&(AVAILABILITY_KEY, engineer.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerUnavailable));
+        if starts_at < availability.starts_at || ends_at > availability.ends_at {
+            panic_with_error!(&env, ContractError::EngineerUnavailable);
+        }
+
+        let key = (WORKLOAD_KEY, engineer.clone());
+        let mut assignments: Vec<WorkAssignment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut overlapping = 0u32;
+        for assignment in assignments.iter() {
+            if assignment.status != AssignmentStatus::Completed
+                && assignment.status != AssignmentStatus::Cancelled
+                && assignment.starts_at < ends_at
+                && starts_at < assignment.ends_at
+            {
+                overlapping = overlapping.saturating_add(1);
+            }
+        }
+        if overlapping >= availability.max_assignments {
+            panic_with_error!(&env, ContractError::EngineerUnavailable);
+        }
+
+        let assignment_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&NEXT_ASSIGNMENT_ID_KEY)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&NEXT_ASSIGNMENT_ID_KEY, &assignment_id.saturating_add(1));
+        extend_persistent_ttl(&env, &NEXT_ASSIGNMENT_ID_KEY);
+        assignments.push_back(WorkAssignment {
+            assignment_id,
+            engineer: engineer.clone(),
+            task_type,
+            starts_at,
+            ends_at,
+            status: AssignmentStatus::Assigned,
+        });
+        env.storage().persistent().set(&key, &assignments);
+        extend_persistent_ttl(&env, &key);
+        assignment_id
+    }
+
+    /// Update the lifecycle status of an assignment.
+    pub fn update_assignment_status(
+        env: Env,
+        engineer: Address,
+        assignment_id: u64,
+        status: AssignmentStatus,
+    ) {
+        ensure_not_paused(&env);
+        engineer.require_auth();
+        let key = (WORKLOAD_KEY, engineer.clone());
+        let mut assignments: Vec<WorkAssignment> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
+        for i in 0..assignments.len() {
+            let mut assignment = assignments.get(i).unwrap();
+            if assignment.assignment_id == assignment_id {
+                assignment.status = status;
+                assignments.set(i, assignment);
+                env.storage().persistent().set(&key, &assignments);
+                extend_persistent_ttl(&env, &key);
+                return;
+            }
+        }
+        panic_with_error!(&env, ContractError::WorkAssignmentNotFound);
+    }
+
+    /// Return all assignments recorded for an engineer.
+    pub fn get_engineer_workload(env: Env, engineer: Address) -> Vec<WorkAssignment> {
+        env.storage()
+            .persistent()
+            .get(&(WORKLOAD_KEY, engineer))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     pub fn set_ce_requirement(
         env: Env,
         admin: Address,
@@ -1944,9 +2244,14 @@ impl EngineerRegistry {
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MENTOR_START"), apprentice),
+            (env.ledger().timestamp(), hours_required),
+        );
     }
 
     pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
+        ensure_not_paused(&env);
         let key = (APP_KEY, apprentice);
         let mut apprenticeship: Apprenticeship = env
             .storage()
@@ -1960,6 +2265,10 @@ impl EngineerRegistry {
             .min(apprenticeship.hours_required);
         env.storage().persistent().set(&key, &apprenticeship);
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("MENTOR_HOURS"), apprentice),
+            (hours, apprenticeship.hours_completed),
+        );
     }
 
     pub fn complete_apprenticeship(env: Env, apprentice: Address) {
@@ -1983,6 +2292,19 @@ impl EngineerRegistry {
         env.storage().persistent().set(&engineer_key(&apprentice), &record);
         env.storage().persistent().remove(&key);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
+        env.events().publish(
+            (symbol_short!("MENTOR_DONE"), apprentice),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Return the active mentorship agreement for an apprentice.
+    ///
+    /// The agreement is removed after `complete_apprenticeship` succeeds.
+    pub fn get_apprenticeship(env: Env, apprentice: Address) -> Option<Apprenticeship> {
+        env.storage()
+            .persistent()
+            .get(&(APP_KEY, apprentice))
     }
 
     pub fn get_engineer_tier(env: Env, engineer: Address) -> EngineerTier {
