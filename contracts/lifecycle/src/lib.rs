@@ -6997,6 +6997,54 @@ impl Lifecycle {
         shared::extend_persistent_ttl(&env, &peer_group_key);
     }
 
+    /// Return anonymized maintenance benchmarks for an asset category.
+    ///
+    /// Only aggregate values are returned; no owner, engineer, or asset ID is
+    /// exposed. This lets operators compare their fleet with the other
+    /// registered assets without creating a cross-tenant data disclosure.
+    pub fn get_industry_benchmark(env: Env, asset_type: Symbol) -> IndustryBenchmark {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let all_assets = client.get_all_assets();
+        let mut member_count = 0u32;
+        let mut score_total = 0u64;
+        let mut maintenance_total = 0u64;
+        let mut cost_total = 0u64;
+
+        for i in 0..all_assets.len() {
+            let asset_id = all_assets.get(i).unwrap();
+            let asset = client.get_asset(&asset_id);
+            if asset.asset_type != asset_type {
+                continue;
+            }
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            member_count = member_count.saturating_add(1);
+            score_total = score_total.saturating_add(Self::get_collateral_score(&env, asset_id) as u64);
+            maintenance_total = maintenance_total.saturating_add(history.len() as u64);
+            cost_total = cost_total.saturating_add(Self::get_total_maintenance_cost(&env, asset_id));
+        }
+
+        IndustryBenchmark {
+            asset_type,
+            member_count,
+            mean_score: if member_count == 0 { 0 } else { (score_total / member_count as u64) as u32 },
+            mean_maintenance_count: if member_count == 0 {
+                0
+            } else {
+                (maintenance_total / member_count as u64) as u32
+            },
+            mean_maintenance_cost: if member_count == 0 {
+                0
+            } else {
+                cost_total / member_count as u64
+            },
+        }
+    }
+
     // =========================================================================
     // Additional Helper Functions for Better Integration
     // =========================================================================
