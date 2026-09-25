@@ -519,6 +519,7 @@ pub enum DataKey {
     MaintenanceAttestations(u64),
     AttestorAuth(u64, Address),
     MaintenanceSignatures(u64),
+    CompressedHistory(u64),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).

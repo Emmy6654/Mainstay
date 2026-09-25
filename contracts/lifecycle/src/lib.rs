@@ -46,6 +46,7 @@ use shared::validation::require_non_empty_vec;
 use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -236,6 +237,45 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
         entries.push_back(entry);
         env.storage().persistent().set(&key, &entries);
         extend_persistent_ttl(env, &key);
+    }
+
+    fn rle_compress(env: &Env, input: &Bytes) -> Bytes {
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let value = input.get(i).unwrap();
+            let mut count = 1u32;
+            while i + count < input.len()
+                && input.get(i + count).unwrap() == value
+                && count < u8::MAX as u32
+            {
+                count += 1;
+            }
+            output.push_back(count as u8);
+            output.push_back(value);
+            i += count;
+        }
+        output
+    }
+
+    fn rle_decompress(env: &Env, input: &Bytes) -> Option<Bytes> {
+        if input.len() % 2 != 0 {
+            return None;
+        }
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let count = input.get(i).unwrap();
+            if count == 0 {
+                return None;
+            }
+            let value = input.get(i + 1).unwrap();
+            for _ in 0..count {
+                output.push_back(value);
+            }
+            i += 2;
+        }
+        Some(output)
     }
 }
 
@@ -3418,10 +3458,60 @@ impl Lifecycle {
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
-        env.storage()
+        if let Some(history) = env.storage()
             .persistent()
             .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env))
+        {
+            return history;
+        }
+        let archived: Bytes = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
+            .unwrap_or_else(|| Bytes::new(&env));
+        if archived.is_empty() {
+            return Vec::new(&env);
+        }
+        let encoded = rle_decompress(&env, &archived)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::CompressionFailed));
+        Vec::<MaintenanceRecord>::from_xdr(&env, &encoded)
+            .unwrap_or_else(|_| panic_with_error!(&env, ContractError::CompressionFailed))
+    }
+
+    /// Compress and archive a decommissioned asset's immutable maintenance history.
+    ///
+    /// Decommissioning is required because compacted history is intentionally
+    /// removed from the live key and cannot accept future submissions.
+    pub fn compact_maintenance_history(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        if !env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::CompressionRequiresDecommissioned);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let encoded = history.clone().to_xdr(&env);
+        let compressed = rle_compress(&env, &encoded);
+        let key = DataKey::CompressedHistory(asset_id);
+        env.storage().persistent().set(&key, &compressed);
+        extend_persistent_ttl(&env, &key);
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.events().publish(
+            (symbol_short!("MNT_COMPACT"), asset_id),
+            (encoded.len(), compressed.len()),
+        );
+    }
+
+    pub fn get_compressed_maintenance_history(
+        env: Env,
+        asset_id: u64,
+    ) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
     }
 
     /// Return the append-only audit trail for an asset's maintenance records.
