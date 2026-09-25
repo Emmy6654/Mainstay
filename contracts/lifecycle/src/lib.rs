@@ -14,6 +14,7 @@ pub(crate) use storage::{
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    maintenance_audit_key, maintenance_attestations_key, attestor_auth_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -28,7 +29,8 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
+    MaintenanceAttestation, MaintenanceSignature,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -43,6 +45,7 @@ use shared::validation::require_non_empty_vec;
 use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -217,6 +220,57 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
     } else {
         let last = history.get(history.len() - 1).unwrap();
         Some(hash_maintenance_record(env, &last))
+    }
+
+    fn append_maintenance_audit(env: &Env, asset_id: u64, entry: MaintenanceAuditEntry) {
+        let key = DataKey::MaintenanceAudit(asset_id);
+        let mut entries: Vec<MaintenanceAuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        entries.push_back(entry);
+        env.storage().persistent().set(&key, &entries);
+        extend_persistent_ttl(env, &key);
+    }
+
+    fn rle_compress(env: &Env, input: &Bytes) -> Bytes {
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let value = input.get(i).unwrap();
+            let mut count = 1u32;
+            while i + count < input.len()
+                && input.get(i + count).unwrap() == value
+                && count < u8::MAX as u32
+            {
+                count += 1;
+            }
+            output.push_back(count as u8);
+            output.push_back(value);
+            i += count;
+        }
+        output
+    }
+
+    fn rle_decompress(env: &Env, input: &Bytes) -> Option<Bytes> {
+        if input.len() % 2 != 0 {
+            return None;
+        }
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let count = input.get(i).unwrap();
+            if count == 0 {
+                return None;
+            }
+            let value = input.get(i + 1).unwrap();
+            for _ in 0..count {
+                output.push_back(value);
+            }
+            i += 2;
+        }
+        Some(output)
     }
 }
 
@@ -1090,6 +1144,172 @@ impl Lifecycle {
                 already_present = true;
                 break;
             }
+        }
+
+        /// Authorize an independent party to attest maintenance records for an asset.
+        pub fn authorize_attestor(env: Env, owner: Address, asset_id: u64, attestor: Address) {
+            ensure_not_paused(&env);
+            owner.require_auth();
+            let asset_registry = get_asset_registry_addr(&env);
+            verify_asset_exists(&env, &asset_registry, &asset_id);
+            let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                .get_asset(&asset_id);
+            if asset.owner != owner {
+                panic_with_error!(&env, ContractError::UnauthorizedOwner);
+            }
+            let key = attestor_auth_key(asset_id, &attestor);
+            env.storage().persistent().set(&key, &true);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Record an attestation from an owner-authorized independent party.
+        pub fn attest_maintenance(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            attestor: Address,
+            statement: Bytes,
+        ) {
+            ensure_not_paused(&env);
+            attestor.require_auth();
+            let auth_key = attestor_auth_key(asset_id, &attestor);
+            if !env.storage().persistent().get::<_, bool>(&auth_key).unwrap_or(false) {
+                panic_with_error!(&env, ContractError::UnauthorizedAttestor);
+            }
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut found = false;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                panic_with_error!(&env, ContractError::RecordNotFound);
+            }
+            let key = DataKey::MaintenanceAttestations(asset_id);
+            let mut attestations: Vec<MaintenanceAttestation> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            attestations.push_back(MaintenanceAttestation {
+                asset_id,
+                record_timestamp,
+                attestor: attestor.clone(),
+                statement,
+                timestamp: env.ledger().timestamp(),
+            });
+            env.storage().persistent().set(&key, &attestations);
+            extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (symbol_short!("MNT_ATTEST"), asset_id),
+                (record_timestamp, attestor),
+            );
+        }
+
+        pub fn get_maintenance_attestations(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceAttestation> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceAttestations(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
+        }
+
+        /// Verify and persist an engineer's Ed25519 signature over a record hash.
+        pub fn sign_maintenance_record(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            signer: Address,
+            public_key: BytesN<32>,
+            signature: BytesN<64>,
+        ) {
+            ensure_not_paused(&env);
+            signer.require_auth();
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut record_hash: Option<Bytes> = None;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp && record.engineer == signer {
+                    record_hash = Some(hash_maintenance_record(&env, &record));
+                    break;
+                }
+            }
+            let message = record_hash.unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::RecordNotFound)
+            });
+            env.crypto().ed25519_verify(&public_key, &message, &signature);
+
+            let key = DataKey::MaintenanceSignatures(asset_id);
+            let mut signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            signatures.push_back(MaintenanceSignature {
+                asset_id,
+                record_timestamp,
+                signer,
+                public_key,
+                signature,
+            });
+            env.storage().persistent().set(&key, &signatures);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Returns whether a valid stored signature exists for a record.
+        pub fn verify_maintenance_signature(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+        ) -> bool {
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            for record in history.iter() {
+                if record.timestamp != record_timestamp {
+                    continue;
+                }
+                let message = hash_maintenance_record(&env, &record);
+                for stored in signatures.iter() {
+                    if stored.record_timestamp == record_timestamp {
+                        env.crypto().ed25519_verify(
+                            &stored.public_key,
+                            &message,
+                            &stored.signature,
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        pub fn get_maintenance_signatures(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceSignature> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
         }
         if !already_present {
             list.push_back(engineer);
@@ -2266,10 +2486,19 @@ impl Lifecycle {
         };
 
         history.push_back(record);
+        let audit_entry = MaintenanceAuditEntry {
+            asset_id,
+            record_timestamp: timestamp,
+            actor: engineer.clone(),
+            action: symbol_short!("SUBMIT"),
+            record_hash: hash_maintenance_record(&env, &history.get(history.len() - 1).unwrap()),
+            timestamp,
+        };
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
+        append_maintenance_audit(&env, asset_id, audit_entry);
 
         // #1222: Advance next_due for any recurring task this submission satisfies,
         // so the schedule doesn't stay perpetually overdue after the first submission.
@@ -2752,6 +2981,18 @@ impl Lifecycle {
         // All validation passed — now commit everything atomically.
         for record in new_records.iter() {
             history.push_back(record);
+            append_maintenance_audit(
+                &env,
+                asset_id,
+                MaintenanceAuditEntry {
+                    asset_id,
+                    record_timestamp: record.timestamp,
+                    actor: engineer.clone(),
+                    action: symbol_short!("SUBMIT"),
+                    record_hash: hash_maintenance_record(&env, record),
+                    timestamp,
+                },
+            );
         }
         for entry in score_entries.iter() {
             score_history_push(&env, asset_id, entry, config.max_history);
@@ -3209,10 +3450,71 @@ impl Lifecycle {
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
-        env.storage()
+        if let Some(history) = env.storage()
             .persistent()
             .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env))
+        {
+            return history;
+        }
+        let archived: Bytes = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
+            .unwrap_or_else(|| Bytes::new(&env));
+        if archived.is_empty() {
+            return Vec::new(&env);
+        }
+        let encoded = rle_decompress(&env, &archived)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::CompressionFailed));
+        Vec::<MaintenanceRecord>::from_xdr(&env, &encoded)
+            .unwrap_or_else(|_| panic_with_error!(&env, ContractError::CompressionFailed))
+    }
+
+    /// Compress and archive a decommissioned asset's immutable maintenance history.
+    ///
+    /// Decommissioning is required because compacted history is intentionally
+    /// removed from the live key and cannot accept future submissions.
+    pub fn compact_maintenance_history(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        if !env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::CompressionRequiresDecommissioned);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let encoded = history.clone().to_xdr(&env);
+        let compressed = rle_compress(&env, &encoded);
+        let key = DataKey::CompressedHistory(asset_id);
+        env.storage().persistent().set(&key, &compressed);
+        extend_persistent_ttl(&env, &key);
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.events().publish(
+            (symbol_short!("MNT_COMPACT"), asset_id),
+            (encoded.len(), compressed.len()),
+        );
+    }
+
+    pub fn get_compressed_maintenance_history(
+        env: Env,
+        asset_id: u64,
+    ) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
+    }
+
+    /// Return the append-only audit trail for an asset's maintenance records.
+    pub fn get_maintenance_audit(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<MaintenanceAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceAudit(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Get a paginated slice of the maintenance history for an asset (#996).
