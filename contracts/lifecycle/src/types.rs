@@ -61,6 +61,16 @@ pub struct MaintenanceRecord {
     pub reconstructed: bool,
 }
 
+/// Aggregated maintenance spend for one task type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceCostSummary {
+    pub task_type: Symbol,
+    pub total_cost: u64,
+    pub record_count: u32,
+    pub average_cost: u64,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

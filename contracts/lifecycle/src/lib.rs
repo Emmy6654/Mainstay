@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceCostSummary, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -3763,6 +3763,47 @@ impl Lifecycle {
                     total = total.saturating_add(cost);
                     count += 1;
                 }
+            }
+
+            /// Aggregate recorded maintenance spend by task type.
+            ///
+            /// Records without a cost are excluded. This compact view lets supply
+            /// chain dashboards compare parts/labour categories without downloading
+            /// every maintenance record.
+            pub fn get_maintenance_cost_summary(env: Env, asset_id: u64) -> Vec<MaintenanceCostSummary> {
+                let history: Vec<MaintenanceRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&history_key(asset_id))
+                    .unwrap_or_else(|| Vec::new(&env));
+                let mut summaries = Vec::<MaintenanceCostSummary>::new(&env);
+                for record in history.iter() {
+                    let cost = match record.cost {
+                        Some(value) => value,
+                        None => continue,
+                    };
+                    let mut found = false;
+                    for index in 0..summaries.len() {
+                        let mut summary = summaries.get(index).unwrap();
+                        if summary.task_type == record.task_type {
+                            summary.total_cost = summary.total_cost.saturating_add(cost);
+                            summary.record_count = summary.record_count.saturating_add(1);
+                            summary.average_cost = summary.total_cost / summary.record_count as u64;
+                            summaries.set(index, summary);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        summaries.push_back(MaintenanceCostSummary {
+                            task_type: record.task_type,
+                            total_cost: cost,
+                            record_count: 1,
+                            average_cost: cost,
+                        });
+                    }
+                }
+                summaries
             }
         }
         if count == 0 {
