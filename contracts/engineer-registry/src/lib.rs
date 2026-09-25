@@ -119,6 +119,14 @@ pub struct Apprenticeship {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictRecord {
+    pub asset_id: u64,
+    pub overridden: bool,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrainingRecord {
     pub training_type: Symbol,
     pub completion_date: u64,
@@ -186,6 +194,7 @@ const ENGINEER_LIST: Symbol = symbol_short!("ENG_LIST");
 const CE_KEY: Symbol = symbol_short!("CE");
 const APP_KEY: Symbol = symbol_short!("APP");
 const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
+const CONFLICT_HISTORY_KEY: Symbol = symbol_short!("COI_HIST");
 const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
 const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 /// Default reputation decay interval: 90 days in seconds (#1315)
@@ -1982,6 +1991,68 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
             .tier
+    }
+
+    pub fn register_engineer_interests(
+        env: Env,
+        engineer: Address,
+        asset_ids: Vec<u64>,
+    ) {
+        ensure_not_paused(&env);
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+        let key = (INTEREST_KEY, engineer.clone());
+        env.storage().persistent().set(&key, &asset_ids);
+        extend_persistent_ttl(&env, &key);
+        let history_key = (CONFLICT_HISTORY_KEY, engineer);
+        let mut history: Vec<ConflictRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        for asset_id in asset_ids.iter() {
+            history.push_back(ConflictRecord {
+                asset_id,
+                overridden: false,
+                timestamp: env.ledger().timestamp(),
+            });
+        }
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+    }
+
+    pub fn approve_conflict_override(env: Env, engineer: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+        let key = (CONFLICT_OVERRIDE_KEY, engineer.clone(), asset_id);
+        env.storage().persistent().set(&key, &true);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("COI_OVR"), engineer),
+            (asset_id, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn check_conflict_of_interest(env: Env, engineer: Address, asset_id: u64) -> bool {
+        let interests: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&(INTEREST_KEY, engineer.clone()))
+            .unwrap_or(Vec::new(&env));
+        interests.contains(asset_id)
+            && !env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&(CONFLICT_OVERRIDE_KEY, engineer, asset_id))
+                .unwrap_or(false)
+    }
+
+    pub fn get_conflict_history(env: Env, engineer: Address) -> Vec<ConflictRecord> {
+        env.storage()
+            .persistent()
+            .get(&(CONFLICT_HISTORY_KEY, engineer))
+            .unwrap_or(Vec::new(&env))
     }
 }
 
