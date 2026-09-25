@@ -848,6 +848,7 @@ mod engineer_registry {
         fn update_reputation(env: Env, engineer: Address, delta: i32);
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
         fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol>;
+        fn check_conflict_of_interest(env: Env, engineer: Address, asset_id: u64) -> bool;
     }
 }
 
@@ -2189,6 +2190,9 @@ impl Lifecycle {
         // Verify engineer credential via the engineer registry.
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        if registry.check_conflict_of_interest(&engineer, &asset_id) {
+            panic_with_error!(&env, ContractError::ConflictOfInterest);
+        }
         let status = registry.get_credential_status(&engineer);
         if status != engineer_registry::CredentialStatus::Valid
             && status != engineer_registry::CredentialStatus::GracePeriod

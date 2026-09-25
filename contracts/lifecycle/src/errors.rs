@@ -68,6 +68,7 @@ pub enum ContractError {
     TooManyAdmins = 39,
     /// Insufficient fee provided for the maintenance submission priority level (#1313).
     InsufficientFee = 40,
+    ConflictOfInterest = 41,
 }
 
 impl From<SharedContractError> for ContractError {
