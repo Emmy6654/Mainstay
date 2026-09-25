@@ -179,6 +179,7 @@ const CE_KEY: Symbol = symbol_short!("CE");
 const APP_KEY: Symbol = symbol_short!("APP");
 const INTEREST_KEY: Symbol = symbol_short!("INTEREST");
 const CONFLICT_OVERRIDE_KEY: Symbol = symbol_short!("COI_OVR");
+const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 /// Default reputation decay interval: 90 days in seconds (#1315)
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
@@ -520,6 +521,8 @@ impl EngineerRegistry {
                     CredentialStatus::Revoked
                 } else if is_suspended(&e, env.ledger().timestamp()) {
                     CredentialStatus::Suspended
+                } else if !Self::verify_engineer_ce_compliance(env.clone(), engineer.clone()) {
+                    CredentialStatus::Suspended
                 } else if !env.storage().instance().has(&trusted_key(&e.issuer)) {
                     // The issuer that credentialed this engineer is no longer trusted.
                     CredentialStatus::Revoked
@@ -756,6 +759,8 @@ impl EngineerRegistry {
                 if !e.active {
                     EngineerStatus::Revoked
                 } else if is_suspended(&e, env.ledger().timestamp()) {
+                    EngineerStatus::Suspended
+                } else if !Self::verify_engineer_ce_compliance(env.clone(), engineer.clone()) {
                     EngineerStatus::Suspended
                 } else if env.ledger().timestamp() >= e.expires_at {
                     EngineerStatus::Expired
@@ -1800,6 +1805,95 @@ impl EngineerRegistry {
             }
         }
         result
+    }
+
+    pub fn set_ce_requirement(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        hours: u32,
+        frequency_secs: u64,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if hours == 0 || frequency_secs == 0 {
+            panic_with_error!(&env, ContractError::InvalidValidityPeriod);
+        }
+        env.storage()
+            .persistent()
+            .set(&(CE_REQUIREMENT_KEY, specialization), &(hours, frequency_secs));
+        extend_persistent_ttl(&env, &(CE_REQUIREMENT_KEY, specialization));
+    }
+
+    pub fn register_ce_completion(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        completion: ContinuingEducation,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        if Self::get_admin(env.clone()) != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .is_none()
+        {
+            panic_with_error!(&env, ContractError::EngineerNotFound);
+        }
+        let key = (CE_KEY, engineer);
+        let mut records: Vec<ContinuingEducation> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        records.push_back(completion);
+        env.storage().persistent().set(&key, &records);
+        extend_persistent_ttl(&env, &key);
+    }
+
+    pub fn verify_engineer_ce_compliance(env: Env, engineer: Address) -> bool {
+        let record: Engineer = match env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+        {
+            Some(record) => record,
+            None => return false,
+        };
+        let now = env.ledger().timestamp();
+        let completions: Vec<ContinuingEducation> = env
+            .storage()
+            .persistent()
+            .get(&(CE_KEY, engineer))
+            .unwrap_or(Vec::new(&env));
+        for specialization in record.specializations.iter() {
+            let (required_hours, frequency): (u32, u64) = match env
+                .storage()
+                .persistent()
+                .get(&(CE_REQUIREMENT_KEY, specialization.clone()))
+            {
+                Some(value) => value,
+                None => continue,
+            };
+            let cutoff = now.saturating_sub(frequency);
+            let mut hours = 0u32;
+            for completion in completions.iter() {
+                if completion.topic == specialization && completion.completed_at >= cutoff {
+                    hours = hours.saturating_add(completion.hours);
+                }
+            }
+            if hours < required_hours {
+                return false;
+            }
+        }
+        true
     }
 }
 
