@@ -26,7 +26,8 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, CostReconciliation, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TaskGroup, TimelockProposal, TransferRecord, WeightProposal,
+    DisputeStatus, MaintenanceDispute, ScoreEntry, TaskGroup, TimelockProposal, TransferRecord,
+    WeightProposal,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
@@ -3350,6 +3351,109 @@ impl Lifecycle {
             }
         }
         result
+    }
+
+    /// Open a dispute against a maintenance record.
+    pub fn open_maintenance_dispute(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+        claimant: Address,
+        reason: String,
+    ) -> u32 {
+        claimant.require_auth();
+        if reason.is_empty() {
+            panic_with_error!(&env, ContractError::InvalidTaskGroup);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !history.iter().any(|record| record.timestamp == record_timestamp) {
+            panic_with_error!(&env, ContractError::DisputedRecordNotFound);
+        }
+        let key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<MaintenanceDispute> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for dispute in disputes.iter() {
+            if dispute.record_timestamp == record_timestamp
+                && dispute.status == DisputeStatus::Open
+            {
+                panic_with_error!(&env, ContractError::DuplicateDispute);
+            }
+        }
+        let dispute_id = disputes.len();
+        disputes.push_back(MaintenanceDispute {
+            dispute_id,
+            record_timestamp,
+            claimant: claimant.clone(),
+            reason,
+            status: DisputeStatus::Open,
+            resolution: None,
+            created_at: env.ledger().timestamp(),
+            resolved_at: None,
+        });
+        env.storage().persistent().set(&key, &disputes);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("DISPUTE"), asset_id),
+            (dispute_id, record_timestamp, claimant),
+        );
+        dispute_id
+    }
+
+    /// Resolve an open dispute. `accepted = true` records a resolved dispute;
+    /// `false` records a rejected dispute. Resolution text is retained on-chain.
+    pub fn resolve_maintenance_dispute(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        dispute_id: u32,
+        accepted: bool,
+        resolution: String,
+    ) {
+        require_admin(&env, &admin);
+        let key = DataKey::Disputes(asset_id);
+        let mut disputes: Vec<MaintenanceDispute> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut dispute = disputes
+            .get(dispute_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputedRecordNotFound));
+        if dispute.status != DisputeStatus::Open {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
+        dispute.status = if accepted {
+            DisputeStatus::Resolved
+        } else {
+            DisputeStatus::Rejected
+        };
+        dispute.resolution = Some(resolution);
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        disputes.set(dispute_id, dispute);
+        env.storage().persistent().set(&key, &disputes);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("DISP_RES"), asset_id),
+            (dispute_id, accepted, admin),
+        );
+    }
+
+    /// Return all disputes for an asset in creation order.
+    pub fn get_maintenance_disputes(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<MaintenanceDispute> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Disputes(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// View alias for [`get_last_service`].

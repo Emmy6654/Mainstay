@@ -76,6 +76,29 @@ pub struct TaskGroup {
     pub record_timestamps: Vec<u64>,
 }
 
+/// State of a maintenance-record dispute.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisputeStatus {
+    Open = 0,
+    Resolved = 1,
+    Rejected = 2,
+}
+
+/// An auditable dispute raised against a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceDispute {
+    pub dispute_id: u32,
+    pub record_timestamp: u64,
+    pub claimant: Address,
+    pub reason: String,
+    pub status: DisputeStatus,
+    pub resolution: Option<String>,
+    pub created_at: u64,
+    pub resolved_at: Option<u64>,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

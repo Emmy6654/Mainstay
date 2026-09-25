@@ -72,6 +72,8 @@ pub enum ContractError {
     InvalidEvidenceHash = 41,
     /// A dispute has already been resolved and cannot be changed.
     DisputeAlreadyResolved = 42,
+    /// A dispute references a record that is not in the asset history.
+    DisputedRecordNotFound = 43,
 }
 
 impl From<SharedContractError> for ContractError {
