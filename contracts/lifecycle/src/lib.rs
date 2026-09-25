@@ -31,7 +31,7 @@ use crate::types::{
     AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, ComplianceReport, Config, CostAnalytics, DataKey, EngineerProductivity, FleetPerformance, HealthSnapshot, IndustryBenchmark,
     MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
-    MaintenanceAttestation,
+    MaintenanceAttestation, MaintenanceSignature,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -1184,6 +1184,96 @@ impl Lifecycle {
             env.storage()
                 .persistent()
                 .get(&DataKey::MaintenanceAttestations(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
+        }
+
+        /// Verify and persist an engineer's Ed25519 signature over a record hash.
+        pub fn sign_maintenance_record(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            signer: Address,
+            public_key: BytesN<32>,
+            signature: BytesN<64>,
+        ) {
+            ensure_not_paused(&env);
+            signer.require_auth();
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut record_hash: Option<Bytes> = None;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp && record.engineer == signer {
+                    record_hash = Some(hash_maintenance_record(&env, &record));
+                    break;
+                }
+            }
+            let message = record_hash.unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::RecordNotFound)
+            });
+            env.crypto().ed25519_verify(&public_key, &message, &signature);
+
+            let key = DataKey::MaintenanceSignatures(asset_id);
+            let mut signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            signatures.push_back(MaintenanceSignature {
+                asset_id,
+                record_timestamp,
+                signer,
+                public_key,
+                signature,
+            });
+            env.storage().persistent().set(&key, &signatures);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Returns whether a valid stored signature exists for a record.
+        pub fn verify_maintenance_signature(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+        ) -> bool {
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            for record in history.iter() {
+                if record.timestamp != record_timestamp {
+                    continue;
+                }
+                let message = hash_maintenance_record(&env, &record);
+                for stored in signatures.iter() {
+                    if stored.record_timestamp == record_timestamp {
+                        env.crypto().ed25519_verify(
+                            &stored.public_key,
+                            &message,
+                            &stored.signature,
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        pub fn get_maintenance_signatures(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceSignature> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
                 .unwrap_or_else(|| Vec::new(&env))
         }
         if !already_present {
