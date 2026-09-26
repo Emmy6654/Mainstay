@@ -72,6 +72,26 @@ cargo install cargo-audit --locked
 cargo audit
 ```
 
+For offline integration clients, start the deterministic Soroban RPC mock:
+
+```bash
+python3 scripts/mock-soroban-rpc.py \
+  --fixture scripts/mock-soroban-rpc-fixture.json
+```
+
+It serves `/health` and JSON-RPC requests at
+`http://127.0.0.1:8000/soroban/rpc`; unconfigured methods return a JSON-RPC
+`-32601` error instead of silently succeeding.
+
+Export a JSON backup's assets for analysis:
+
+```bash
+python3 scripts/export-assets.py backups/<timestamp> --format both
+```
+
+This writes `assets.csv` and `assets.xlsx` next to the backup (or use
+`--output-dir` for a separate destination).
+
 On Windows (PowerShell):
 
 ```powershell

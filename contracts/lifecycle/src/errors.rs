@@ -69,10 +69,10 @@ pub enum ContractError {
     /// Insufficient fee provided for the maintenance submission priority level (#1313).
     InsufficientFee = 40,
     ConflictOfInterest = 41,
-    /// The requested safety incident does not exist.
-    IncidentNotFound = 42,
-    /// A safety incident description exceeds the configured notes limit.
-    IncidentDescriptionTooLong = 43,
+    UnauthorizedAttestor = 42,
+    RecordNotFound = 43,
+    CompressionFailed = 44,
+    CompressionRequiresDecommissioned = 45,
 }
 
 impl From<SharedContractError> for ContractError {
