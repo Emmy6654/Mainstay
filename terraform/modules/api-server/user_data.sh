@@ -59,6 +59,8 @@ docker run -d \
   -e STELLAR_RPC_URL="$RPC_URL" \
   -e STELLAR_NETWORK_PASSPHRASE="$NETWORK" \
   -e DEPLOY_REGION="$REGION" \
+  -e DSAR_TABLE_NAME="${dsar_table_name}" \
+  -e DSAR_QUEUE_URL="${dsar_queue_url}" \
   -e RUST_LOG=info \
   --memory="512m" \
   --cpus="1" \
@@ -70,12 +72,18 @@ docker run -d \
 #  - ip_limit:  100 req/min per IP
 #  - key_limit: 1000 req/day ≈ 17 req/min per API key
 cat > /etc/nginx/conf.d/mainstay-api.conf <<'NGINX'
+map $http_origin $cors_origin {
+    default "";
+%{ for origin in allowed_origins ~}
+    "${origin}" "${origin}";
+%{ endfor ~}
+}
+
 limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
 limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
-log_format ratelimit '$remote_addr [$time_local] "$request" $status '
-                     'limit_req=$limit_req_status '
-                     'api_key="$http_x_api_key"';
+log_format ratelimit '$remote_addr [$time_local] "$request_method $uri" $status '
+                     'limit_req=$limit_req_status';
 
 upstream api_backend {
     least_conn;
@@ -96,6 +104,12 @@ server {
     ssl_certificate_key /etc/nginx/ssl/key.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
     access_log /var/log/nginx/access.log ratelimit buffer=32k flush=5s;
     error_log  /var/log/nginx/error.log warn;
@@ -122,6 +136,21 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+        add_header Access-Control-Allow-Origin $cors_origin always;
+        add_header Access-Control-Allow-Credentials "true" always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type, X-API-Key" always;
+        add_header Vary "Origin" always;
+
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+
         proxy_read_timeout 30s;
         proxy_connect_timeout 5s;
     }
@@ -145,7 +174,7 @@ mkdir -p /etc/nginx/ssl
 openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
   -keyout /etc/nginx/ssl/key.pem \
   -out /etc/nginx/ssl/cert.pem \
-  -subj "/CN=api.${REGION}.mainstay.io"
+  -subj "/CN=api.$${REGION}.mainstay.io"
 
 systemctl enable nginx
 systemctl restart nginx
