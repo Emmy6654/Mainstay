@@ -2350,6 +2350,23 @@ impl EngineerRegistry {
         let key = (CONFLICT_OVERRIDE_KEY, engineer.clone(), asset_id);
         env.storage().persistent().set(&key, &true);
         extend_persistent_ttl(&env, &key);
+        let history_key = (CONFLICT_HISTORY_KEY, engineer.clone());
+        if let Some(mut history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<ConflictRecord>>(&history_key)
+        {
+            for index in 0..history.len() {
+                if let Some(mut record) = history.get(index) {
+                    if record.asset_id == asset_id {
+                        record.overridden = true;
+                        history.set(index, record);
+                    }
+                }
+            }
+            env.storage().persistent().set(&history_key, &history);
+            extend_persistent_ttl(&env, &history_key);
+        }
         env.events().publish(
             (symbol_short!("COI_OVR"), engineer),
             (asset_id, env.ledger().timestamp()),
@@ -4459,6 +4476,140 @@ mod tests {
             &None,
         );
         engineer
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn service_area_membership_matches_every_region_combination(
+            selected in proptest::array::uniform5(proptest::bool::ANY),
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, admin) = setup(&env);
+            let issuer = Address::generate(&env);
+            client.add_trusted_issuer(&admin, &issuer);
+            let engineer = setup_engineer(&env, &client, &issuer, 201);
+            let regions = [
+                Region::NorthAmerica,
+                Region::LatinAmerica,
+                Region::Europe,
+                Region::MiddleEastAfrica,
+                Region::AsiaPacific,
+            ];
+            let mut configured = soroban_sdk::Vec::new(&env);
+            for (index, region) in regions.iter().enumerate() {
+                if selected[index] {
+                    configured.push_back(*region);
+                }
+            }
+
+            client.set_engineer_service_area(&engineer, &configured);
+
+            for (index, region) in regions.iter().enumerate() {
+                let matches = client
+                    .get_engineers_for_region(region)
+                    .contains(&engineer);
+                assert_eq!(
+                    matches,
+                    selected[index],
+                    "region membership diverged for region index {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ce_compliance_matches_reference_window_model() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        let engineer = setup_engineer(&env, &client, &issuer, 202);
+        let specialization = symbol_short!("solar_pnl");
+        client.add_specialization(&issuer, &engineer, &specialization);
+        client.set_ce_requirement(&admin, &specialization, &10, &100);
+
+        env.ledger().set_timestamp(1_000);
+        let now = env.ledger().timestamp();
+        let completions = [
+            ContinuingEducation { hours: 4, completed_at: now, topic: specialization.clone() },
+            ContinuingEducation { hours: 7, completed_at: now - 50, topic: specialization.clone() },
+            ContinuingEducation { hours: 100, completed_at: now - 101, topic: specialization.clone() },
+            ContinuingEducation { hours: 100, completed_at: now, topic: symbol_short!("wind_turb") },
+        ];
+        for completion in completions.iter() {
+            client.register_ce_completion(&admin, &engineer, completion);
+        }
+
+        let required_hours = 10u32;
+        let cutoff = now.saturating_sub(100);
+        let reference_hours = completions
+            .iter()
+            .filter(|completion| {
+                completion.topic == specialization && completion.completed_at >= cutoff
+            })
+            .map(|completion| completion.hours)
+            .sum::<u32>();
+
+        assert_eq!(
+            client.verify_engineer_ce_compliance(&engineer),
+            reference_hours >= required_hours
+        );
+    }
+
+    #[test]
+    fn apprenticeship_scenario_promotes_engineer_after_mentor_approval() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+        let mentor = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        let apprentice = setup_engineer(&env, &client, &issuer, 203);
+
+        client.start_apprenticeship(&apprentice, &mentor, &100);
+        assert_eq!(client.get_engineer_tier(&apprentice), EngineerTier::Apprentice);
+        assert_eq!(
+            client.try_complete_apprenticeship(&apprentice),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ApprenticeshipNotComplete as u32,
+            )))
+        );
+
+        client.record_apprenticeship_hours(&apprentice, &60);
+        client.record_apprenticeship_hours(&apprentice, &60);
+        client.complete_apprenticeship(&apprentice);
+
+        assert_eq!(client.get_engineer_tier(&apprentice), EngineerTier::Full);
+        assert_eq!(
+            client.try_get_engineer_tier(&apprentice).unwrap(),
+            EngineerTier::Full
+        );
+    }
+
+    #[test]
+    fn conflict_history_invariant_tracks_override_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let engineer = Address::generate(&env);
+        let interests = soroban_sdk::vec![&env, 41u64, 42u64];
+
+        client.register_engineer_interests(&engineer, &interests);
+        assert!(client.check_conflict_of_interest(&engineer, &41));
+        assert!(client.check_conflict_of_interest(&engineer, &42));
+        assert!(!client.check_conflict_of_interest(&engineer, &43));
+
+        client.approve_conflict_override(&engineer, &41);
+
+        assert!(!client.check_conflict_of_interest(&engineer, &41));
+        assert!(client.check_conflict_of_interest(&engineer, &42));
+        let history = client.get_conflict_history(&engineer);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().asset_id, 41);
+        assert!(history.get(0).unwrap().overridden);
+        assert!(!history.get(1).unwrap().overridden);
     }
 
     #[test]
