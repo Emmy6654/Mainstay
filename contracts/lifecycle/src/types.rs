@@ -61,55 +61,75 @@ pub struct MaintenanceRecord {
     pub reconstructed: bool,
 }
 
-/// Evidence that a recorded maintenance cost was reconciled with an invoice.
+/// Return-on-investment metrics for an asset's maintenance program.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CostReconciliation {
-    pub invoice_hash: Bytes,
-    pub verified_cost: u64,
-    pub verified_by: Address,
-    pub verified_at: u64,
+pub struct MaintenanceRoi {
+    pub asset_id: u64,
+    pub maintenance_cost: u64,
+    pub avoided_loss: u64,
+    /// ROI in basis points: 10,000 represents a 100% return.
+    pub roi_basis_points: i64,
+    pub maintenance_count: u32,
 }
 
-/// A maintenance work-order group identifier is stored separately from records
-/// so existing record hashes and clients remain backward compatible.
+/// An anonymized aggregate of maintenance outcomes for one asset category.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskGroup {
-    pub group_id: Bytes,
-    pub record_timestamps: Vec<u64>,
+pub struct IndustryBenchmark {
+    pub asset_type: Symbol,
+    pub member_count: u32,
+    pub mean_score: u32,
+    pub mean_maintenance_count: u32,
+    pub mean_maintenance_cost: u64,
 }
 
-/// State of a maintenance-record dispute.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DisputeStatus {
-    Open = 0,
-    Resolved = 1,
-    Rejected = 2,
-}
-
-/// An auditable dispute raised against a maintenance record.
+/// A compliance and audit summary generated from on-chain lifecycle data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaintenanceDispute {
-    pub dispute_id: u32,
+pub struct ComplianceReport {
+    pub asset_id: u64,
+    pub standard_registered: bool,
+    pub total_maintenance_records: u32,
+    pub compliant_records: u32,
+    pub non_compliant_records: u32,
+    pub compliance_percentage: u32,
+    pub total_cost: u64,
+    pub chain_integrity: bool,
+    pub generated_at: u64,
+}
+
+/// An immutable audit entry for a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceAuditEntry {
+    pub asset_id: u64,
     pub record_timestamp: u64,
-    pub claimant: Address,
-    pub reason: String,
-    pub status: DisputeStatus,
-    pub resolution: Option<String>,
-    pub created_at: u64,
-    pub resolved_at: Option<u64>,
+    pub actor: Address,
+    pub action: Symbol,
+    pub record_hash: Bytes,
+    pub timestamp: u64,
 }
 
-/// A content hash for off-chain maintenance evidence such as a photo or invoice.
+/// A third-party verification of a maintenance record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EvidenceAttachment {
-    pub content_hash: Bytes,
-    pub submitted_by: Address,
-    pub submitted_at: u64,
+pub struct MaintenanceAttestation {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub attestor: Address,
+    pub statement: Bytes,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceSignature {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub signer: Address,
+    pub public_key: BytesN<32>,
+    pub signature: BytesN<64>,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -241,6 +261,52 @@ pub struct AssetFullSnapshot {
     pub total_maintenance_records: u32,
     /// Timestamp of last maintenance service
     pub last_service_timestamp: u64,
+}
+
+/// Aggregated collateral health for the assets currently owned by an address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralPortfolioHealth {
+    pub asset_count: u32,
+    pub eligible_asset_count: u32,
+    pub locked_asset_count: u32,
+    pub total_collateral_score: u64,
+    pub average_collateral_score: u32,
+}
+
+/// Maintenance activity and cost metrics for one engineer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineerProductivity {
+    pub asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_cost: u64,
+    pub average_cost: u64,
+    pub last_activity: Option<u64>,
+}
+
+/// Historical maintenance cost analysis and a deterministic forward estimate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostAnalytics {
+    pub total_cost: u64,
+    pub recorded_cost_count: u32,
+    pub average_cost: u64,
+    pub last_cost: Option<u64>,
+    pub forecast_cost: u64,
+}
+
+/// Aggregated operating metrics for an owner's current fleet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetPerformance {
+    pub asset_count: u32,
+    pub serviced_asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_maintenance_cost: u64,
+    pub average_collateral_score: u32,
+    pub locked_asset_count: u32,
+    pub decommissioned_asset_count: u32,
 }
 
 /// An on-chain governance proposal to change a task-type score weight.
@@ -449,6 +515,11 @@ pub enum DataKey {
     WeightProposal(Symbol),
     /// Stores `Vec<DisputeRecord>` for a given asset (issue #1319).
     Disputes(u64),
+    MaintenanceAudit(u64),
+    MaintenanceAttestations(u64),
+    AttestorAuth(u64, Address),
+    MaintenanceSignatures(u64),
+    CompressedHistory(u64),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).
