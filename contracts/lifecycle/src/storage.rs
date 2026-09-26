@@ -58,6 +58,18 @@ pub(crate) fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("XFER_HIST"), asset_id)
 }
 
+pub(crate) fn maintenance_audit_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MNT_AUD"), asset_id)
+}
+
+pub(crate) fn maintenance_attestations_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MNT_ATT"), asset_id)
+}
+
+pub(crate) fn attestor_auth_key(asset_id: u64, attestor: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("ATT_AUTH"), asset_id, attestor.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Per-engineer keys
 // ---------------------------------------------------------------------------

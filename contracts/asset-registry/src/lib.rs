@@ -70,8 +70,10 @@ pub enum ContractError {
     PoolNotFound = 35,
     /// Cannot create collateral pool for single asset (issue #1318).
     InvalidPoolSize = 36,
-    /// Encrypted asset fields were empty or exceeded the supported size.
-    InvalidEncryptedData = 37,
+    /// A co-owned asset must use the weighted voting flow for critical changes.
+    MultisigRequired = 37,
+    /// A co-owner action has already been executed.
+    ActionAlreadyExecuted = 38,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -307,6 +309,16 @@ pub struct SearchPage {
     pub assets: Vec<Asset>,
     /// Total number of assets that matched the filter (before the 100-result cap).
     pub total: u32,
+    /// Counts for each asset type represented by the complete result set.
+    pub facets: Vec<FacetCount>,
+}
+
+/// A count of matching assets grouped by asset type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetCount {
+    pub asset_type: Symbol,
+    pub count: u32,
 }
 
 /// Issue #1629: Asset usage tracking and analytics data
@@ -1283,16 +1295,27 @@ impl AssetRegistry {
         asset
     }
 
-    /// Return encrypted serial and location fields for an asset.
-    pub fn get_encrypted_asset_fields(env: Env, asset_id: u64) -> EncryptedAssetFields {
-        let key = encrypted_asset_key(asset_id);
-        let fields: EncryptedAssetFields = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
-        extend_persistent_ttl(&env, &key);
-        fields
+    /// Return all registered assets from `asset_ids` in one invocation.
+    ///
+    /// Missing IDs are omitted, matching the tolerant behavior of the other
+    /// batch read endpoints. The input is bounded to keep response and
+    /// instruction usage predictable for API clients.
+    pub fn batch_get_assets(env: Env, asset_ids: Vec<u64>) -> Vec<Asset> {
+        if asset_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        let mut assets = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            let key = asset_key(asset_id);
+            if let Some(asset) = env.storage().persistent().get(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+                assets.push_back(asset);
+            }
+        }
+        assets
     }
 
     /// Look up an asset by its physical serial number.
@@ -2228,6 +2251,13 @@ impl AssetRegistry {
 
         if asset.owner != current_owner {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Co-owned assets cannot bypass their weighted approval policy through
+        // the legacy single-signer transfer entry point. Use propose_action,
+        // vote_on_action, and execute_action instead.
+        if !asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::MultisigRequired);
         }
 
         if current_owner == new_owner {
@@ -3183,6 +3213,7 @@ impl AssetRegistry {
 
         let mut matched: Vec<Asset> = Vec::new(&env);
         let mut total_matched: u32 = 0;
+        let mut facet_counts: Vec<(Symbol, u32)> = Vec::new(&env);
 
         for id in 1..=total_assets {
             let key = asset_key(id);
@@ -3220,6 +3251,18 @@ impl AssetRegistry {
             }
 
             total_matched += 1;
+            let mut facet_found = false;
+            for i in 0..facet_counts.len() {
+                let (facet_type, count) = facet_counts.get(i).unwrap();
+                if facet_type == asset.asset_type {
+                    facet_counts.set(i, (facet_type, count + 1));
+                    facet_found = true;
+                    break;
+                }
+            }
+            if !facet_found {
+                facet_counts.push_back((asset.asset_type.clone(), 1));
+            }
             if matched.len() < MAX_RESULTS {
                 matched.push_back(asset);
             }
@@ -3294,7 +3337,13 @@ impl AssetRegistry {
             }
         }
 
-        SearchPage { assets: matched, total: total_matched }
+        let mut facets: Vec<FacetCount> = Vec::new(&env);
+        for i in 0..facet_counts.len() {
+            let (asset_type, count) = facet_counts.get(i).unwrap();
+            facets.push_back(FacetCount { asset_type, count });
+        }
+
+        SearchPage { assets: matched, total: total_matched, facets }
     }
 
     /// Mark an asset as under maintenance.
@@ -3556,6 +3605,10 @@ impl AssetRegistry {
             .get(&proposal_key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
 
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::ActionAlreadyExecuted);
+        }
+
         let mut asset: Asset = env
             .storage()
             .persistent()
@@ -3585,11 +3638,41 @@ impl AssetRegistry {
         match proposal.action_type {
             ActionType::Transfer => {
                 if let Some(new_owner) = proposal.new_owner {
+                    if asset.is_locked {
+                        panic_with_error!(&env, ContractError::AssetLocked);
+                    }
+                    if asset.deprecation_status != DeprecationStatus::Active {
+                        panic_with_error!(&env, ContractError::AssetDecommissioned);
+                    }
+                    let old_owner = asset.owner.clone();
+                    let hash: BytesN<32> = env
+                        .crypto()
+                        .sha256(&asset.metadata.clone().to_xdr(&env))
+                        .into();
+                    env.storage()
+                        .persistent()
+                        .remove(&dedup_key(&old_owner, &asset.asset_type, &hash));
+                    env.storage()
+                        .persistent()
+                        .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+                    extend_persistent_ttl(
+                        &env,
+                        &dedup_key(&new_owner, &asset.asset_type, &hash),
+                    );
+                    owner_index_remove(&env, &old_owner, asset_id);
+                    owner_index_add(&env, &new_owner, asset_id);
                     // Transfer asset to new owner
-                    asset.owner = new_owner;
+                    asset.owner = new_owner.clone();
                     env.storage()
                         .persistent()
                         .set(&asset_key(asset_id), &asset);
+                    extend_persistent_ttl(&env, &asset_key(asset_id));
+                    if let Ok(lifecycle_addr) =
+                        env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY)
+                    {
+                        lifecycle::LifecycleClient::new(&env, &lifecycle_addr)
+                            .transfer_notify(&asset_id, &new_owner);
+                    }
 
                     env.events().publish(
                         (symbol_short!("XFER_EXEC"), asset_id),
@@ -9086,6 +9169,9 @@ mod tests {
         });
         assert_eq!(page.total, 2);
         assert_eq!(page.assets.len(), 2);
+        assert_eq!(page.facets.len(), 2);
+        assert_eq!(page.facets.get(0).unwrap().count, 1);
+        assert_eq!(page.facets.get(1).unwrap().count, 1);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub(crate) use storage::{
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
+    maintenance_audit_key, maintenance_attestations_key, attestor_auth_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
 };
 
@@ -27,8 +28,10 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceCostSummary, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, ComplianceReport, Config, CostAnalytics, DataKey, EngineerProductivity, FleetPerformance, HealthSnapshot, IndustryBenchmark,
+    MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
+    ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
+    MaintenanceAttestation, MaintenanceSignature,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -43,6 +46,7 @@ use shared::validation::require_non_empty_vec;
 use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -96,6 +100,10 @@ const FEE_CRITICAL: u64 = 5_000;
 /// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
+/// Maximum number of asset snapshots returned by one aggregate read.
+pub const MAX_SNAPSHOT_BATCH_SIZE: u32 = 50;
+/// Bound per-asset ACL size so authorization checks remain predictable.
+const MAX_AUTHORIZED_ENGINEERS: u32 = 100;
 /// Default retirement review period: 7 days in seconds.
 const DEFAULT_RETIREMENT_REVIEW_PERIOD: u64 = 604_800;
 /// Default coordinated task timeout: 30 days in seconds.
@@ -217,6 +225,57 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
     } else {
         let last = history.get(history.len() - 1).unwrap();
         Some(hash_maintenance_record(env, &last))
+    }
+
+    fn append_maintenance_audit(env: &Env, asset_id: u64, entry: MaintenanceAuditEntry) {
+        let key = DataKey::MaintenanceAudit(asset_id);
+        let mut entries: Vec<MaintenanceAuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        entries.push_back(entry);
+        env.storage().persistent().set(&key, &entries);
+        extend_persistent_ttl(env, &key);
+    }
+
+    fn rle_compress(env: &Env, input: &Bytes) -> Bytes {
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let value = input.get(i).unwrap();
+            let mut count = 1u32;
+            while i + count < input.len()
+                && input.get(i + count).unwrap() == value
+                && count < u8::MAX as u32
+            {
+                count += 1;
+            }
+            output.push_back(count as u8);
+            output.push_back(value);
+            i += count;
+        }
+        output
+    }
+
+    fn rle_decompress(env: &Env, input: &Bytes) -> Option<Bytes> {
+        if input.len() % 2 != 0 {
+            return None;
+        }
+        let mut output = Bytes::new(env);
+        let mut i = 0u32;
+        while i < input.len() {
+            let count = input.get(i).unwrap();
+            if count == 0 {
+                return None;
+            }
+            let value = input.get(i + 1).unwrap();
+            for _ in 0..count {
+                output.push_back(value);
+            }
+            i += 2;
+        }
+        Some(output)
     }
 }
 
@@ -1091,7 +1150,176 @@ impl Lifecycle {
                 break;
             }
         }
+
+        /// Authorize an independent party to attest maintenance records for an asset.
+        pub fn authorize_attestor(env: Env, owner: Address, asset_id: u64, attestor: Address) {
+            ensure_not_paused(&env);
+            owner.require_auth();
+            let asset_registry = get_asset_registry_addr(&env);
+            verify_asset_exists(&env, &asset_registry, &asset_id);
+            let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                .get_asset(&asset_id);
+            if asset.owner != owner {
+                panic_with_error!(&env, ContractError::UnauthorizedOwner);
+            }
+            let key = attestor_auth_key(asset_id, &attestor);
+            env.storage().persistent().set(&key, &true);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Record an attestation from an owner-authorized independent party.
+        pub fn attest_maintenance(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            attestor: Address,
+            statement: Bytes,
+        ) {
+            ensure_not_paused(&env);
+            attestor.require_auth();
+            let auth_key = attestor_auth_key(asset_id, &attestor);
+            if !env.storage().persistent().get::<_, bool>(&auth_key).unwrap_or(false) {
+                panic_with_error!(&env, ContractError::UnauthorizedAttestor);
+            }
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut found = false;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                panic_with_error!(&env, ContractError::RecordNotFound);
+            }
+            let key = DataKey::MaintenanceAttestations(asset_id);
+            let mut attestations: Vec<MaintenanceAttestation> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            attestations.push_back(MaintenanceAttestation {
+                asset_id,
+                record_timestamp,
+                attestor: attestor.clone(),
+                statement,
+                timestamp: env.ledger().timestamp(),
+            });
+            env.storage().persistent().set(&key, &attestations);
+            extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (symbol_short!("MNT_ATTEST"), asset_id),
+                (record_timestamp, attestor),
+            );
+        }
+
+        pub fn get_maintenance_attestations(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceAttestation> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceAttestations(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
+        }
+
+        /// Verify and persist an engineer's Ed25519 signature over a record hash.
+        pub fn sign_maintenance_record(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+            signer: Address,
+            public_key: BytesN<32>,
+            signature: BytesN<64>,
+        ) {
+            ensure_not_paused(&env);
+            signer.require_auth();
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut record_hash: Option<Bytes> = None;
+            for record in history.iter() {
+                if record.timestamp == record_timestamp && record.engineer == signer {
+                    record_hash = Some(hash_maintenance_record(&env, &record));
+                    break;
+                }
+            }
+            let message = record_hash.unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::RecordNotFound)
+            });
+            env.crypto().ed25519_verify(&public_key, &message, &signature);
+
+            let key = DataKey::MaintenanceSignatures(asset_id);
+            let mut signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            signatures.push_back(MaintenanceSignature {
+                asset_id,
+                record_timestamp,
+                signer,
+                public_key,
+                signature,
+            });
+            env.storage().persistent().set(&key, &signatures);
+            extend_persistent_ttl(&env, &key);
+        }
+
+        /// Returns whether a valid stored signature exists for a record.
+        pub fn verify_maintenance_signature(
+            env: Env,
+            asset_id: u64,
+            record_timestamp: u64,
+        ) -> bool {
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let signatures: Vec<MaintenanceSignature> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            for record in history.iter() {
+                if record.timestamp != record_timestamp {
+                    continue;
+                }
+                let message = hash_maintenance_record(&env, &record);
+                for stored in signatures.iter() {
+                    if stored.record_timestamp == record_timestamp {
+                        env.crypto().ed25519_verify(
+                            &stored.public_key,
+                            &message,
+                            &stored.signature,
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        pub fn get_maintenance_signatures(
+            env: Env,
+            asset_id: u64,
+        ) -> Vec<MaintenanceSignature> {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MaintenanceSignatures(asset_id))
+                .unwrap_or_else(|| Vec::new(&env))
+        }
         if !already_present {
+            if list.len() >= MAX_AUTHORIZED_ENGINEERS {
+                panic_with_error!(&env, ContractError::TooManyAuthorizedEngineers);
+            }
             list.push_back(engineer);
             env.storage().persistent().set(&list_key, &list);
             extend_persistent_ttl(&env, &list_key);
@@ -2266,10 +2494,19 @@ impl Lifecycle {
         };
 
         history.push_back(record);
+        let audit_entry = MaintenanceAuditEntry {
+            asset_id,
+            record_timestamp: timestamp,
+            actor: engineer.clone(),
+            action: symbol_short!("SUBMIT"),
+            record_hash: hash_maintenance_record(&env, &history.get(history.len() - 1).unwrap()),
+            timestamp,
+        };
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
+        append_maintenance_audit(&env, asset_id, audit_entry);
 
         // #1222: Advance next_due for any recurring task this submission satisfies,
         // so the schedule doesn't stay perpetually overdue after the first submission.
@@ -2752,6 +2989,18 @@ impl Lifecycle {
         // All validation passed — now commit everything atomically.
         for record in new_records.iter() {
             history.push_back(record);
+            append_maintenance_audit(
+                &env,
+                asset_id,
+                MaintenanceAuditEntry {
+                    asset_id,
+                    record_timestamp: record.timestamp,
+                    actor: engineer.clone(),
+                    action: symbol_short!("SUBMIT"),
+                    record_hash: hash_maintenance_record(&env, record),
+                    timestamp,
+                },
+            );
         }
         for entry in score_entries.iter() {
             score_history_push(&env, asset_id, entry, config.max_history);
@@ -3209,10 +3458,71 @@ impl Lifecycle {
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
-        env.storage()
+        if let Some(history) = env.storage()
             .persistent()
             .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env))
+        {
+            return history;
+        }
+        let archived: Bytes = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
+            .unwrap_or_else(|| Bytes::new(&env));
+        if archived.is_empty() {
+            return Vec::new(&env);
+        }
+        let encoded = rle_decompress(&env, &archived)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::CompressionFailed));
+        Vec::<MaintenanceRecord>::from_xdr(&env, &encoded)
+            .unwrap_or_else(|_| panic_with_error!(&env, ContractError::CompressionFailed))
+    }
+
+    /// Compress and archive a decommissioned asset's immutable maintenance history.
+    ///
+    /// Decommissioning is required because compacted history is intentionally
+    /// removed from the live key and cannot accept future submissions.
+    pub fn compact_maintenance_history(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        if !env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::CompressionRequiresDecommissioned);
+        }
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let encoded = history.clone().to_xdr(&env);
+        let compressed = rle_compress(&env, &encoded);
+        let key = DataKey::CompressedHistory(asset_id);
+        env.storage().persistent().set(&key, &compressed);
+        extend_persistent_ttl(&env, &key);
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.events().publish(
+            (symbol_short!("MNT_COMPACT"), asset_id),
+            (encoded.len(), compressed.len()),
+        );
+    }
+
+    pub fn get_compressed_maintenance_history(
+        env: Env,
+        asset_id: u64,
+    ) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressedHistory(asset_id))
+    }
+
+    /// Return the append-only audit trail for an asset's maintenance records.
+    pub fn get_maintenance_audit(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<MaintenanceAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceAudit(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Get a paginated slice of the maintenance history for an asset (#996).
@@ -3765,45 +4075,43 @@ impl Lifecycle {
                 }
             }
 
-            /// Aggregate recorded maintenance spend by task type.
+            /// Calculate the maintenance program's return on investment.
             ///
-            /// Records without a cost are excluded. This compact view lets supply
-            /// chain dashboards compare parts/labour categories without downloading
-            /// every maintenance record.
-            pub fn get_maintenance_cost_summary(env: Env, asset_id: u64) -> Vec<MaintenanceCostSummary> {
+            /// `avoided_loss` is the estimated loss prevented by maintaining the asset,
+            /// expressed in stroops. The caller supplies this business valuation while
+            /// the contract supplies the verifiable maintenance cost and count.
+            pub fn calculate_maintenance_roi(
+                env: Env,
+                asset_id: u64,
+                avoided_loss: u64,
+            ) -> MaintenanceRoi {
+                let maintenance_cost = Self::get_total_maintenance_cost(env.clone(), asset_id);
                 let history: Vec<MaintenanceRecord> = env
                     .storage()
                     .persistent()
                     .get(&history_key(asset_id))
                     .unwrap_or_else(|| Vec::new(&env));
-                let mut summaries = Vec::<MaintenanceCostSummary>::new(&env);
-                for record in history.iter() {
-                    let cost = match record.cost {
-                        Some(value) => value,
-                        None => continue,
-                    };
-                    let mut found = false;
-                    for index in 0..summaries.len() {
-                        let mut summary = summaries.get(index).unwrap();
-                        if summary.task_type == record.task_type {
-                            summary.total_cost = summary.total_cost.saturating_add(cost);
-                            summary.record_count = summary.record_count.saturating_add(1);
-                            summary.average_cost = summary.total_cost / summary.record_count as u64;
-                            summaries.set(index, summary);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        summaries.push_back(MaintenanceCostSummary {
-                            task_type: record.task_type,
-                            total_cost: cost,
-                            record_count: 1,
-                            average_cost: cost,
-                        });
-                    }
+                let roi_basis_points = if maintenance_cost == 0 {
+                    if avoided_loss == 0 { 0 } else { i64::MAX }
+                } else {
+                    let net = (avoided_loss as i128) - (maintenance_cost as i128);
+                    ((net * 10_000) / maintenance_cost as i128)
+                        .max(i64::MIN as i128)
+                        .min(i64::MAX as i128) as i64
+                };
+
+                MaintenanceRoi {
+                    asset_id,
+                    maintenance_cost,
+                    avoided_loss,
+                    roi_basis_points,
+                    maintenance_count: history.len() as u32,
                 }
-                summaries
+            }
+
+            /// View alias for [`calculate_maintenance_roi`].
+            pub fn get_maintenance_roi(env: Env, asset_id: u64, avoided_loss: u64) -> MaintenanceRoi {
+                Self::calculate_maintenance_roi(env, asset_id, avoided_loss)
             }
         }
         if count == 0 {
@@ -4371,6 +4679,73 @@ impl Lifecycle {
         }
     }
 
+    /// Generate an auditable compliance report for an asset.
+    ///
+    /// The supplied proof is checked against the registered standard. Since
+    /// maintenance records are immutable and do not contain private
+    /// documentation, a valid proof attests to the complete visible history;
+    /// an invalid proof marks every record as non-compliant.
+    pub fn generate_compliance_report(
+        env: Env,
+        asset_id: u64,
+        compliance_proof_hash: Bytes,
+    ) -> ComplianceReport {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let standard_registered = if let Some(asset) =
+            asset_registry::AssetRegistryClient::new(&env, &get_asset_registry_addr(&env))
+                .try_get_asset(&asset_id)
+                .ok()
+        {
+            env.storage()
+                .persistent()
+                .has(&standard_key(&asset.asset_type))
+        } else {
+            false
+        };
+        let compliant = if standard_registered
+            && Self::validate_maintenance_compliance(
+                env.clone(),
+                asset_id,
+                symbol_short!("REPORT"),
+                compliance_proof_hash,
+            )
+        {
+            history.len() as u32
+        } else {
+            0
+        };
+        let total = history.len() as u32;
+
+        ComplianceReport {
+            asset_id,
+            standard_registered,
+            total_maintenance_records: total,
+            compliant_records: compliant,
+            non_compliant_records: total.saturating_sub(compliant),
+            compliance_percentage: if total == 0 {
+                0
+            } else {
+                (compliant * 100) / total
+            },
+            total_cost: Self::get_total_maintenance_cost(&env, asset_id),
+            chain_integrity: Self::verify_maintenance_chain_integrity(&env, asset_id),
+            generated_at: env.ledger().timestamp(),
+        }
+    }
+
+    /// View alias for [`generate_compliance_report`].
+    pub fn get_compliance_report(
+        env: Env,
+        asset_id: u64,
+        compliance_proof_hash: Bytes,
+    ) -> ComplianceReport {
+        Self::generate_compliance_report(env, asset_id, compliance_proof_hash)
+    }
+
     /// Return the registered maintenance compliance standard for an asset type.
     ///
     /// Returns the raw standard bytes if registered, or empty `Bytes` if none.
@@ -4528,6 +4903,27 @@ impl Lifecycle {
             total_maintenance_records,
             last_service_timestamp,
         }
+    }
+
+    /// Return complete snapshots for multiple assets in one contract invocation.
+    ///
+    /// This is the contract-side aggregation primitive for API gateways and
+    /// GraphQL resolvers. It keeps clients from issuing one RPC request per
+    /// related asset while preserving the same snapshot shape and validation
+    /// semantics as `get_asset_full_snapshot`.
+    ///
+    /// The batch is bounded so a caller cannot create an unbounded response or
+    /// exceed Soroban instruction and data limits.
+    pub fn get_asset_full_snapshots(env: Env, asset_ids: Vec<u64>) -> Vec<AssetFullSnapshot> {
+        if asset_ids.len() > MAX_SNAPSHOT_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        let mut snapshots = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            snapshots.push_back(Self::get_asset_full_snapshot(env.clone(), asset_id));
+        }
+        snapshots
     }
 
     /// Return the chronological collateral valuation history for an asset.
@@ -6998,6 +7394,54 @@ impl Lifecycle {
         shared::extend_persistent_ttl(&env, &peer_group_key);
     }
 
+    /// Return anonymized maintenance benchmarks for an asset category.
+    ///
+    /// Only aggregate values are returned; no owner, engineer, or asset ID is
+    /// exposed. This lets operators compare their fleet with the other
+    /// registered assets without creating a cross-tenant data disclosure.
+    pub fn get_industry_benchmark(env: Env, asset_type: Symbol) -> IndustryBenchmark {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let all_assets = client.get_all_assets();
+        let mut member_count = 0u32;
+        let mut score_total = 0u64;
+        let mut maintenance_total = 0u64;
+        let mut cost_total = 0u64;
+
+        for i in 0..all_assets.len() {
+            let asset_id = all_assets.get(i).unwrap();
+            let asset = client.get_asset(&asset_id);
+            if asset.asset_type != asset_type {
+                continue;
+            }
+            let history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            member_count = member_count.saturating_add(1);
+            score_total = score_total.saturating_add(Self::get_collateral_score(&env, asset_id) as u64);
+            maintenance_total = maintenance_total.saturating_add(history.len() as u64);
+            cost_total = cost_total.saturating_add(Self::get_total_maintenance_cost(&env, asset_id));
+        }
+
+        IndustryBenchmark {
+            asset_type,
+            member_count,
+            mean_score: if member_count == 0 { 0 } else { (score_total / member_count as u64) as u32 },
+            mean_maintenance_count: if member_count == 0 {
+                0
+            } else {
+                (maintenance_total / member_count as u64) as u32
+            },
+            mean_maintenance_cost: if member_count == 0 {
+                0
+            } else {
+                cost_total / member_count as u64
+            },
+        }
+    }
+
     // =========================================================================
     // Additional Helper Functions for Better Integration
     // =========================================================================
@@ -7086,6 +7530,7 @@ impl Lifecycle {
             .persistent()
             .get(&baseline_key)
             .unwrap_or_else(|| Vec::new(&env));
+        let detected = Self::check_score_anomaly(env.clone(), asset_id, score);
 
         // Keep last 20 scores for moving average
         const MAX_BASELINE: usize = 20;
@@ -7096,6 +7541,29 @@ impl Lifecycle {
         baseline_scores.push_back(score as u64);
         env.storage().persistent().set(&baseline_key, &baseline_scores);
         shared::extend_persistent_ttl(&env, &baseline_key);
+
+        if let Some((stdev_multiple, baseline_score)) = detected {
+            let anomalies_key = score_anomalies_key(asset_id);
+            let mut anomalies: Vec<ScoreAnomaly> = env
+                .storage()
+                .persistent()
+                .get(&anomalies_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            anomalies.push_back(ScoreAnomaly {
+                asset_id,
+                timestamp: env.ledger().timestamp(),
+                baseline_score,
+                observed_score: score,
+                standard_deviation_multiple: stdev_multiple,
+                investigation_status: symbol_short!("PENDING"),
+            });
+            env.storage().persistent().set(&anomalies_key, &anomalies);
+            shared::extend_persistent_ttl(&env, &anomalies_key);
+            env.events().publish(
+                (symbol_short!("ANOMALY"), asset_id),
+                (baseline_score, score, stdev_multiple),
+            );
+        }
     }
 
     /// Get list of registered score providers.
@@ -7594,6 +8062,199 @@ impl Lifecycle {
             extend_persistent_ttl(&env, &key);
         }
         config
+    }
+
+    /// Aggregate collateral health for all assets currently owned by `owner`.
+    pub fn get_collateral_portfolio_health(
+        env: Env,
+        owner: Address,
+    ) -> CollateralPortfolioHealth {
+        let registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+        let assets = client.get_assets_by_owner(&owner);
+        let config = Self::get_config(env.clone());
+        let mut eligible = 0u32;
+        let mut locked = 0u32;
+        let mut total_score = 0u64;
+
+        for asset_id in assets.iter() {
+            let asset = client.get_asset(&asset_id);
+            let score = Self::get_collateral_score(env.clone(), asset_id);
+            total_score = total_score.saturating_add(score as u64);
+            if score >= config.min_collateral_score {
+                eligible = eligible.saturating_add(1);
+            }
+            if asset.is_locked {
+                locked = locked.saturating_add(1);
+            }
+        }
+
+        let count = assets.len();
+        CollateralPortfolioHealth {
+            asset_count: count,
+            eligible_asset_count: eligible,
+            locked_asset_count: locked,
+            total_collateral_score: total_score,
+            average_collateral_score: if count == 0 {
+                0
+            } else {
+                (total_score / count as u64) as u32
+            },
+        }
+    }
+
+    /// Return maintenance productivity metrics for an engineer since a timestamp.
+    pub fn get_engineer_productivity(
+        env: Env,
+        engineer: Address,
+        since_timestamp: u64,
+    ) -> EngineerProductivity {
+        let asset_ids = Self::get_engineer_maintenance_history(env.clone(), engineer.clone());
+        let mut asset_count = 0u32;
+        let mut maintenance_count = 0u32;
+        let mut total_cost = 0u64;
+        let mut last_activity = None;
+
+        for asset_id in asset_ids.iter() {
+            let records = Self::get_maintenance_history_by_engineer(
+                env.clone(),
+                asset_id,
+                engineer.clone(),
+            );
+            let mut counted_asset = false;
+            for record in records.iter() {
+                if record.timestamp < since_timestamp {
+                    continue;
+                }
+                counted_asset = true;
+                maintenance_count = maintenance_count.saturating_add(1);
+                total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                if last_activity.is_none_or(|timestamp| record.timestamp > timestamp) {
+                    last_activity = Some(record.timestamp);
+                }
+            }
+            if counted_asset {
+                asset_count = asset_count.saturating_add(1);
+            }
+        }
+
+        EngineerProductivity {
+            asset_count,
+            maintenance_count,
+            total_cost,
+            average_cost: if maintenance_count == 0 {
+                0
+            } else {
+                total_cost / maintenance_count as u64
+            },
+            last_activity,
+        }
+    }
+
+    /// Analyze recorded maintenance costs and estimate cost over a future period.
+    pub fn get_cost_analytics(
+        env: Env,
+        asset_id: u64,
+        forecast_period_secs: u64,
+    ) -> CostAnalytics {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut total_cost = 0u64;
+        let mut count = 0u32;
+        let mut first_timestamp = None;
+        let mut last_timestamp = None;
+        let mut last_cost = None;
+
+        for record in history.iter() {
+            if let Some(cost) = record.cost {
+                total_cost = total_cost.saturating_add(cost);
+                count = count.saturating_add(1);
+                first_timestamp = Some(first_timestamp.map_or(record.timestamp, |value| {
+                    value.min(record.timestamp)
+                }));
+                last_timestamp = Some(last_timestamp.map_or(record.timestamp, |value| {
+                    value.max(record.timestamp)
+                }));
+                if last_timestamp == Some(record.timestamp) {
+                    last_cost = Some(cost);
+                }
+            }
+
+            /// Aggregate maintenance, cost, collateral, and lifecycle metrics for an owner fleet.
+            pub fn get_fleet_performance(env: Env, owner: Address) -> FleetPerformance {
+                let registry = get_asset_registry_addr(&env);
+                let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+                let asset_ids = client.get_assets_by_owner(&owner);
+                let mut serviced = 0u32;
+                let mut maintenance_count = 0u32;
+                let mut total_cost = 0u64;
+                let mut total_score = 0u64;
+                let mut locked = 0u32;
+                let mut decommissioned = 0u32;
+
+                for asset_id in asset_ids.iter() {
+                    let asset = client.get_asset(&asset_id);
+                    let history: Vec<MaintenanceRecord> = env
+                        .storage()
+                        .persistent()
+                        .get(&history_key(asset_id))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    if !history.is_empty() {
+                        serviced = serviced.saturating_add(1);
+                    }
+                    for record in history.iter() {
+                        maintenance_count = maintenance_count.saturating_add(1);
+                        total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                    }
+                    total_score = total_score
+                        .saturating_add(Self::get_collateral_score(env.clone(), asset_id) as u64);
+                    if asset.is_locked {
+                        locked = locked.saturating_add(1);
+                    }
+                    if asset.deprecation_status == asset_registry::DeprecationStatus::Decommissioned {
+                        decommissioned = decommissioned.saturating_add(1);
+                    }
+                }
+
+                let count = asset_ids.len();
+                FleetPerformance {
+                    asset_count: count,
+                    serviced_asset_count: serviced,
+                    maintenance_count,
+                    total_maintenance_cost: total_cost,
+                    average_collateral_score: if count == 0 {
+                        0
+                    } else {
+                        (total_score / count as u64) as u32
+                    },
+                    locked_asset_count: locked,
+                    decommissioned_asset_count: decommissioned,
+                }
+            }
+        }
+
+        let average_cost = if count == 0 {
+            0
+        } else {
+            total_cost / count as u64
+        };
+        let forecast_cost = match (first_timestamp, last_timestamp) {
+            (Some(first), Some(last)) if last > first => total_cost
+                .saturating_mul(forecast_period_secs)
+                / (last - first),
+            _ => average_cost,
+        };
+
+        CostAnalytics {
+            total_cost,
+            recorded_cost_count: count,
+            average_cost,
+            last_cost,
+            forecast_cost,
+        }
     }
 }
 
