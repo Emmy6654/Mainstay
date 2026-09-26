@@ -96,6 +96,8 @@ const FEE_CRITICAL: u64 = 5_000;
 /// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
+/// Bound per-asset ACL size so authorization checks remain predictable.
+const MAX_AUTHORIZED_ENGINEERS: u32 = 100;
 /// Default retirement review period: 7 days in seconds.
 const DEFAULT_RETIREMENT_REVIEW_PERIOD: u64 = 604_800;
 /// Default coordinated task timeout: 30 days in seconds.
@@ -1092,6 +1094,9 @@ impl Lifecycle {
             }
         }
         if !already_present {
+            if list.len() >= MAX_AUTHORIZED_ENGINEERS {
+                panic_with_error!(&env, ContractError::TooManyAuthorizedEngineers);
+            }
             list.push_back(engineer);
             env.storage().persistent().set(&list_key, &list);
             extend_persistent_ttl(&env, &list_key);

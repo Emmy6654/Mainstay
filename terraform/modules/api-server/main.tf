@@ -297,6 +297,24 @@ resource "aws_lb_listener" "http" {
       port        = "443"
       status_code = "HTTP_301"
     }
+
+    resource "aws_iam_role" "api" {
+      name = "mainstay-api-${var.region}"
+
+      assume_role_policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [{
+          Effect    = "Allow"
+          Principal = { Service = "ec2.amazonaws.com" }
+          Action    = "sts:AssumeRole"
+        }]
+      })
+    }
+
+    resource "aws_iam_instance_profile" "api" {
+      name = "mainstay-api-${var.region}"
+      role = aws_iam_role.api.name
+    }
   }
 }
 
@@ -315,6 +333,10 @@ resource "aws_launch_template" "api" {
     dsar_table_name = aws_dynamodb_table.data_subject_requests.name
     dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
   }))
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.api.name
+  }
 
   vpc_security_group_ids = [aws_security_group.api.id]
   block_device_mappings {

@@ -70,6 +70,10 @@ pub enum ContractError {
     PoolNotFound = 35,
     /// Cannot create collateral pool for single asset (issue #1318).
     InvalidPoolSize = 36,
+    /// A co-owned asset must use the weighted voting flow for critical changes.
+    MultisigRequired = 37,
+    /// A co-owner action has already been executed.
+    ActionAlreadyExecuted = 38,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -2120,6 +2124,13 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
+        // Co-owned assets cannot bypass their weighted approval policy through
+        // the legacy single-signer transfer entry point. Use propose_action,
+        // vote_on_action, and execute_action instead.
+        if !asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::MultisigRequired);
+        }
+
         if current_owner == new_owner {
             panic_with_error!(&env, ContractError::SameOwner);
         }
@@ -3446,6 +3457,10 @@ impl AssetRegistry {
             .get(&proposal_key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
 
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::ActionAlreadyExecuted);
+        }
+
         let mut asset: Asset = env
             .storage()
             .persistent()
@@ -3475,11 +3490,41 @@ impl AssetRegistry {
         match proposal.action_type {
             ActionType::Transfer => {
                 if let Some(new_owner) = proposal.new_owner {
+                    if asset.is_locked {
+                        panic_with_error!(&env, ContractError::AssetLocked);
+                    }
+                    if asset.deprecation_status != DeprecationStatus::Active {
+                        panic_with_error!(&env, ContractError::AssetDecommissioned);
+                    }
+                    let old_owner = asset.owner.clone();
+                    let hash: BytesN<32> = env
+                        .crypto()
+                        .sha256(&asset.metadata.clone().to_xdr(&env))
+                        .into();
+                    env.storage()
+                        .persistent()
+                        .remove(&dedup_key(&old_owner, &asset.asset_type, &hash));
+                    env.storage()
+                        .persistent()
+                        .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+                    extend_persistent_ttl(
+                        &env,
+                        &dedup_key(&new_owner, &asset.asset_type, &hash),
+                    );
+                    owner_index_remove(&env, &old_owner, asset_id);
+                    owner_index_add(&env, &new_owner, asset_id);
                     // Transfer asset to new owner
-                    asset.owner = new_owner;
+                    asset.owner = new_owner.clone();
                     env.storage()
                         .persistent()
                         .set(&asset_key(asset_id), &asset);
+                    extend_persistent_ttl(&env, &asset_key(asset_id));
+                    if let Ok(lifecycle_addr) =
+                        env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY)
+                    {
+                        lifecycle::LifecycleClient::new(&env, &lifecycle_addr)
+                            .transfer_notify(&asset_id, &new_owner);
+                    }
 
                     env.events().publish(
                         (symbol_short!("XFER_EXEC"), asset_id),
