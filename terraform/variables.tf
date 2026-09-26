@@ -62,21 +62,22 @@ variable "network_passphrase" {
   default     = "Public Global Stellar Network ; September 2015"
 }
 
-variable "vault_address" {
-  description = "HashiCorp Vault address used by API instances"
-  type        = string
-  sensitive   = false
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
 }
 
-variable "vault_aws_role" {
-  description = "Vault AWS auth role mapped to the API instance profile"
-  type        = string
+variable "log_retention_days" {
+  description = "Number of days to retain API access and error logs"
+  type        = number
+  default     = 30
 }
 
-variable "vault_secret_path" {
-  description = "Vault KV path containing API and third-party credentials"
-  type        = string
-  default     = "secret/data/mainstay/api"
+variable "request_retention_seconds" {
+  description = "Maximum retention for data-subject request messages"
+  type        = number
+  default     = 604800
 }
 
 # ── SQS queues for cross-region cache invalidation ──────────

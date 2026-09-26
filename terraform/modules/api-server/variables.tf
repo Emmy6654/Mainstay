@@ -39,19 +39,22 @@ variable "network_passphrase" {
   type        = string
 }
 
-variable "vault_address" {
-  description = "HashiCorp Vault address used by the API instance"
-  type        = string
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
 }
 
-variable "vault_aws_role" {
-  description = "Vault AWS auth role for this instance profile"
-  type        = string
+variable "log_retention_days" {
+  description = "Number of days to retain API access and error logs"
+  type        = number
+  default     = 30
 }
 
-variable "vault_secret_path" {
-  description = "Vault KV path containing API and third-party credentials"
-  type        = string
+variable "request_retention_seconds" {
+  description = "Maximum retention for data-subject request messages"
+  type        = number
+  default     = 604800
 }
 
 # Data source for AZs in the region
