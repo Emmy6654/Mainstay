@@ -74,6 +74,9 @@ pub enum ContractError {
     MultisigRequired = 37,
     /// A co-owner action has already been executed.
     ActionAlreadyExecuted = 38,
+    InvalidEncryptedData = 39,
+    /// The supplied serial hash does not match the encrypted serial bytes.
+    InvalidSerialNumberHash = 40,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -596,6 +599,20 @@ fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) 
     serial_dedup_key(&hash)
 }
 
+fn get_asset_by_serial_hash(env: &Env, hash: &BytesN<32>) -> Option<Asset> {
+    let key = serial_dedup_key(hash);
+    let asset_id: u64 = env.storage().persistent().get(&key)?;
+    let asset_storage_key = asset_key(asset_id);
+    let asset: Asset = env.storage().persistent().get(&asset_storage_key)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&asset_storage_key, TTL_THRESHOLD, TTL_TARGET);
+    Some(asset)
+}
+
 fn encrypted_asset_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("ENC_ASSET"), asset_id)
 }
@@ -1048,9 +1065,11 @@ impl AssetRegistry {
 
     /// Register an asset without putting sensitive serial or location data on-chain.
     ///
-    /// `serial_number_hash` must be the SHA-256 digest of the canonical serial
-    /// number. The digest preserves global deduplication without exposing the
-    /// serial. `encrypted_*` values must be produced client-side using an
+    /// `serial_number_hash` must be the SHA-256 digest of `encrypted_serial_number`.
+    /// Binding the lookup key to the ciphertext prevents callers from reserving
+    /// arbitrary plaintext-serial hashes. Clients can look up the record using
+    /// `get_asset_by_serial_number_hash`; the contract cannot infer the plaintext
+    /// serial from ciphertext. `encrypted_*` values must be produced client-side using an
     /// authenticated encryption scheme and can only be decrypted by authorised
     /// off-chain consumers.
     pub fn register_asset_encrypted(
@@ -1069,6 +1088,11 @@ impl AssetRegistry {
             || encrypted_location.is_empty() || encrypted_location.len() > 4096
         {
             panic_with_error!(&env, ContractError::InvalidEncryptedData);
+        }
+        let expected_serial_hash: BytesN<32> =
+            env.crypto().sha256(&encrypted_serial_number).into();
+        if serial_number_hash != expected_serial_hash {
+            panic_with_error!(&env, ContractError::InvalidSerialNumberHash);
         }
         validate_asset_type_symbol(&env, &asset_type);
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
@@ -1324,10 +1348,10 @@ impl AssetRegistry {
     /// can use this function to retrieve the full on-chain record without needing
     /// to know the numeric `asset_id` in advance.
     ///
-    /// The lookup is O(1): during `register_asset` a mapping of
-    /// `sha256(serial_number) → asset_id` is written to persistent storage under
-    /// the same key used for serial-number deduplication, so no additional storage
-    /// is required.
+    /// The lookup is O(1): during plaintext registration, a mapping of
+    /// `sha256(serial_number) → asset_id` is written under the serial deduplication
+    /// key. Encrypted records should be queried with
+    /// `get_asset_by_serial_number_hash`.
     ///
     /// # Arguments
     /// * `serial` - The physical serial number string (case-sensitive, as registered)
@@ -1336,25 +1360,18 @@ impl AssetRegistry {
     /// `Some(Asset)` if an asset with that serial number exists; `None` otherwise.
     pub fn get_asset_by_serial_number(env: Env, serial: String) -> Option<Asset> {
         let key = serial_number_lookup_key(&env, &serial);
-        // Resolve serial → asset_id using the dedup index written at registration time.
-        let asset_id: u64 = match env.storage().persistent().get(&key) {
-            Some(id) => id,
-            None => return None,
-        };
-        // Fetch the full Asset record.
-        let asset_key = asset_key(asset_id);
-        let asset: Asset = match env.storage().persistent().get(&asset_key) {
-            Some(a) => a,
-            None => return None,
-        };
-        // Extend TTL on both entries on read to keep the index alive.
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_key, TTL_THRESHOLD, TTL_TARGET);
-        Some(asset)
+        get_asset_by_serial_hash(&env, &key.1)
+    }
+
+    /// Look up an asset registered with encrypted serial data by its ciphertext hash.
+    ///
+    /// The supplied hash must be the same SHA-256 digest that was verified and
+    /// stored during `register_asset_encrypted`.
+    pub fn get_asset_by_serial_number_hash(
+        env: Env,
+        serial_number_hash: BytesN<32>,
+    ) -> Option<Asset> {
+        get_asset_by_serial_hash(&env, &serial_number_hash)
     }
 
     /// Check whether an asset with the given ID is present in the registry.
@@ -10183,5 +10200,66 @@ mod tests {
     #[test]
     fn test_specialization_mismatch_discriminant_matches_lifecycle() {
         assert_eq!(ContractError::SpecializationMismatch as u32, 30);
+    }
+
+    #[test]
+    fn test_encrypted_serial_hash_is_bound_to_ciphertext_and_lookup_works() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-1");
+        let encrypted_location = Bytes::from_slice(&env, b"ciphertext:location-1");
+        let serial_hash: BytesN<32> = env.crypto().sha256(&encrypted_serial).into();
+        let asset_id = client.register_asset_encrypted(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Encrypted asset"),
+            &serial_hash,
+            &encrypted_serial,
+            &encrypted_location,
+            &owner,
+        );
+
+        let asset = client
+            .get_asset_by_serial_number_hash(&serial_hash)
+            .unwrap();
+        assert_eq!(asset.asset_id, asset_id);
+        assert_eq!(asset.serial_number, String::from_str(&env, "[encrypted]"));
+        assert!(client
+            .get_asset_by_serial_number(&String::from_str(&env, "serial-1"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_encrypted_serial_registration_rejects_unrelated_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-2");
+        let arbitrary_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let result = client.try_register_asset_encrypted(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Encrypted asset"),
+            &arbitrary_hash,
+            &encrypted_serial,
+            &Bytes::from_slice(&env, b"ciphertext:location-2"),
+            &Address::generate(&env),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSerialNumberHash as u32
+            )))
+        );
     }
 }
